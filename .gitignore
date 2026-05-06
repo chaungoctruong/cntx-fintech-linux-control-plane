@@ -1,0 +1,95 @@
+# Environments
+.env*
+!.env.example
+!.env.*.example
+*.env
+*.key
+*.pem
+
+# Logs
+*.log
+logs/
+**/logs/
+hubbot.log
+worker_logs/
+debug-*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.py.save
+*.orig
+*.rej
+venv/
+.venv/
+env/
+.env/
+backend_ai/backend/venv/
+hubbot_state.pickle
+hubbot/venv_hub/
+hubbot/.hubbot*.lock
+.pytest_cache/
+.ruff_cache/
+
+# Node.js
+node_modules/
+.next/
+out/
+frontend-v2/.next/
+frontend-v2/out/
+.vercel/
+*.tsbuildinfo
+
+# Databases
+postgres_data/
+*.sqlite
+*.db
+*.dump
+*.bak
+
+# Local artifacts / private worktrees
+ops/artifacts/
+secrets/
+.cursor/
+backend-ctrader/
+bot-trading/
+bot-token/
+reports/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large archives / binaries
+*.tar.gz
+*.tgz
+*.zip
+*.exe
+*.dll
+*.so
+*.dylib
+*.node
+*.wasm
+*.pack
+*.pack.gz
+
+# ML / data binary blobs
+*.parquet
+*.pkl
+*.pickle
+*.joblib
+*.onnx
+*.pt
+*.pth
+*.h5
+*.npy
+*.npz
+
+# Catch-all heavy folders that may appear under sub-projects
+**/.venv/
+**/venv/
+**/site-packages/
+**/__pycache__/
+**/.next/
+**/node_modules/

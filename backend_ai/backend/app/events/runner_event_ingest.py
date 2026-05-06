@@ -1,0 +1,1489 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+import uuid
+from threading import Lock
+from typing import Any
+
+from app.events.command_router import CommandRouterService
+from app.infra.redis_streams import RedisStreamPublisher
+from app.models.control_plane import CommandType, DeploymentStatus, EventType
+from app.orchestration.deployment_config import TRADING_CONFIG_SCHEMA_VERSION, normalize_deployment_config
+from app.orchestration.start_failure_policy import (
+    RUNNER_THROTTLE_FAILURE_THRESHOLD,
+    RUNNER_THROTTLE_SEC,
+    SLOT_QUARANTINE_SEC,
+    classify_start_failure,
+    start_failure_is_credential_failure,
+    start_failure_reason,
+)
+from app.repositories.control_plane_repository import ControlPlaneRepository
+from app.settings import settings
+from runner.schemas.events import RunnerEvent, RunnerEventType
+from ops_telegram_alerts import schedule_error_alert
+
+_HEARTBEAT_STATE_KEYS = {
+    "account_id",
+    "active_account_id",
+    "available_bot_names",
+    "available_bots",
+    "bot_catalog",
+    "connection_status",
+    "control_plane_state",
+    "current_control_plane_state",
+    "current_runner_state",
+    "current_state",
+    "deployment_id",
+    "error",
+    "error_code",
+    "health_status",
+    "last_error",
+    "mt5_liveness_reason",
+    "mt5_liveness_state",
+    "reason",
+    "runner_state",
+    "slot_inventory",
+    "slot_state",
+    "status",
+    "verification_status",
+}
+
+_HEARTBEAT_VOLATILE_KEYS = {
+    "age_sec",
+    "created_at",
+    "elapsed_ms",
+    "event_at",
+    "heartbeat_at",
+    "heartbeat_received_at",
+    "latency_ms",
+    "now",
+    "observed_at",
+    "sequence",
+    "seq",
+    "time",
+    "timestamp",
+    "ts",
+    "updated_at",
+    "uptime",
+    "uptime_sec",
+}
+
+_CONFIG_HOT_UPDATE_FALLBACK_REASONS = {
+    "unsupported_command",
+    "no_supported_config_update_fields",
+}
+_CONFIG_HOT_UPDATE_FALLBACK_REASON_FRAGMENTS = (
+    "timeout",
+    "timed out",
+)
+
+
+def _canonical_slot_id(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    if lowered.startswith("slot_") or lowered.startswith("slot-"):
+        return f"slot-{raw[5:]}"
+    return raw
+
+
+def _normalize_slot_projection_state(payload: dict[str, Any]) -> str | None:
+    direct_candidates = (
+        payload.get("new_state"),
+        payload.get("slot_state"),
+        payload.get("to_state"),
+        payload.get("current_control_plane_state"),
+        payload.get("control_plane_state"),
+    )
+    for candidate in direct_candidates:
+        value = str(candidate or "").strip().lower()
+        if value in {"ready", "allocated", "degraded", "broken", "disabled"}:
+            return value
+
+    runner_state = str(
+        payload.get("current_state")
+        or payload.get("current_runner_state")
+        or ""
+    ).strip().lower()
+    if not runner_state:
+        return None
+    if runner_state in {"ready", "empty", "stopped"}:
+        return "ready"
+    if runner_state in {"active", "verifying", "preparing", "stopping"}:
+        return "allocated"
+    if runner_state == "rebuilding":
+        return "degraded"
+    if runner_state in {"degraded", "broken", "disabled"}:
+        return runner_state
+    return None
+
+
+def _deployment_wants_stopped(deployment: dict[str, Any] | None) -> bool:
+    if not deployment:
+        return False
+    desired_state = str(deployment.get("desired_state") or "").strip().lower()
+    status = str(deployment.get("status") or "").strip().lower()
+    if desired_state == "stopped":
+        return True
+    return status in {"stop_requested", "stopped", "failed", "blocked"}
+
+
+def _event_reason(payload: dict[str, Any]) -> str:
+    return str(
+        payload.get("reason")
+        or payload.get("error")
+        or payload.get("error_text")
+        or payload.get("message")
+        or ""
+    ).strip().lower()
+
+
+def _should_fallback_config_hot_update(reason: str) -> bool:
+    normalized = str(reason or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized in _CONFIG_HOT_UPDATE_FALLBACK_REASONS:
+        return True
+    return any(fragment in normalized for fragment in _CONFIG_HOT_UPDATE_FALLBACK_REASON_FRAGMENTS)
+
+
+def _payload_command_id(payload: dict[str, Any]) -> str | None:
+    value = str(payload.get("command_id") or "").strip()
+    return value or None
+
+
+def _start_bootstrap_failure_reason(payload: dict[str, Any]) -> str | None:
+    candidates = (
+        payload.get("exact_exception"),
+        payload.get("message"),
+        payload.get("log_message"),
+        payload.get("reason"),
+        payload.get("error"),
+        payload.get("error_text"),
+    )
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        lowered = value.lower()
+        if lowered.startswith("slot_bootstrap_failed:fatal_"):
+            return value[:200]
+        if lowered == "start_bot_command_bootstrap_failed":
+            return str(payload.get("exact_exception") or payload.get("message") or value)[:200]
+    return None
+
+
+def _json_signature(value: Any) -> str:
+    try:
+        rendered = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        rendered = repr(value)
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def _heartbeat_state_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key, value in payload.items():
+        key_s = str(key or "").strip()
+        if not key_s or key_s in _HEARTBEAT_VOLATILE_KEYS:
+            continue
+        if key_s in _HEARTBEAT_STATE_KEYS:
+            out[key_s] = value
+    return out
+
+
+class RunnerEventIngestService:
+    def __init__(self, repo: ControlPlaneRepository) -> None:
+        self._repo = repo
+        self._publisher = RedisStreamPublisher()
+        self._command_router = CommandRouterService(repo)
+        self._heartbeat_write_cache: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        self._heartbeat_write_lock = Lock()
+        self._heartbeat_write_throttle_sec = max(
+            0.0,
+            float(getattr(settings, "RUNNER_HEARTBEAT_WRITE_THROTTLE_SEC", 5.0) or 5.0),
+        )
+
+    def _fail_start_deployment_after_bootstrap_failure(
+        self,
+        *,
+        deployment_id: int | None,
+        account_id: int | None,
+        command_id: str | None,
+        runner_id: str,
+        slot_id: str | None,
+        reason: str,
+        trace_id: str | None,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        if deployment_id is None:
+            return
+
+        deployment = self._repo.get_deployment(deployment_id=deployment_id)
+        if _deployment_wants_stopped(deployment):
+            return
+
+        command = self._repo.get_execution_command(command_id=command_id or "") if command_id else None
+        command_type = str((command or {}).get("command_type") or "").strip().upper()
+        deployment_status = str((deployment or {}).get("status") or "").strip().lower()
+        start_context = command_type == "START_BOT" or deployment_status in {"start_requested", "starting"}
+        if not start_context:
+            return
+
+        if command_id and command_type in {"", "START_BOT"}:
+            self._repo.update_execution_command_delivery(
+                command_id=command_id,
+                status="failed",
+                error_text=reason,
+                payload={
+                    "last_event_type": event_type,
+                    "runner_id": runner_id,
+                    "slot_id": slot_id,
+                    "failure_reason": reason,
+                },
+            )
+        failed_account_id = account_id or (command or {}).get("account_id")
+        if failed_account_id is not None and start_failure_is_credential_failure(reason=reason, payload=payload):
+            self._repo.mark_account_runtime_login_result(
+                account_id=int(failed_account_id),
+                ok=False,
+                error_text=reason,
+            )
+
+        self._repo.update_deployment_status(
+            deployment_id=deployment_id,
+            status=DeploymentStatus.FAILED.value,
+            desired_state="stopped",
+            is_active=False,
+            health_status="bootstrap_failed",
+            last_error=reason,
+            stopped=True,
+            runner_id=runner_id,
+            slot_id=slot_id,
+        )
+        self._repo.release_deployment_slot(deployment_id=deployment_id, keep_sticky=False)
+        insert_audit = getattr(self._repo, "insert_deployment_audit", None)
+        if callable(insert_audit):
+            insert_audit(
+                deployment_id=deployment_id,
+                action="deployment.start_failed",
+                payload={
+                    "deployment_id": deployment_id,
+                    "account_id": account_id,
+                    "command_id": command_id,
+                    "runner_id": runner_id,
+                    "slot_id": slot_id,
+                    "reason": reason,
+                },
+                result="bootstrap_failed",
+                trace_id=trace_id,
+            )
+        schedule_error_alert(
+            area="Windows runner",
+            summary="Bot không khởi động được trên runner.",
+            severity="critical",
+            account_id=account_id,
+            deployment_id=deployment_id,
+            runner_id=runner_id,
+            slot_id=slot_id,
+            impact="User có thể không bật được bot.",
+            action="Kiểm tra log Windows runner, slot MT5 và command START_BOT.",
+            detail={"reason": reason, "command_id": command_id, "event_type": event_type},
+            alert_key=f"runner_start_bootstrap_failed:{deployment_id}:{runner_id}:{slot_id}",
+            cooldown_sec=180,
+        )
+
+    def _heartbeat_cache_key(
+        self,
+        *,
+        runner_id: str,
+        slot_id: str | None,
+        account_id: int | None,
+        deployment_id: int | None,
+    ) -> tuple[str, str, str, str]:
+        return (
+            str(runner_id or "").strip(),
+            str(slot_id or "").strip(),
+            str(account_id or ""),
+            str(deployment_id or ""),
+        )
+
+    def _should_write_heartbeat(
+        self,
+        *,
+        runner_id: str,
+        slot_id: str | None,
+        account_id: int | None,
+        deployment_id: int | None,
+        payload: dict[str, Any],
+    ) -> bool:
+        if self._heartbeat_write_throttle_sec <= 0:
+            return True
+        key = self._heartbeat_cache_key(
+            runner_id=runner_id,
+            slot_id=slot_id,
+            account_id=account_id,
+            deployment_id=deployment_id,
+        )
+        state_signature = _json_signature(
+            {
+                "runner_id": key[0],
+                "slot_id": key[1],
+                "account_id": key[2],
+                "deployment_id": key[3],
+                "state": _heartbeat_state_payload(payload),
+            }
+        )
+        now = time.monotonic()
+        with self._heartbeat_write_lock:
+            previous = self._heartbeat_write_cache.get(key)
+            if (
+                previous
+                and previous.get("state_signature") == state_signature
+                and now - float(previous.get("written_at") or 0.0) < self._heartbeat_write_throttle_sec
+            ):
+                return False
+            self._heartbeat_write_cache[key] = {
+                "state_signature": state_signature,
+                "written_at": now,
+            }
+            return True
+
+    def _reconcile_runtime_slot(
+        self,
+        *,
+        deployment_id: int | None,
+        account_id: int | None,
+        runner_id: str,
+        slot_id: str | None,
+    ) -> None:
+        if deployment_id is None or not slot_id:
+            return
+        reconcile = getattr(self._repo, "reconcile_deployment_runtime_slot", None)
+        if not callable(reconcile):
+            return
+        reconcile(
+            deployment_id=deployment_id,
+            account_id=account_id,
+            runner_id=runner_id,
+            slot_id=slot_id,
+        )
+
+    async def _fallback_config_hot_update_restart(
+        self,
+        *,
+        deployment_id: int,
+        command: dict[str, Any],
+        reason: str,
+        trace_id: str | None,
+    ) -> None:
+        if not _should_fallback_config_hot_update(reason):
+            return
+        deployment = self._repo.get_deployment(deployment_id=deployment_id)
+        if not deployment:
+            return
+        if _deployment_wants_stopped(deployment):
+            self._repo.insert_deployment_audit(
+                deployment_id=deployment_id,
+                action="deployment.config.hot_update_failed",
+                payload={
+                    "deployment_id": deployment_id,
+                    "command_id": command.get("command_id"),
+                    "reason": reason,
+                },
+                result="deployment_stopping_skip_restart",
+                trace_id=trace_id,
+            )
+            return
+        if str(deployment.get("status") or "").strip().lower() != "running":
+            self._repo.insert_deployment_audit(
+                deployment_id=deployment_id,
+                action="deployment.config.hot_update_failed",
+                payload={
+                    "deployment_id": deployment_id,
+                    "command_id": command.get("command_id"),
+                    "reason": reason,
+                    "deployment_status": deployment.get("status"),
+                },
+                result="restart_required_not_running",
+                trace_id=trace_id,
+            )
+            return
+
+        pending = self._repo.get_pending_account_start_stop_command(account_id=int(deployment["account_id"]))
+        if pending:
+            self._repo.insert_deployment_audit(
+                deployment_id=deployment_id,
+                action="deployment.config.hot_update_failed",
+                payload={
+                    "deployment_id": deployment_id,
+                    "command_id": command.get("command_id"),
+                    "pending_command_id": pending.get("command_id"),
+                    "reason": reason,
+                },
+                result="restart_required_start_stop_pending",
+                trace_id=trace_id,
+            )
+            return
+
+        from app.orchestration.deployment_manager import DeploymentManagerService
+
+        restart_trace_id = f"{trace_id or command.get('trace_id') or uuid.uuid4().hex}:restart"
+        manager = DeploymentManagerService(self._repo, command_router=self._command_router)
+        try:
+            restart_result = await manager.request_config_restart(
+                deployment=deployment,
+                trace_id=restart_trace_id,
+            )
+            restart_command = restart_result.get("command") or {}
+            self._repo.insert_deployment_audit(
+                deployment_id=deployment_id,
+                action="deployment.config.hot_update_fallback_restart_requested",
+                payload={
+                    "deployment_id": deployment_id,
+                    "account_id": deployment.get("account_id"),
+                    "failed_command_id": command.get("command_id"),
+                    "restart_command_id": restart_command.get("command_id"),
+                    "reason": reason,
+                    "coalesced": bool(restart_result.get("coalesced")),
+                },
+                result="coalesced" if restart_result.get("coalesced") else "stop_queued",
+                trace_id=restart_command.get("trace_id") or restart_trace_id,
+            )
+        except Exception as exc:
+            self._repo.insert_deployment_audit(
+                deployment_id=deployment_id,
+                action="deployment.config.hot_update_fallback_restart_failed",
+                payload={
+                    "deployment_id": deployment_id,
+                    "account_id": deployment.get("account_id"),
+                    "failed_command_id": command.get("command_id"),
+                    "reason": reason,
+                    "restart_error": str(exc)[:200],
+                },
+                result="enqueue_failed",
+                trace_id=restart_trace_id,
+            )
+            schedule_error_alert(
+                area="Cập nhật cấu hình bot",
+                summary="Không tự restart được bot sau khi hot-update config lỗi.",
+                exc=exc,
+                deployment_id=deployment_id,
+                account_id=deployment.get("account_id"),
+                impact="Thay đổi cấu hình có thể chưa có hiệu lực.",
+                action="Kiểm tra lệnh UPDATE_BOT_CONFIG và trạng thái deployment.",
+                detail={"reason": reason, "failed_command_id": command.get("command_id")},
+                alert_key=f"config_hot_update_fallback_restart_failed:{deployment_id}:{exc.__class__.__name__}",
+                cooldown_sec=180,
+            )
+
+    def _build_restart_start_payload(
+        self,
+        *,
+        deployment: dict[str, Any],
+        bot: dict[str, Any],
+        stop_command: dict[str, Any],
+    ) -> dict[str, Any]:
+        deployment_config = normalize_deployment_config(
+            bot=bot,
+            config=deployment.get("config_json") or {},
+        )
+        return {
+            "account_id": int(deployment["account_id"]),
+            "mode": str(deployment.get("mode") or "live").strip().lower() or "live",
+            "broker": deployment.get("broker"),
+            "server": deployment.get("server"),
+            "login": deployment.get("login"),
+            "bot_name": bot.get("bot_name") or deployment.get("bot_name"),
+            "bot_version": bot.get("version") or "",
+            "runtime_entry": bot.get("runtime_entry") or "",
+            "profile_class": bot.get("profile_class") or deployment.get("profile_class") or "",
+            "resource_hints": bot.get("resource_hints") or {},
+            "config_contract_version": TRADING_CONFIG_SCHEMA_VERSION,
+            "config": deployment_config,
+            "sticky_reused": True,
+            "control_flow": "deployment_config_restart",
+            "restart_policy": "stop_then_start_same_deployment",
+            "config_restart_stop_command_id": stop_command.get("command_id"),
+            "config_update_trace_id": (stop_command.get("payload_json") or {}).get("config_update_trace_id"),
+        }
+
+    async def _restart_after_config_stop(
+        self,
+        *,
+        deployment_id: int,
+        command_id: str | None,
+    ) -> None:
+        get_stop_command = getattr(self._repo, "get_config_restart_stop_command_for_start", None)
+        if not callable(get_stop_command):
+            return
+        stop_command = get_stop_command(
+            deployment_id=deployment_id,
+            command_id=command_id,
+        )
+        if not stop_command:
+            return
+        deployment = self._repo.get_deployment(deployment_id=deployment_id)
+        if not deployment:
+            self._repo.insert_deployment_audit(
+                deployment_id=deployment_id,
+                action="deployment.config.restart_failed",
+                payload={
+                    "deployment_id": deployment_id,
+                    "command_id": stop_command.get("command_id"),
+                    "reason": "deployment_not_found_after_stop",
+                },
+                result="deployment_not_found",
+                trace_id=stop_command.get("trace_id"),
+            )
+            return
+
+        runner_id = str(deployment.get("runner_id") or stop_command.get("runner_id") or "").strip()
+        slot_id = _canonical_slot_id(deployment.get("slot_id") or stop_command.get("slot_id"))
+        if not runner_id or not slot_id:
+            self._repo.insert_deployment_audit(
+                deployment_id=deployment_id,
+                action="deployment.config.restart_failed",
+                payload={
+                    "deployment_id": deployment_id,
+                    "command_id": stop_command.get("command_id"),
+                    "reason": "runtime_binding_missing_after_stop",
+                },
+                result="runtime_binding_missing",
+                trace_id=stop_command.get("trace_id"),
+            )
+            return
+
+        try:
+            binding = self._repo.allocate_slot_binding(
+                account_id=int(deployment["account_id"]),
+                runner_id=runner_id,
+                slot_id=slot_id,
+                sticky=True,
+            )
+            start_trace_id = f"{stop_command.get('trace_id') or uuid.uuid4().hex}:start"
+            updated = self._repo.update_deployment_status(
+                deployment_id=deployment_id,
+                status=DeploymentStatus.START_REQUESTED.value,
+                desired_state="running",
+                is_active=True,
+                health_status="starting",
+                runner_id=runner_id,
+                slot_id=slot_id,
+            )
+            restart_deployment = {**deployment, **(updated or {})}
+            bot_name = str(deployment.get("bot_code") or deployment.get("bot_name") or "").strip()
+            bot = self._repo.get_bot_by_name(bot_name=bot_name) or {
+                "bot_code": deployment.get("bot_code"),
+                "bot_name": deployment.get("bot_name"),
+                "profile_class": deployment.get("profile_class"),
+                "resource_hints": {},
+            }
+            payload = self._build_restart_start_payload(
+                deployment=restart_deployment,
+                bot=bot,
+                stop_command=stop_command,
+            )
+            command = await self._command_router.dispatch(
+                command_type=CommandType.START_BOT,
+                account_id=int(deployment["account_id"]),
+                deployment_id=deployment_id,
+                bot_id=str(bot.get("bot_code") or bot.get("bot_id") or deployment.get("bot_code") or ""),
+                runner_id=runner_id,
+                slot_id=slot_id,
+                priority=95,
+                payload=payload,
+                trace_id=start_trace_id,
+            )
+            self._repo.insert_deployment_audit(
+                deployment_id=deployment_id,
+                action="deployment.config.restart_requested",
+                payload={
+                    "deployment_id": deployment_id,
+                    "account_id": deployment.get("account_id"),
+                    "stop_command_id": stop_command.get("command_id"),
+                    "start_command_id": command.get("command_id"),
+                    "trace_id": command.get("trace_id") or start_trace_id,
+                    "runner_id": runner_id,
+                    "slot_id": slot_id,
+                    "binding_id": binding.get("id") if isinstance(binding, dict) else None,
+                },
+                result="start_queued",
+                trace_id=command.get("trace_id") or start_trace_id,
+            )
+        except Exception as exc:
+            try:
+                self._repo.update_deployment_status(
+                    deployment_id=deployment_id,
+                    status=DeploymentStatus.FAILED.value,
+                    desired_state="stopped",
+                    is_active=False,
+                    health_status="config_restart_failed",
+                    last_error="config_restart_start_enqueue_failed",
+                    stopped=True,
+                    runner_id=runner_id,
+                    slot_id=slot_id,
+                )
+            except Exception:
+                pass
+            self._repo.insert_deployment_audit(
+                deployment_id=deployment_id,
+                action="deployment.config.restart_failed",
+                payload={
+                    "deployment_id": deployment_id,
+                    "command_id": stop_command.get("command_id"),
+                    "reason": str(exc)[:200],
+                },
+                result="start_enqueue_failed",
+                trace_id=stop_command.get("trace_id"),
+            )
+            schedule_error_alert(
+                area="Restart bot",
+                summary="Backend không gửi được lệnh START sau khi STOP để restart config.",
+                exc=exc,
+                deployment_id=deployment_id,
+                account_id=deployment.get("account_id"),
+                runner_id=runner_id,
+                slot_id=slot_id,
+                impact="Bot có thể đang dừng sau khi đổi cấu hình.",
+                action="Kiểm tra command queue và trạng thái deployment.",
+                detail={"stop_command_id": stop_command.get("command_id")},
+                alert_key=f"config_restart_start_enqueue_failed:{deployment_id}:{exc.__class__.__name__}",
+                cooldown_sec=180,
+            )
+            return
+
+    async def _start_queued_replacement_after_stop(
+        self,
+        *,
+        previous_deployment_id: int,
+        command_id: str | None,
+    ) -> None:
+        get_stop_command = getattr(self._repo, "get_replacement_stop_command_for_start", None)
+        if not callable(get_stop_command):
+            return
+        stop_command = get_stop_command(
+            previous_deployment_id=previous_deployment_id,
+            command_id=command_id,
+        )
+        if not stop_command:
+            return
+
+        try:
+            replacement_deployment_id = int((stop_command.get("payload_json") or {}).get("replacement_deployment_id") or 0)
+        except Exception:
+            replacement_deployment_id = 0
+        if replacement_deployment_id <= 0:
+            self._repo.insert_deployment_audit(
+                deployment_id=previous_deployment_id,
+                action="deployment.replacement_start_failed",
+                payload={
+                    "previous_deployment_id": previous_deployment_id,
+                    "command_id": stop_command.get("command_id"),
+                    "reason": "replacement_deployment_id_missing",
+                },
+                result="invalid_stop_payload",
+                trace_id=stop_command.get("trace_id"),
+            )
+            return
+
+        previous = self._repo.get_deployment(deployment_id=previous_deployment_id) or {
+            "id": previous_deployment_id,
+            "account_id": stop_command.get("account_id"),
+        }
+        from app.orchestration.deployment_manager import DeploymentManagerService
+
+        manager = DeploymentManagerService(self._repo, command_router=self._command_router)
+        try:
+            await manager.start_queued_replacement_deployment(
+                replacement_deployment_id=replacement_deployment_id,
+                previous_deployment=previous,
+                stop_command=stop_command,
+            )
+        except Exception as exc:
+            self._repo.update_deployment_status(
+                deployment_id=replacement_deployment_id,
+                status=DeploymentStatus.FAILED.value,
+                desired_state="stopped",
+                is_active=False,
+                health_status="replacement_start_failed",
+                last_error=str(exc)[:200],
+                stopped=True,
+            )
+            self._repo.insert_deployment_audit(
+                deployment_id=replacement_deployment_id,
+                action="deployment.replacement_start_failed",
+                payload={
+                    "deployment_id": replacement_deployment_id,
+                    "previous_deployment_id": previous_deployment_id,
+                    "stop_command_id": stop_command.get("command_id"),
+                    "reason": str(exc)[:200],
+                },
+                result="start_enqueue_failed",
+                trace_id=stop_command.get("trace_id"),
+            )
+
+    async def _auto_reroute_start_after_slot_failure(
+        self,
+        *,
+        deployment_id: int,
+        command: dict[str, Any],
+        runner_id: str,
+        slot_id: str | None,
+        payload: dict[str, Any],
+        trace_id: str | None,
+    ) -> dict[str, Any]:
+        command_payload = command.get("payload_json") if isinstance(command, dict) else {}
+        if not isinstance(command_payload, dict):
+            command_payload = {}
+        control_flow = str(command_payload.get("control_flow") or "").strip()
+        if control_flow == "deployment_config_restart":
+            return {"retry_queued": False, "reason": "control_flow_not_auto_rerouted"}
+
+        reason = start_failure_reason(payload, fallback="command_rejected")
+        action = classify_start_failure(reason=reason, command_payload=command_payload)
+        quarantine_result: dict[str, Any] | None = None
+        if action.slot_runtime_failure and slot_id:
+            quarantine_result = self._repo.quarantine_runner_slot_for_start_failure(
+                runner_id=runner_id,
+                slot_id=slot_id,
+                account_id=int(command.get("account_id") or 0),
+                deployment_id=deployment_id,
+                command_id=str(command.get("command_id") or ""),
+                reason=reason,
+                quarantine_sec=action.quarantine_sec,
+                runner_failure_window_sec=600,
+                runner_throttle_threshold=RUNNER_THROTTLE_FAILURE_THRESHOLD,
+                runner_throttle_sec=RUNNER_THROTTLE_SEC,
+            )
+            self._repo.insert_deployment_audit(
+                deployment_id=deployment_id,
+                action="deployment.start_slot_quarantined",
+                payload={
+                    "deployment_id": deployment_id,
+                    "command_id": command.get("command_id"),
+                    "runner_id": runner_id,
+                    "slot_id": slot_id,
+                    "reason": reason,
+                    "quarantine_sec": SLOT_QUARANTINE_SEC,
+                    "quarantine": quarantine_result,
+                },
+                result="slot_quarantined",
+                trace_id=trace_id,
+            )
+        if not action.auto_reroute:
+            return {
+                "retry_queued": False,
+                "reason": "not_auto_rerouteable",
+                "slot_runtime_failure": action.slot_runtime_failure,
+                "quarantine": quarantine_result,
+            }
+
+        deployment = self._repo.get_deployment(deployment_id=deployment_id)
+        if not deployment:
+            return {"retry_queued": False, "reason": "deployment_not_found", "quarantine": quarantine_result}
+        try:
+            user_id = int(deployment.get("user_id") or 0)
+            account_id = int(deployment.get("account_id") or command.get("account_id") or 0)
+        except Exception:
+            return {"retry_queued": False, "reason": "deployment_identity_invalid", "quarantine": quarantine_result}
+        if user_id <= 0 or account_id <= 0:
+            return {"retry_queued": False, "reason": "deployment_identity_missing", "quarantine": quarantine_result}
+
+        account = self._repo.get_account(account_id=account_id, user_id=user_id)
+        if not account:
+            return {"retry_queued": False, "reason": "account_not_found", "quarantine": quarantine_result}
+        bot_name = str(deployment.get("bot_code") or deployment.get("bot_name") or command.get("bot_id") or "").strip()
+        if not bot_name:
+            return {"retry_queued": False, "reason": "bot_name_missing", "quarantine": quarantine_result}
+
+        from app.orchestration.deployment_manager import DeploymentManagerService
+
+        manager = DeploymentManagerService(self._repo, command_router=self._command_router)
+        retry_extra = {
+            "control_flow": "auto_reroute_start",
+            "auto_reroute": True,
+            "auto_reroute_attempt": action.next_attempt,
+            "auto_reroute_from_deployment_id": deployment_id,
+            "auto_reroute_from_command_id": command.get("command_id"),
+            "auto_reroute_from_runner_id": runner_id,
+            "auto_reroute_from_slot_id": slot_id,
+            "auto_reroute_reason": reason,
+        }
+        result = await manager.start_deployment(
+            user_id=user_id,
+            account=account,
+            bot_name=bot_name,
+            bot_config_overrides=deployment.get("config_json") or {},
+            mode=str(deployment.get("mode") or "live").strip().lower() or "live",
+            start_payload_extra=retry_extra,
+        )
+        retry_deployment = result.get("deployment") or {}
+        retry_command = result.get("command") or {}
+        self._repo.insert_deployment_audit(
+            deployment_id=deployment_id,
+            action="deployment.start_auto_rerouted",
+            payload={
+                "deployment_id": deployment_id,
+                "retry_deployment_id": retry_deployment.get("id"),
+                "failed_command_id": command.get("command_id"),
+                "retry_command_id": retry_command.get("command_id"),
+                "from_runner_id": runner_id,
+                "from_slot_id": slot_id,
+                "to_runner_id": retry_command.get("runner_id"),
+                "to_slot_id": retry_command.get("slot_id"),
+                "attempt": action.next_attempt,
+                "reason": reason,
+                "quarantine": quarantine_result,
+            },
+            result="retry_queued",
+            trace_id=trace_id,
+        )
+        return {
+            "retry_queued": True,
+            "retry_deployment_id": retry_deployment.get("id"),
+            "retry_command_id": retry_command.get("command_id"),
+            "runner_id": retry_command.get("runner_id"),
+            "slot_id": retry_command.get("slot_id"),
+            "attempt": action.next_attempt,
+            "quarantine": quarantine_result,
+        }
+
+    async def ingest_heartbeat(
+        self,
+        *,
+        runner_id: str,
+        slot_id: str | None,
+        account_id: int | None,
+        deployment_id: int | None,
+        payload: dict[str, Any],
+        trace_id: str | None,
+    ) -> dict[str, Any]:
+        event_id = uuid.uuid4().hex
+        slot_id_value = _canonical_slot_id(slot_id)
+        event_model = RunnerEvent.model_validate(
+            {
+                "event_id": event_id,
+                "event_type": RunnerEventType.HEARTBEAT.value,
+                "account_id": account_id,
+                "deployment_id": deployment_id,
+                "bot_id": None,
+                "runner_id": runner_id,
+                "slot_id": slot_id_value,
+                "severity": "info",
+                "payload": payload or {},
+                "trace_id": trace_id,
+            }
+        )
+        if not self._should_write_heartbeat(
+            runner_id=runner_id,
+            slot_id=slot_id_value,
+            account_id=account_id,
+            deployment_id=deployment_id,
+            payload=payload or {},
+        ):
+            return {
+                "event_id": event_model.event_id,
+                "event_type": event_model.event_type.value,
+                "account_id": event_model.account_id,
+                "deployment_id": event_model.deployment_id,
+                "runner_id": event_model.runner_id,
+                "slot_id": event_model.slot_id,
+                "throttled": True,
+                "skipped_db_write": True,
+            }
+        self._repo.touch_runner_heartbeat(runner_id=runner_id, slot_id=slot_id_value, payload=payload)
+        self._reconcile_runtime_slot(
+            deployment_id=deployment_id,
+            account_id=account_id,
+            runner_id=runner_id,
+            slot_id=slot_id_value,
+        )
+        self._repo.touch_deployment_heartbeat(
+            deployment_id=deployment_id,
+            account_id=account_id,
+            runner_id=runner_id,
+            slot_id=slot_id_value,
+            payload=payload,
+        )
+        event = self._repo.insert_execution_event(
+            event_id=event_model.event_id,
+            event_type=event_model.event_type.value,
+            account_id=event_model.account_id,
+            deployment_id=event_model.deployment_id,
+            bot_id=event_model.bot_id,
+            runner_id=event_model.runner_id,
+            slot_id=event_model.slot_id,
+            command_id=event_model.command_id,
+            severity=event_model.severity.value,
+            payload=event_model.payload,
+            trace_id=event_model.trace_id,
+        )
+        await self._publisher.publish_event(
+            {
+                "event_id": event_model.event_id,
+                "event_type": event_model.event_type.value,
+                "account_id": event_model.account_id,
+                "deployment_id": event_model.deployment_id,
+                "bot_id": "",
+                "runner_id": event_model.runner_id,
+                "slot_id": event_model.slot_id or "",
+                "command_id": event_model.command_id or "",
+                "severity": "info",
+                "payload": event_model.payload,
+                "trace_id": event_model.trace_id or "",
+            }
+        )
+        return event
+
+    async def ingest_event(
+        self,
+        *,
+        event_id: str,
+        event_type: str,
+        account_id: int | None,
+        deployment_id: int | None,
+        bot_id: str | None,
+        runner_id: str,
+        slot_id: str | None,
+        severity: str,
+        payload: dict[str, Any],
+        trace_id: str | None,
+        command_id: str | None = None,
+        created_at: str | None = None,
+    ) -> dict[str, Any]:
+        slot_id_value = _canonical_slot_id(slot_id)
+        event_model = RunnerEvent.model_validate(
+            {
+                "event_id": event_id or uuid.uuid4().hex,
+                "event_type": event_type,
+                "account_id": account_id,
+                "deployment_id": deployment_id,
+                "bot_id": bot_id,
+                "runner_id": runner_id,
+                "slot_id": slot_id_value,
+                "severity": severity,
+                "payload": payload or {},
+                "trace_id": trace_id,
+                "command_id": command_id,
+                "created_at": created_at,
+            }
+        )
+        normalized_event_id = event_model.event_id
+        event_type_value = event_model.event_type.value
+        payload_map = dict(event_model.payload or {})
+        event_command_id = event_model.command_id or _payload_command_id(payload_map)
+        if event_model.created_at and not payload_map.get("event_at"):
+            payload_map["event_at"] = event_model.created_at
+        severity_value = event_model.severity.value
+        if event_type_value == EventType.HEARTBEAT.value and not self._should_write_heartbeat(
+            runner_id=event_model.runner_id,
+            slot_id=event_model.slot_id,
+            account_id=event_model.account_id,
+            deployment_id=event_model.deployment_id,
+            payload=payload_map,
+        ):
+            return {
+                "event_id": normalized_event_id,
+                "event_type": event_type_value,
+                "account_id": event_model.account_id,
+                "deployment_id": event_model.deployment_id,
+                "runner_id": event_model.runner_id,
+                "slot_id": event_model.slot_id,
+                "throttled": True,
+                "skipped_db_write": True,
+            }
+
+        self._repo.touch_runner_heartbeat(runner_id=runner_id, slot_id=slot_id_value, payload=payload_map)
+        if event_type_value == EventType.HEARTBEAT.value:
+            self._reconcile_runtime_slot(
+                deployment_id=event_model.deployment_id,
+                account_id=event_model.account_id,
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+            )
+            self._repo.touch_deployment_heartbeat(
+                deployment_id=event_model.deployment_id,
+                account_id=event_model.account_id,
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+                payload=payload_map,
+            )
+
+        event = self._repo.insert_execution_event(
+            event_id=normalized_event_id,
+            event_type=event_type_value,
+            account_id=event_model.account_id,
+            deployment_id=event_model.deployment_id,
+            bot_id=event_model.bot_id,
+            runner_id=event_model.runner_id,
+            slot_id=event_model.slot_id,
+            command_id=event_command_id,
+            severity=severity_value,
+            payload=payload_map,
+            trace_id=event_model.trace_id,
+        )
+
+        if event_command_id and event_type_value in {
+            EventType.BOT_STARTED.value,
+            EventType.BOT_STOPPED.value,
+            EventType.ORDER_SENT.value,
+            EventType.ORDER_FILLED.value,
+            EventType.POSITION_UPDATED.value,
+        }:
+            self._repo.update_execution_command_delivery(
+                command_id=event_command_id,
+                status="acknowledged",
+                error_text=None,
+                payload={"last_event_type": event_type_value, "runner_id": event_model.runner_id, "slot_id": event_model.slot_id},
+            )
+        elif event_command_id and event_type_value in {EventType.ORDER_REJECTED.value, EventType.COMMAND_REJECTED.value}:
+            self._repo.update_execution_command_delivery(
+                command_id=event_command_id,
+                status="failed",
+                error_text=str(payload_map.get("reason") or payload_map.get("message") or event_type_value.lower()),
+                payload={"last_event_type": event_type_value, "runner_id": event_model.runner_id, "slot_id": event_model.slot_id},
+            )
+
+        if event_type_value == EventType.BOT_STARTED.value and event_model.deployment_id is not None:
+            deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
+            if not _deployment_wants_stopped(deployment):
+                self._reconcile_runtime_slot(
+                    deployment_id=event_model.deployment_id,
+                    account_id=event_model.account_id,
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                )
+                self._repo.update_deployment_status(
+                    deployment_id=event_model.deployment_id,
+                    status=DeploymentStatus.RUNNING.value,
+                    desired_state="running",
+                    is_active=True,
+                    health_status="running",
+                    started=True,
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                )
+                started_account_id = event_model.account_id or (deployment or {}).get("account_id")
+                if started_account_id is not None:
+                    self._repo.mark_account_runtime_login_result(
+                        account_id=int(started_account_id),
+                        ok=True,
+                    )
+                if event_command_id:
+                    command = self._repo.get_execution_command(command_id=event_command_id)
+                    command_payload = command.get("payload_json") if isinstance(command, dict) else {}
+                    if isinstance(command_payload, dict) and command_payload.get("control_flow") == "deployment_config_restart":
+                        self._repo.insert_deployment_audit(
+                            deployment_id=event_model.deployment_id,
+                            action="deployment.config.restarted",
+                            payload={
+                                "deployment_id": event_model.deployment_id,
+                                "account_id": event_model.account_id,
+                                "command_id": event_command_id,
+                                "runner_id": event_model.runner_id,
+                                "slot_id": event_model.slot_id,
+                            },
+                            result="bot_started",
+                            trace_id=event_model.trace_id,
+                        )
+        elif event_type_value == EventType.BOT_STOPPED.value and event_model.deployment_id is not None:
+            # STOP events must be idempotent.  Do not call the runtime-slot
+            # reconcile path here: that path marks a binding active/current and
+            # can collide with a newer deployment for the same account.
+            self._repo.update_deployment_status(
+                deployment_id=event_model.deployment_id,
+                status=DeploymentStatus.STOPPED.value,
+                desired_state="stopped",
+                is_active=False,
+                health_status="stopped",
+                stopped=True,
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+            )
+            self._repo.release_deployment_slot(deployment_id=event_model.deployment_id, keep_sticky=False)
+            self._repo.fail_pending_start_commands_for_deployment(
+                deployment_id=event_model.deployment_id,
+                reason="start_command_superseded_by_bot_stopped",
+            )
+            self._repo.reconcile_terminal_bot_control_commands(deployment_id=event_model.deployment_id)
+            await self._restart_after_config_stop(
+                deployment_id=event_model.deployment_id,
+                command_id=event_command_id,
+            )
+            await self._start_queued_replacement_after_stop(
+                previous_deployment_id=event_model.deployment_id,
+                command_id=event_command_id,
+            )
+        elif event_type_value == EventType.SLOT_BROKEN.value:
+            if event_model.slot_id:
+                self._repo.update_runner_slot_state(
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                    status="broken",
+                    metadata=payload_map,
+                )
+            if event_model.deployment_id is not None:
+                self._repo.update_deployment_status(
+                    deployment_id=event_model.deployment_id,
+                    status=DeploymentStatus.FAILED.value,
+                    desired_state="stopped",
+                    is_active=False,
+                    health_status="broken",
+                    last_error=str(payload_map.get("reason") or "slot_broken"),
+                    stopped=True,
+                )
+            schedule_error_alert(
+                area="Windows runner",
+                summary="Một slot MT5 bị lỗi.",
+                severity="critical",
+                account_id=event_model.account_id,
+                deployment_id=event_model.deployment_id,
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+                impact="Bot trên slot này có thể đã dừng hoặc không nhận lệnh.",
+                action="Kiểm tra MT5 terminal, worker slot và log Windows.",
+                detail={"reason": _event_reason(payload_map) or "slot_broken"},
+                alert_key=f"slot_broken:{event_model.runner_id}:{event_model.slot_id}",
+                cooldown_sec=180,
+            )
+        elif event_type_value == EventType.SLOT_DEGRADED.value:
+            if event_model.slot_id:
+                self._repo.update_runner_slot_state(
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                    status="degraded",
+                    metadata=payload_map,
+                )
+            if event_model.deployment_id is not None:
+                self._repo.update_deployment_status(
+                    deployment_id=event_model.deployment_id,
+                    status=DeploymentStatus.RUNNING.value,
+                    desired_state="running",
+                    is_active=True,
+                    health_status="degraded",
+                )
+        elif event_type_value == EventType.SLOT_STATE_CHANGED.value:
+            slot_state = _normalize_slot_projection_state(payload_map)
+            if event_model.slot_id and slot_state:
+                self._repo.update_runner_slot_state(
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                    status=slot_state,
+                    metadata=payload_map,
+                )
+        elif event_type_value == EventType.COMMAND_REJECTED.value:
+            command = self._repo.get_execution_command(command_id=event_command_id or "")
+            if command and event_model.deployment_id is not None:
+                command_type = str(command.get("command_type") or "").strip().upper()
+                command_payload = command.get("payload_json") if isinstance(command, dict) else {}
+                if isinstance(command_payload, dict) and command_payload.get("control_flow") == "deployment_config_restart":
+                    self._repo.insert_deployment_audit(
+                        deployment_id=event_model.deployment_id,
+                        action="deployment.config.restart_failed",
+                        payload={
+                            "deployment_id": event_model.deployment_id,
+                            "account_id": event_model.account_id,
+                            "command_id": event_command_id,
+                            "command_type": command_type,
+                            "reason": _event_reason(payload_map) or "command_rejected",
+                        },
+                        result="command_rejected",
+                        trace_id=event_model.trace_id,
+                    )
+                if isinstance(command_payload, dict) and command_payload.get("control_flow") == "deployment_replacement_start":
+                    try:
+                        replacement_deployment_id = int(command_payload.get("replacement_deployment_id") or 0)
+                    except Exception:
+                        replacement_deployment_id = 0
+                    reason = _event_reason(payload_map) or "command_rejected"
+                    if replacement_deployment_id > 0:
+                        self._repo.update_deployment_status(
+                            deployment_id=replacement_deployment_id,
+                            status=DeploymentStatus.FAILED.value,
+                            desired_state="stopped",
+                            is_active=False,
+                            health_status="replacement_stop_rejected",
+                            last_error=reason,
+                            stopped=True,
+                        )
+                        self._repo.insert_deployment_audit(
+                            deployment_id=replacement_deployment_id,
+                            action="deployment.replacement_start_failed",
+                            payload={
+                                "deployment_id": replacement_deployment_id,
+                                "previous_deployment_id": event_model.deployment_id,
+                                "command_id": event_command_id,
+                                "reason": reason,
+                            },
+                            result="previous_stop_rejected",
+                            trace_id=event_model.trace_id,
+                        )
+                if command_type == "UPDATE_BOT_CONFIG":
+                    schedule_error_alert(
+                        area="Cập nhật cấu hình bot",
+                        summary="Runner từ chối cập nhật cấu hình khi bot đang chạy.",
+                        severity="warning",
+                        account_id=event_model.account_id,
+                        deployment_id=event_model.deployment_id,
+                        runner_id=event_model.runner_id,
+                        slot_id=event_model.slot_id,
+                        impact="Thay đổi như DCA có thể chưa có hiệu lực ngay.",
+                        action="Kiểm tra reason từ runner và fallback restart policy.",
+                        detail={"reason": _event_reason(payload_map) or "command_rejected"},
+                        alert_key=f"update_bot_config_rejected:{event_model.deployment_id}:{_event_reason(payload_map)}",
+                        cooldown_sec=180,
+                    )
+                    await self._fallback_config_hot_update_restart(
+                        deployment_id=event_model.deployment_id,
+                        command=command,
+                        reason=_event_reason(payload_map) or "command_rejected",
+                        trace_id=event_model.trace_id,
+                    )
+                if command_type == "START_BOT":
+                    reason = start_failure_reason(payload_map, fallback="command_rejected")
+                    failed_account_id = event_model.account_id or command.get("account_id")
+                    if failed_account_id is not None and start_failure_is_credential_failure(
+                        reason=reason,
+                        payload=payload_map,
+                    ):
+                        self._repo.mark_account_runtime_login_result(
+                            account_id=int(failed_account_id),
+                            ok=False,
+                            error_text=reason,
+                        )
+                    self._repo.update_deployment_status(
+                        deployment_id=event_model.deployment_id,
+                        status=DeploymentStatus.FAILED.value,
+                        desired_state="stopped",
+                        is_active=False,
+                        health_status="rejected",
+                        last_error=reason,
+                        stopped=True,
+                    )
+                    self._repo.release_deployment_slot(
+                        deployment_id=event_model.deployment_id,
+                        keep_sticky=False,
+                    )
+                    reroute_result: dict[str, Any] = {}
+                    try:
+                        reroute_result = await self._auto_reroute_start_after_slot_failure(
+                            deployment_id=event_model.deployment_id,
+                            command=command,
+                            runner_id=event_model.runner_id,
+                            slot_id=event_model.slot_id,
+                            payload=payload_map,
+                            trace_id=event_model.trace_id,
+                        )
+                    except Exception as exc:
+                        reroute_result = {"retry_queued": False, "reason": f"auto_reroute_failed:{exc.__class__.__name__}"}
+                        schedule_error_alert(
+                            area="Tự chuyển slot",
+                            summary="Backend chưa tự chuyển được bot sang slot khác.",
+                            severity="warning",
+                            account_id=event_model.account_id,
+                            deployment_id=event_model.deployment_id,
+                            runner_id=event_model.runner_id,
+                            slot_id=event_model.slot_id,
+                            impact="User có thể phải bật lại bot.",
+                            action="Kiểm tra slot còn trống và lỗi START gần nhất.",
+                            detail={"reason": reason, "error": str(exc)[:200]},
+                            alert_key=f"start_auto_reroute_failed:{event_model.deployment_id}:{exc.__class__.__name__}",
+                            cooldown_sec=180,
+                        )
+                    if reroute_result.get("retry_queued"):
+                        schedule_error_alert(
+                            area="Windows runner",
+                            summary="Một slot lỗi, backend đã tự chuyển bot sang slot khác.",
+                            severity="warning",
+                            account_id=event_model.account_id,
+                            deployment_id=reroute_result.get("retry_deployment_id") or event_model.deployment_id,
+                            runner_id=reroute_result.get("runner_id") or event_model.runner_id,
+                            slot_id=reroute_result.get("slot_id") or event_model.slot_id,
+                            impact="User không cần thao tác lại nếu slot mới chạy thành công.",
+                            action="Theo dõi command START mới và slot vừa được chuyển.",
+                            detail={
+                                "failed_deployment_id": event_model.deployment_id,
+                                "failed_runner_id": event_model.runner_id,
+                                "failed_slot_id": event_model.slot_id,
+                                "reason": reason,
+                                "retry": reroute_result,
+                            },
+                            alert_key=f"start_bot_auto_rerouted:{event_model.deployment_id}:{reroute_result.get('retry_deployment_id')}",
+                            cooldown_sec=180,
+                        )
+                    else:
+                        schedule_error_alert(
+                            area="Windows runner",
+                            summary="Runner từ chối lệnh bật bot.",
+                            severity="critical",
+                            account_id=event_model.account_id,
+                            deployment_id=event_model.deployment_id,
+                            runner_id=event_model.runner_id,
+                            slot_id=event_model.slot_id,
+                            impact="User có thể không bật được bot.",
+                            action="Kiểm tra reason từ runner, slot và command START_BOT.",
+                            detail={"reason": reason, "auto_reroute": reroute_result},
+                            alert_key=f"start_bot_rejected:{event_model.deployment_id}:{reason}",
+                            cooldown_sec=180,
+                        )
+                elif command_type == "STOP_BOT" and _event_reason(payload_map) == "account_not_active":
+                    deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
+                    if _deployment_wants_stopped(deployment):
+                        if event_command_id:
+                            self._repo.update_execution_command_delivery(
+                                command_id=event_command_id,
+                                status="acknowledged",
+                                error_text=None,
+                                payload={
+                                    "last_event_type": event_type_value,
+                                    "runner_id": event_model.runner_id,
+                                    "slot_id": event_model.slot_id,
+                                    "idempotent_stop": True,
+                                    "runner_reason": "account_not_active",
+                                },
+                            )
+                        self._repo.update_deployment_status(
+                            deployment_id=event_model.deployment_id,
+                            status=DeploymentStatus.STOPPED.value,
+                            desired_state="stopped",
+                            is_active=False,
+                            health_status="stopped",
+                            stopped=True,
+                            runner_id=event_model.runner_id,
+                            slot_id=event_model.slot_id,
+                        )
+                        self._repo.release_deployment_slot(deployment_id=event_model.deployment_id, keep_sticky=False)
+                        self._repo.fail_pending_start_commands_for_deployment(
+                            deployment_id=event_model.deployment_id,
+                            reason="stop_rejected_account_not_active",
+                        )
+                        await self._restart_after_config_stop(
+                            deployment_id=event_model.deployment_id,
+                            command_id=event_command_id,
+                        )
+                        await self._start_queued_replacement_after_stop(
+                            previous_deployment_id=event_model.deployment_id,
+                            command_id=event_command_id,
+                        )
+                elif command_type in {"PLACE_ORDER", "MODIFY_ORDER", "CLOSE_ORDER", "SYNC_STATE"}:
+                    self._repo.update_deployment_status(
+                        deployment_id=event_model.deployment_id,
+                        status=DeploymentStatus.RUNNING.value,
+                        desired_state="running",
+                        is_active=True,
+                        health_status="running",
+                        last_error=str(payload_map.get("reason") or "command_rejected"),
+                    )
+        elif event_type_value == EventType.RUNTIME_LOG.value:
+            runtime_message = str(payload_map.get("message") or payload_map.get("log_message") or "runtime_log")
+            self._repo.insert_runtime_log(
+                account_id=event_model.account_id,
+                deployment_id=event_model.deployment_id,
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+                level=str(payload_map.get("level") or severity_value or "info"),
+                message=runtime_message,
+                payload=payload_map,
+                trace_id=event_model.trace_id,
+            )
+            runtime_text = f"{runtime_message} {_event_reason(payload_map)}".lower()
+            if "backend_state" in runtime_text or "store_candle_skipped" in runtime_text:
+                schedule_error_alert(
+                    area="GsAlgo state bridge",
+                    summary="Bot báo lỗi khi gửi state/candle về backend.",
+                    severity="warning",
+                    account_id=event_model.account_id,
+                    deployment_id=event_model.deployment_id,
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                    impact="Dashboard, audit hoặc recovery có thể thiếu dữ liệu.",
+                    action="Kiểm tra endpoint bot-state, nginx và dữ liệu state mới nhất.",
+                    detail={
+                        "message": runtime_message,
+                        "reason": _event_reason(payload_map),
+                        "status_code": payload_map.get("status_code"),
+                    },
+                    alert_key=f"runtime_backend_state:{event_model.deployment_id}:{payload_map.get('status_code') or _event_reason(payload_map)}",
+                    cooldown_sec=180,
+                )
+            bootstrap_failure_reason = _start_bootstrap_failure_reason(payload_map)
+            if bootstrap_failure_reason:
+                self._fail_start_deployment_after_bootstrap_failure(
+                    deployment_id=event_model.deployment_id,
+                    account_id=event_model.account_id,
+                    command_id=event_command_id,
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                    reason=bootstrap_failure_reason,
+                trace_id=event_model.trace_id,
+                event_type=event_type_value,
+                payload=payload_map,
+            )
+        if event_model.account_id is not None and payload_map:
+            if any(key in payload_map for key in ("pnl", "balance", "equity", "free_margin", "connection_status")):
+                self._repo.upsert_account_state_snapshot(
+                    account_id=event_model.account_id,
+                    deployment_id=event_model.deployment_id,
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                    connection_status=str(payload_map.get("connection_status") or "connected"),
+                    pnl=float(payload_map["pnl"]) if payload_map.get("pnl") is not None else None,
+                    balance=float(payload_map["balance"]) if payload_map.get("balance") is not None else None,
+                    equity=float(payload_map["equity"]) if payload_map.get("equity") is not None else None,
+                    free_margin=float(payload_map["free_margin"]) if payload_map.get("free_margin") is not None else None,
+                    payload=payload_map,
+                )
+            positions = payload_map.get("positions")
+            if isinstance(positions, list):
+                for index, position in enumerate(positions):
+                    if not isinstance(position, dict):
+                        continue
+                    self._repo.upsert_position_snapshot(
+                        account_id=event_model.account_id,
+                        deployment_id=event_model.deployment_id,
+                        position_key=str(position.get("position_key") or position.get("id") or f"pos-{index}"),
+                        symbol=str(position.get("symbol") or ""),
+                        side=str(position.get("side") or ""),
+                        volume=float(position["volume"]) if position.get("volume") is not None else None,
+                        entry_price=float(position["entry_price"]) if position.get("entry_price") is not None else None,
+                        mark_price=float(position["mark_price"]) if position.get("mark_price") is not None else None,
+                        pnl=float(position["pnl"]) if position.get("pnl") is not None else None,
+                        payload=position,
+                    )
+
+        self._repo.upsert_execution_audit(
+            event_id=normalized_event_id,
+            command_id=event_command_id,
+            trace_id=event_model.trace_id,
+            account_id=event_model.account_id,
+            deployment_id=event_model.deployment_id,
+            runner_id=event_model.runner_id,
+            slot_id=event_model.slot_id,
+            event_type=event_type_value,
+            severity=severity_value,
+            audit_status="recorded",
+            payload=payload_map,
+            source_stream_id=None,
+        )
+
+        await self._publisher.publish_event(
+            {
+                "event_id": normalized_event_id,
+                "event_type": event_type_value,
+                "account_id": event_model.account_id,
+                "deployment_id": event_model.deployment_id,
+                "bot_id": event_model.bot_id or "",
+                "runner_id": event_model.runner_id,
+                "slot_id": event_model.slot_id or "",
+                "command_id": event_command_id or "",
+                "severity": severity_value,
+                "payload": payload_map,
+                "trace_id": event_model.trace_id or "",
+            }
+        )
+        return event

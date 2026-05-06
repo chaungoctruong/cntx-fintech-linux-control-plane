@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 960" role="img" aria-labelledby="title desc">
+  <title id="title">CNTx labs</title>
+  <desc id="desc">CNTx labs trading operations mark</desc>
+  <rect width="960" height="960" rx="180" fill="#05070b"/>
+  <path d="M170 604 360 236h108L279 604H170Z" fill="#22d3ee"/>
+  <path d="M359 604 548 236h108L467 604H359Z" fill="#34d399"/>
+  <path d="M595 604 470 430l64-76 189 250H595Z" fill="#f8fafc"/>
+  <path d="M666 236h120L591 470l-59-78 134-156Z" fill="#f8fafc"/>
+  <text x="480" y="750" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="104" font-weight="800" fill="#f8fafc">CNTx</text>
+  <text x="480" y="820" text-anchor="middle" font-family="Inter, Arial, sans-serif" font-size="48" font-weight="600" letter-spacing="12" fill="#94a3b8">labs</text>
+</svg>

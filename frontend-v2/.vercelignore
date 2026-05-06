@@ -1,0 +1,15 @@
+# Mini App deploy boundary.
+# Keep backend-side bot repositories out of any frontend deploy rooted at
+# `frontend-v2`. `bot-trading/` is not Mini App content.
+bot-trading/
+trading-bot/
+../bot-trading/
+../trading-bot/
+
+# Only frontend-v2 static output should be deployed from this project.
+../backend_ai/
+../hubbot/
+../ops/
+../runner/
+../legacy/
+../backend-ctrader/

@@ -1,0 +1,421 @@
+"use client";
+
+import { useCallback, useState, type Dispatch, type SetStateAction } from "react";
+
+import {
+  claimMt5BotToken,
+  deleteMt5Account,
+  startMt5Deployment,
+  stopMt5Deployment,
+  type MT5AccountItem,
+  type MT5BotCatalogItem,
+  type MT5BotTokenEntitlement,
+  type MT5DeploymentItem,
+} from "@/lib/api";
+import {
+  getDeploymentByIdForAccount,
+  getLatestDeploymentForAccount,
+  getStartResponseDeploymentId,
+  isMt5AccountReady,
+  normalizeDeploymentId,
+  parsePositiveDecimalInput,
+  type TradingUnit,
+} from "@/components/Bot/mt5ControlUtils";
+import { getDeploymentFailureMessage, getFriendlyMt5ActionError } from "@/components/Bot/mt5ControlMessages";
+
+const START_STOP_POLL_DELAYS_MS = [500, 750, 1000, 1250, 1500, 2000, 2500, 3000];
+
+type NoticeTone = "success" | "error" | "info";
+
+type Snapshot = {
+  accounts: MT5AccountItem[];
+  deployments: MT5DeploymentItem[];
+};
+
+type LoadStateFn = (options?: { silentErrors?: boolean; spinner?: boolean; includeBots?: boolean }) => Promise<Snapshot | null>;
+
+type StartPollOptions = {
+  deploymentId?: number | null;
+  afterDeploymentId?: number | null;
+};
+
+type PollResult = {
+  settled: boolean;
+  success: boolean;
+  account: MT5AccountItem | null;
+  latestDeployment: MT5DeploymentItem | null;
+  outcome: "running" | "stopped" | "failed" | "pending";
+};
+
+type UnlockParams = {
+  selectedAccount: MT5AccountItem | null;
+  selectedBot: MT5BotCatalogItem | null;
+  botTokenInput: string;
+  onResetBotTokenInput: () => void;
+  onRequireTerms?: (afterAccept?: () => void) => boolean;
+};
+
+type StartParams = {
+  selectedAccount: MT5AccountItem | null;
+  selectedBot: MT5BotCatalogItem | null;
+  selectedAccountHasActiveBot: boolean;
+  telegramUserHasOtherActiveBot: boolean;
+  botAccessReady: boolean;
+  showTradingConfig: boolean;
+  tradingLotSize: string;
+  tradingStopLoss: string;
+  tradingTakeProfit: string;
+  tradingUnit: TradingUnit;
+  latestDeployment: MT5DeploymentItem | null;
+  activeBotEntitlementId?: string;
+  mt5FullAccess: boolean;
+  onRequireTerms?: (afterAccept?: () => void) => boolean;
+};
+
+type StopParams = {
+  selectedAccount: MT5AccountItem | null;
+  activeStopDeploymentId: number | null;
+};
+
+type DeleteParams = {
+  selectedAccount: MT5AccountItem | null;
+  selectedAccountHasActiveBot: boolean;
+  brokerKey: string;
+  onSetSelectedAccountId: (id: number | null) => void;
+  onResetBotTokenInput: () => void;
+};
+
+type UseMt5BotActionsArgs = {
+  loadState: LoadStateFn;
+  mt5FullAccess: boolean;
+  onNotice: (tone: NoticeTone, message: string) => void;
+  onClearNotice: () => void;
+  setBotTokenEntitlements: Dispatch<SetStateAction<MT5BotTokenEntitlement[]>>;
+};
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+export function useMt5BotActions({
+  loadState,
+  mt5FullAccess,
+  onNotice,
+  onClearNotice,
+  setBotTokenEntitlements,
+}: UseMt5BotActionsArgs) {
+  const [startingBot, setStartingBot] = useState(false);
+  const [stoppingBot, setStoppingBot] = useState(false);
+  const [deletingAccount, setDeletingAccount] = useState(false);
+  const [unlockingBotToken, setUnlockingBotToken] = useState(false);
+  const [deleteConfirmAccountId, setDeleteConfirmAccountId] = useState<number | null>(null);
+
+  const pollUntilStable = useCallback(async (
+    kind: "start" | "stop",
+    accountId: number,
+    startOptions?: StartPollOptions
+  ): Promise<PollResult> => {
+    let latestResult: PollResult = {
+      settled: false,
+      success: false,
+      account: null,
+      latestDeployment: null,
+      outcome: "pending",
+    };
+
+    for (const delayMs of START_STOP_POLL_DELAYS_MS) {
+      await sleep(delayMs);
+      const snapshot = await loadState({ silentErrors: true, spinner: false, includeBots: false });
+      if (!snapshot) {
+        continue;
+      }
+
+      const account = snapshot.accounts.find((item) => item.id === accountId) ?? null;
+      const latestDeployment = getLatestDeploymentForAccount(snapshot.deployments, accountId);
+      const startDeploymentId = startOptions?.deploymentId ?? null;
+      const startAfterDeploymentId = startOptions?.afterDeploymentId ?? null;
+      const outcomeDeployment =
+        kind === "start"
+          ? startDeploymentId
+            ? getDeploymentByIdForAccount(snapshot.deployments, accountId, startDeploymentId)
+            : startAfterDeploymentId
+              ? latestDeployment && latestDeployment.id > startAfterDeploymentId
+                ? latestDeployment
+                : null
+              : latestDeployment
+          : latestDeployment;
+      latestResult = {
+        settled: false,
+        success: false,
+        account,
+        latestDeployment: outcomeDeployment,
+        outcome: "pending",
+      };
+
+      if (kind === "start") {
+        const accountActiveDeploymentId = normalizeDeploymentId(account?.active_deployment_id);
+        const accountActiveStatus = String(account?.active_deployment_status || "").trim().toLowerCase();
+        const accountMatchesTrackedStart =
+          !startDeploymentId || !accountActiveDeploymentId || accountActiveDeploymentId === startDeploymentId;
+        const failureMessage = getDeploymentFailureMessage("start", account, outcomeDeployment);
+        if (failureMessage) {
+          return {
+            settled: true,
+            success: false,
+            account,
+            latestDeployment: outcomeDeployment,
+            outcome: "failed",
+          };
+        }
+        if (
+          String(outcomeDeployment?.status || "").trim().toLowerCase() === "running" ||
+          (accountMatchesTrackedStart && accountActiveStatus === "running")
+        ) {
+          return {
+            settled: true,
+            success: true,
+            account,
+            latestDeployment: outcomeDeployment,
+            outcome: "running",
+          };
+        }
+      } else if (!account?.active_deployment_id) {
+        const latestStatus = String(latestDeployment?.status || "").trim().toLowerCase();
+        if (!latestDeployment || latestStatus === "stopped" || latestStatus === "failed" || latestStatus === "blocked") {
+          return {
+            settled: true,
+            success: true,
+            account,
+            latestDeployment,
+            outcome: "stopped",
+          };
+        }
+      }
+    }
+
+    return latestResult;
+  }, [loadState]);
+
+  const handleUnlockBotToken = useCallback(async (params: UnlockParams) => {
+    onClearNotice();
+
+    if (params.onRequireTerms?.(() => {
+      void handleUnlockBotToken(params);
+    })) {
+      return;
+    }
+
+    if (!params.selectedAccount) {
+      onNotice("error", "Chọn account trước khi nhập token.");
+      return;
+    }
+    if (!isMt5AccountReady(params.selectedAccount)) {
+      onNotice("error", "Account này chưa sẵn sàng, chưa thể mở quyền bot.");
+      return;
+    }
+    if (!params.selectedBot) {
+      onNotice("error", "Chọn bot trước khi nhập token.");
+      return;
+    }
+
+    const token = params.botTokenInput.trim();
+    if (!token) {
+      onNotice("error", "Vui lòng nhập token để mở quyền cho bot đã chọn.");
+      return;
+    }
+
+    setUnlockingBotToken(true);
+    try {
+      const response = await claimMt5BotToken({
+        account_id: params.selectedAccount.id,
+        bot_name: params.selectedBot.bot_name,
+        token,
+      });
+      setBotTokenEntitlements((current) => [
+        response.entitlement,
+        ...current.filter((item) => item.entitlement_id !== response.entitlement.entitlement_id),
+      ]);
+      params.onResetBotTokenInput();
+      onNotice("success", `Đã mở quyền cho bot ${params.selectedBot.display_name}.`);
+    } catch (error) {
+      onNotice("error", getFriendlyMt5ActionError("start", error));
+    } finally {
+      setUnlockingBotToken(false);
+    }
+  }, [onClearNotice, onNotice, setBotTokenEntitlements]);
+
+  const handleStartBot = useCallback(async (params: StartParams) => {
+    onClearNotice();
+
+    if (params.onRequireTerms?.(() => {
+      void handleStartBot(params);
+    })) {
+      return;
+    }
+
+    if (!params.selectedAccount) {
+      onNotice("error", "Chưa có account nào cho broker này để bật bot.");
+      return;
+    }
+    if (!isMt5AccountReady(params.selectedAccount)) {
+      onNotice("error", "Account này chưa sẵn sàng, chưa thể bật bot.");
+      return;
+    }
+    if (params.selectedAccountHasActiveBot) {
+      onNotice("info", "Account này đã có deployment đang hoạt động. Hãy tắt bot hiện tại trước.");
+      return;
+    }
+    if (params.telegramUserHasOtherActiveBot) {
+      onNotice("info", "Mỗi Telegram ID chỉ được dùng 1 bot tại một thời điểm. Hãy tắt bot hiện tại trước khi bật bot khác.");
+      return;
+    }
+    if (!params.selectedBot) {
+      onNotice("error", "Chưa có bot nào khả dụng trong catalog để khởi động.");
+      return;
+    }
+    if (!params.botAccessReady) {
+      onNotice("error", "Vui lòng nhập token để mở quyền cho bot đã chọn trước khi bật bot.");
+      return;
+    }
+
+    let botConfigOverrides: Record<string, unknown> = {};
+    if (params.showTradingConfig) {
+      const lotSize = parsePositiveDecimalInput(params.tradingLotSize);
+      const stopLoss = parsePositiveDecimalInput(params.tradingStopLoss);
+      const takeProfit = parsePositiveDecimalInput(params.tradingTakeProfit);
+      if (lotSize === null) {
+        onNotice("error", "Vui lòng nhập Lot lớn hơn 0 trước khi bật bot.");
+        return;
+      }
+      if (stopLoss === null && takeProfit === null) {
+        onNotice("error", "Vui lòng nhập Stop loss và Take profit trước khi bật bot.");
+        return;
+      }
+      if (stopLoss === null) {
+        onNotice("error", "Vui lòng nhập Stop loss lớn hơn 0 trước khi bật bot.");
+        return;
+      }
+      if (takeProfit === null) {
+        onNotice("error", "Vui lòng nhập Take profit lớn hơn 0 trước khi bật bot.");
+        return;
+      }
+
+      botConfigOverrides = {
+        trading: {
+          lot_size: lotSize,
+          stop_loss: stopLoss,
+          take_profit: takeProfit,
+          trading_unit: params.tradingUnit,
+        },
+      };
+    }
+
+    setStartingBot(true);
+    try {
+      const baselineDeploymentId = params.latestDeployment?.id ?? null;
+      const startResponse = await startMt5Deployment({
+        account_id: params.selectedAccount.id,
+        bot_name: params.selectedBot.bot_name,
+        entitlement_id: mt5FullAccess ? undefined : params.activeBotEntitlementId,
+        bot_config_overrides: botConfigOverrides,
+      });
+      const startedDeploymentId = getStartResponseDeploymentId(startResponse);
+      await loadState({ silentErrors: true, spinner: false, includeBots: false });
+      const pollResult = await pollUntilStable("start", params.selectedAccount.id, {
+        deploymentId: startedDeploymentId,
+        afterDeploymentId: baselineDeploymentId,
+      });
+      if (pollResult.settled && pollResult.success) {
+        onNotice("success", "Đang bật");
+        return;
+      }
+
+      const failureMessage = getDeploymentFailureMessage("start", pollResult.account, pollResult.latestDeployment);
+      if (failureMessage) {
+        onNotice("error", failureMessage);
+        return;
+      }
+      onNotice("info", "Đang bật");
+    } catch (error) {
+      onNotice("error", getFriendlyMt5ActionError("start", error));
+    } finally {
+      setStartingBot(false);
+    }
+  }, [loadState, mt5FullAccess, onClearNotice, onNotice, pollUntilStable]);
+
+  const handleStopBot = useCallback(async (params: StopParams) => {
+    onClearNotice();
+
+    if (!params.selectedAccount || !params.activeStopDeploymentId) {
+      onNotice("error", "Account này chưa có deployment active để tắt.");
+      return;
+    }
+
+    setStoppingBot(true);
+    try {
+      await stopMt5Deployment({
+        deployment_id: params.activeStopDeploymentId,
+        reason: "miniapp_user_stop",
+      });
+      await loadState({ silentErrors: true, spinner: false, includeBots: false });
+      const pollResult = await pollUntilStable("stop", params.selectedAccount.id);
+      if (pollResult.settled && pollResult.success) {
+        onNotice("success", "Đang tắt");
+        return;
+      }
+      onNotice("info", "Đang tắt");
+    } catch (error) {
+      onNotice("error", getFriendlyMt5ActionError("stop", error));
+    } finally {
+      setStoppingBot(false);
+    }
+  }, [loadState, onClearNotice, onNotice, pollUntilStable]);
+
+  const handleDeleteAccount = useCallback(async (params: DeleteParams) => {
+    onClearNotice();
+
+    if (!params.selectedAccount) {
+      onNotice("error", "Chọn account trước khi xóa.");
+      return;
+    }
+    if (params.selectedAccountHasActiveBot) {
+      onNotice("info", "Tài khoản này đang có bot hoạt động. Hãy tắt bot trước khi xóa account.");
+      return;
+    }
+    if (deleteConfirmAccountId !== params.selectedAccount.id) {
+      setDeleteConfirmAccountId(params.selectedAccount.id);
+      onNotice("info", `Bấm "Xác nhận xóa" lần nữa để xóa account ${params.selectedAccount.login}.`);
+      return;
+    }
+
+    setDeletingAccount(true);
+    try {
+      await deleteMt5Account(params.selectedAccount.id);
+      setDeleteConfirmAccountId(null);
+      params.onResetBotTokenInput();
+      setBotTokenEntitlements([]);
+      const snapshot = await loadState({ silentErrors: true, spinner: false, includeBots: false });
+      const nextAccount =
+        snapshot?.accounts.find((account) => account.broker.trim().toLowerCase() === params.brokerKey) ?? null;
+      params.onSetSelectedAccountId(nextAccount?.id ?? null);
+      onNotice("success", "Đã xóa account khỏi Mini App.");
+    } catch (error) {
+      onNotice("error", getFriendlyMt5ActionError("delete", error));
+    } finally {
+      setDeletingAccount(false);
+    }
+  }, [deleteConfirmAccountId, loadState, onClearNotice, onNotice, setBotTokenEntitlements]);
+
+  return {
+    startingBot,
+    stoppingBot,
+    deletingAccount,
+    unlockingBotToken,
+    deleteConfirmAccountId,
+    setDeleteConfirmAccountId,
+    handleUnlockBotToken,
+    handleStartBot,
+    handleStopBot,
+    handleDeleteAccount,
+  };
+}

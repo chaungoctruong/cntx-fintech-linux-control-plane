@@ -1,0 +1,403 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@font-face {
+  font-family: "Outfit";
+  src: url("/fonts/outfit-latin-ext.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  unicode-range:
+    U+0100-02BA,
+    U+02BD-02C5,
+    U+02C7-02CC,
+    U+02CE-02D7,
+    U+02DD-02FF,
+    U+0304,
+    U+0308,
+    U+0329,
+    U+1D00-1DBF,
+    U+1E00-1E9F,
+    U+1EF2-1EFF,
+    U+2020,
+    U+20A0-20AB,
+    U+20AD-20C0,
+    U+2113,
+    U+2C60-2C7F,
+    U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "Outfit";
+  src: url("/fonts/outfit-latin.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  unicode-range:
+    U+0000-00FF,
+    U+0131,
+    U+0152-0153,
+    U+02BB-02BC,
+    U+02C6,
+    U+02DA,
+    U+02DC,
+    U+0304,
+    U+0308,
+    U+0329,
+    U+2000-206F,
+    U+20AC,
+    U+2122,
+    U+2191,
+    U+2193,
+    U+2212,
+    U+2215,
+    U+FEFF,
+    U+FFFD;
+}
+
+@font-face {
+  font-family: "Syne";
+  src: url("/fonts/syne-latin-ext.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400 800;
+  font-display: swap;
+  unicode-range:
+    U+0100-02BA,
+    U+02BD-02C5,
+    U+02C7-02CC,
+    U+02CE-02D7,
+    U+02DD-02FF,
+    U+0304,
+    U+0308,
+    U+0329,
+    U+1D00-1DBF,
+    U+1E00-1E9F,
+    U+1EF2-1EFF,
+    U+2020,
+    U+20A0-20AB,
+    U+20AD-20C0,
+    U+2113,
+    U+2C60-2C7F,
+    U+A720-A7FF;
+}
+
+@font-face {
+  font-family: "Syne";
+  src: url("/fonts/syne-latin.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 400 800;
+  font-display: swap;
+  unicode-range:
+    U+0000-00FF,
+    U+0131,
+    U+0152-0153,
+    U+02BB-02BC,
+    U+02C6,
+    U+02DA,
+    U+02DC,
+    U+0304,
+    U+0308,
+    U+0329,
+    U+2000-206F,
+    U+20AC,
+    U+2122,
+    U+2191,
+    U+2193,
+    U+2212,
+    U+2215,
+    U+FEFF,
+    U+FFFD;
+}
+
+:root {
+  --font-sans: "Outfit", system-ui, sans-serif;
+  --font-display: "Syne", system-ui, sans-serif;
+  --cyber-bg: #05070b;
+  --cyber-panel: #0b1620;
+  --cyber-card: #0b1620;
+  --cyber-accent-red: #ff2b2b;
+  --cyber-accent-green: #00ff9c;
+  --cyber-text: #d9e6f2;
+  --cyber-muted: #8b9cb4;
+  --cyber-hover: #0f1a28;
+}
+
+html {
+  background-color: var(--cyber-bg);
+  -webkit-tap-highlight-color: transparent;
+  scroll-behavior: smooth;
+  text-size-adjust: 100%;
+  -webkit-text-size-adjust: 100%;
+  /* SaaS Standard: Smooth font rendering */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: var(--font-sans), system-ui, sans-serif;
+  background-color: var(--cyber-bg);
+  color: var(--cyber-text);
+  min-height: 100vh;
+  min-height: 100dvh;
+  min-height: calc(var(--vh, 1vh) * 100);
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  padding-bottom: env(safe-area-inset-bottom, 0);
+  padding-top: env(safe-area-inset-top, 0);
+}
+
+/* ——— Dashboard: layered cyber background (SaaS Premium) ——— */
+.app-bg {
+  position: relative;
+  background-color: var(--cyber-bg);
+  background-image:
+    radial-gradient(ellipse 120% 60% at 50% -10%, rgba(0, 255, 156, 0.08) 0%, transparent 45%),
+    radial-gradient(ellipse 80% 40% at 88% 22%, rgba(255, 43, 43, 0.045) 0%, transparent 38%);
+  /* Acceleration */
+  transform: translateZ(0);
+}
+
+.app-bg::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(0, 255, 156, 0.085) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0, 255, 156, 0.085) 1px, transparent 1px);
+  background-size: 31px 31px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.brand-hero {
+  position: relative;
+  padding: 2px 0 8px;
+}
+
+.brand-title {
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 0.44rem;
+  margin: 0 auto;
+  font-family: var(--font-sans);
+  font-size: 2.35rem;
+  font-weight: 900;
+  letter-spacing: 0;
+  line-height: 0.96;
+  white-space: nowrap;
+  text-rendering: geometricPrecision;
+  filter: drop-shadow(0 0 22px rgba(0, 255, 156, 0.16));
+}
+
+.brand-title-main {
+  color: transparent;
+  background: linear-gradient(135deg, #f2fff8 0%, #bdf8df 45%, #68ffc1 100%);
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.brand-title-sub {
+  color: #d9ffee;
+  font-weight: 850;
+}
+
+.brand-subtitle {
+  max-width: 19rem;
+  margin: 0.8rem auto 0;
+  color: #a7b4c8;
+  font-size: 0.95rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  line-height: 1.35;
+}
+
+.brand-hero::after {
+  content: "";
+  display: block;
+  width: 96px;
+  height: 1px;
+  margin: 1rem auto 0;
+  background: linear-gradient(90deg, transparent 0%, rgba(104, 255, 193, 0.45) 50%, transparent 100%);
+}
+
+@media (min-width: 640px) {
+  .brand-title {
+    font-size: 2.75rem;
+  }
+
+  .brand-subtitle {
+    max-width: 23rem;
+    font-size: 1.02rem;
+  }
+}
+
+/* ——— Glass panel: buttery smooth blur and borders ——— */
+.glass-card {
+  @apply rounded-[16px] border border-white/10;
+  background-color: rgba(5, 7, 11, 0.12);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  transform: translateZ(0);
+  backface-visibility: hidden;
+  will-change: transform, opacity;
+  transition: background-color 0.2s ease, border-color 0.2s ease;
+}
+
+/* ——— High-performance Glow ——— */
+.shadow-panel-glow {
+  box-shadow: 0 0 20px -5px rgba(0, 255, 156, 0.15);
+}
+
+@layer utilities {
+  .font-display {
+    font-family: var(--font-display);
+  }
+}
+
+.app-bg::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: radial-gradient(1.5px 1.5px at 20% 30%, rgba(0, 255, 156, 0.15) 0%, transparent 100%),
+    radial-gradient(1.5px 1.5px at 80% 70%, rgba(255, 43, 43, 0.1) 0%, transparent 100%),
+    radial-gradient(1px 1px at 50% 50%, rgba(255, 255, 255, 0.08) 0%, transparent 100%);
+  background-size: 200% 200%, 180% 180%, 220% 220%;
+  animation: particles-drift 25s ease-in-out infinite;
+  pointer-events: none;
+  z-index: 0;
+}
+
+@keyframes particles-drift {
+  0%, 100% { background-position: 0% 0%, 100% 100%, 50% 50%; }
+  50% { background-position: 100% 100%, 0% 0%, 80% 20%; }
+}
+
+/* ——— Balance card: full-width scan loop ——— */
+@keyframes balance-scan-loop {
+  0% {
+    background-position: 160% 0;
+    opacity: 0.35;
+  }
+  18% {
+    opacity: 0.95;
+  }
+  52% {
+    opacity: 0.9;
+  }
+  100% {
+    background-position: -40% 0;
+    opacity: 0.35;
+  }
+}
+
+.balance-scan-line {
+  position: absolute;
+  left: 24px;
+  right: 24px;
+  top: 54px;
+  height: 2px;
+  background: linear-gradient(
+    90deg,
+    rgba(0, 255, 156, 0.08) 0%,
+    rgba(0, 255, 156, 0.22) 18%,
+    rgba(142, 255, 224, 0.95) 46%,
+    rgba(0, 255, 156, 0.28) 65%,
+    rgba(0, 255, 156, 0.08) 100%
+  );
+  background-size: 180% 100%;
+  border-radius: 999px;
+  box-shadow:
+    0 0 12px rgba(0, 255, 156, 0.18),
+    0 0 28px rgba(0, 255, 156, 0.08);
+  animation: balance-scan-loop 3.2s linear infinite;
+  pointer-events: none;
+  will-change: background-position, opacity;
+}
+
+#__next,
+main {
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+@keyframes neon-breath {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 12px rgba(255, 43, 43, 0.5));
+  }
+  50% {
+    filter: drop-shadow(0 0 24px rgba(255, 43, 43, 0.8));
+  }
+}
+
+.animate-neon-breath {
+  animation: neon-breath 2s ease-in-out infinite;
+}
+
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.05) 0%,
+    rgba(255, 255, 255, 0.1) 18%,
+    rgba(255, 255, 255, 0.05) 36%
+  );
+  background-size: 220% 100%;
+  animation: skeleton-shimmer 1.35s linear infinite;
+}
+
+.skeleton-line {
+  border-radius: 999px;
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -20% 0;
+  }
+}
+
+@media (hover: none) and (pointer: coarse) {
+  .app-bg::after {
+    animation: none;
+    opacity: 0.45;
+  }
+
+  .glass-card {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .app-bg::after,
+  .balance-scan-line,
+  .animate-neon-breath,
+  .skeleton {
+    animation: none !important;
+  }
+}

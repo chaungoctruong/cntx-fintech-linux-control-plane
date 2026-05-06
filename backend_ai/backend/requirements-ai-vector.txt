@@ -1,0 +1,3 @@
+# Optional semantic retrieval stack. Do not install on small nodes unless
+# AI_PLATFORM_KNOWLEDGE_VECTOR_ENABLED=true is intentionally enabled.
+sentence-transformers>=3.0,<4

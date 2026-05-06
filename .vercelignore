@@ -1,0 +1,17 @@
+# Mini App deploy boundary.
+# `bot-trading/` is a backend-side bot repository (for example backend
+# integrations such as `backend-ctrader`), not a Mini App static asset.
+# Never upload it to a frontend hosting provider or Mini App deployment.
+bot-trading/
+trading-bot/
+
+# Frozen / legacy adapter workstreams are not frontend deploy inputs.
+legacy/
+backend-ctrader/
+
+# Backend and ops are served separately from the Mini App static export.
+backend_ai/
+hubbot/
+ops/
+runner/
+scripts/

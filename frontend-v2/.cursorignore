@@ -1,0 +1,11 @@
+node_modules/
+.next/
+out/
+dist/
+*.log
+
+# Cho phép đọc .env (Next / frontend)
+!.env
+!.env.*
+!**/.env
+!**/.env.*

@@ -1,0 +1,8 @@
+# Optional LoRA training stack. Install on a dedicated AI/GPU training machine,
+# not on the Linux control-plane runtime unless explicitly approved.
+llamafactory>=0.9.0,<1
+transformers>=4.45,<5
+datasets>=2.20,<4
+accelerate>=0.33,<2
+peft>=0.12,<1
+trl>=0.10,<1

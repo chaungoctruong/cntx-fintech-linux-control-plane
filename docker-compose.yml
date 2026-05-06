@@ -1,0 +1,58 @@
+# Local/dev compose only. Production deployment uses PM2/HA samples under
+# `ecosystem.config.js` and `ops/ha/`; do not treat this file as a production
+# Postgres/Redis/security baseline.
+services:
+  hubbot:
+    build:
+      context: .
+      dockerfile: hubbot/Dockerfile
+    # Local compose compatibility only. `.env.linux.example` is safe dev
+    # defaults; optional `.env.linux` can override it on a workstation.
+    env_file:
+      - .env.linux.example
+      - path: .env.linux
+        required: false
+    volumes:
+      - ./hubbot:/app/hubbot
+    depends_on:
+      - db
+      - redis
+
+  spider-app:
+    build:
+      context: .
+      dockerfile: backend_ai/Dockerfile
+    # Local compose compatibility only. `.env.linux.example` is safe dev
+    # defaults; optional `.env.linux` can override it on a workstation.
+    env_file:
+      - .env.linux.example
+      - path: .env.linux
+        required: false
+    ports:
+      - "8001:8001"
+    depends_on:
+      - db
+      - redis
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${LOCAL_POSTGRES_DB:-spider_dev}
+      POSTGRES_USER: ${LOCAL_POSTGRES_USER:-spider_dev}
+      POSTGRES_PASSWORD: ${LOCAL_POSTGRES_PASSWORD:-spider_dev_only_change_me}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Local/dev Redis only. Production Redis must use the hardened package in
+    # `ops/redis/` with auth/TLS/persistence policy.
+    command: redis-server --appendonly yes
+    volumes:
+      - redisdata:/data
+
+volumes:
+  pgdata:
+  redisdata:

@@ -1,0 +1,201 @@
+/* Storm Market Scanner — Dark SaaS Trading Atmosphere (Premium Vibe) */
+
+.sms__container.dark-trading-vibe {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 200px;
+  overflow: hidden;
+  isolation: isolate;
+  background: 
+    radial-gradient(circle at 50% 120%, rgba(0, 255, 156, 0.12), transparent 45%),
+    radial-gradient(circle at 10% 10%, rgba(255, 43, 43, 0.05), transparent 35%),
+    #020408; /* Sâu hơn, mờ ám hơn */
+}
+
+/* ——— Scanline & Glitch ——— */
+.sms__scanline {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom,
+    transparent 50%,
+    rgba(0, 0, 0, 0.15) 51%,
+    transparent 51%
+  );
+  background-size: 100% 4px;
+  opacity: 0.15;
+}
+
+.sms__glitch-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
+  opacity: 0.04;
+  pointer-events: none;
+}
+
+.sms__atmosphere {
+  z-index: 1;
+  filter: contrast(1.2) brightness(0.8);
+}
+
+.sms__grid {
+  z-index: 2;
+  opacity: 0.12;
+  background-image:
+    linear-gradient(rgba(0, 255, 156, 0.05) 1.5px, transparent 1.5px),
+    linear-gradient(90deg, rgba(0, 255, 156, 0.05) 1.5px, transparent 1.5px);
+  background-size: 40px 40px;
+  mask-image: radial-gradient(circle at center, black 30%, transparent 95%);
+}
+
+/* ——— Candles: Gai góc & Ngầu ——— */
+.sms__candle {
+  position: absolute;
+  width: 12px;
+  transform: translateX(-50%);
+  opacity: 0;
+  will-change: transform, opacity;
+  animation: sms-candle-pulse 8s ease-in-out infinite;
+}
+
+/* "Cái dây" (Wick) đâm xuyên qua thân */
+.sms__candle-wick {
+  position: absolute;
+  left: 50%;
+  bottom: -15px; /* Kéo dài râu xuống dưới */
+  width: 1px;
+  height: var(--sms-wick-height);
+  transform: translateX(-50%);
+  background: linear-gradient(
+    to bottom,
+    transparent,
+    rgba(255, 255, 255, 0.4) 20%,
+    rgba(255, 255, 255, 0.4) 80%,
+    transparent
+  );
+  z-index: 1;
+}
+
+.sms__candle-wick-glow {
+  position: absolute;
+  left: 50%;
+  bottom: -15px;
+  width: 3px;
+  height: var(--sms-wick-height);
+  transform: translateX(-50%);
+  filter: blur(4px);
+  opacity: 0.3;
+  z-index: 0;
+}
+
+.sms__candle--up .sms__candle-wick-glow { background: #00ff9c; }
+.sms__candle--down .sms__candle-wick-glow { background: #ff2b2b; }
+
+.sms__candle-body {
+  position: absolute;
+  left: 50%;
+  bottom: 0;
+  width: 6px;
+  height: var(--sms-body-height);
+  transform: translateX(-50%);
+  border-radius: 1px;
+  z-index: 2;
+}
+
+.sms__candle--up .sms__candle-body {
+  background: #00ff9c;
+  box-shadow: 0 0 15px rgba(0, 255, 156, 0.4);
+}
+
+.sms__candle--down .sms__candle-body {
+  background: #ff2b2b;
+  box-shadow: 0 0 15px rgba(255, 43, 43, 0.4);
+}
+
+/* ——— Symbols: Random & Glitchy ——— */
+.sms__symbol {
+  position: absolute;
+  will-change: transform, opacity;
+  animation: sms-symbol-flow 12s linear infinite;
+  opacity: 0;
+}
+
+.sms__symbol-content {
+  display: flex;
+  flex-direction: column;
+  background: rgba(11, 22, 32, 0.6);
+  padding: 4px 8px;
+  border-radius: 4px;
+  border-left: 2px solid rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(4px);
+}
+
+.sms__symbol--lg .sms__symbol-name { font-size: 13px; letter-spacing: 0.03em; }
+.sms__symbol--md .sms__symbol-name { font-size: 11px; letter-spacing: 0.02em; }
+.sms__symbol--sm .sms__symbol-name { font-size: 9px; opacity: 0.9; }
+.sms__symbol--xs .sms__symbol-name { font-size: 8px; opacity: 0.7; }
+
+.sms__symbol--dim { opacity: 0.45 !important; }
+.sms__symbol--muted { opacity: 0.25 !important; }
+
+.sms__symbol-name {
+  color: #fff;
+  font-weight: 600; /* Giảm từ 800 xuống 600 để chữ nhỏ vẫn rõ nét, không bị nhòe */
+  font-family: var(--font-sans), sans-serif;
+  text-transform: uppercase;
+}
+
+.sms__symbol-change {
+  font-size: 8.5px; /* Nhỏ lại để cân đối */
+  font-weight: 500;
+  margin-top: -1px;
+}
+
+.sms__symbol-change.positive { color: #00ff9c; }
+.sms__symbol-change.negative { color: #ff2b2b; }
+
+/* ——— Atmosphere Effects ——— */
+.sms__storm-cloud {
+  position: absolute;
+  filter: blur(40px);
+  background: rgba(11, 22, 32, 0.8);
+  border-radius: 50%;
+}
+
+.sms__vignette-deep {
+  position: absolute;
+  inset: 0;
+  z-index: 8;
+  background: radial-gradient(
+    circle at center,
+    transparent 20%,
+    rgba(0, 0, 0, 0.4) 70%,
+    rgba(0, 0, 0, 0.9) 100%
+  );
+  pointer-events: none;
+}
+
+/* ——— Animations ——— */
+@keyframes sms-candle-pulse {
+  0% { opacity: 0; transform: translateX(-50%) translateY(20px); }
+  10% { opacity: 0.8; transform: translateX(-50%) translateY(0); }
+  90% { opacity: 0.7; transform: translateX(-50%) translateY(-10px); }
+  100% { opacity: 0; transform: translateX(-50%) translateY(-30px); }
+}
+
+@keyframes sms-symbol-flow {
+  0% { opacity: 0; transform: translateY(10px) scale(0.95); filter: blur(2px); }
+  15% { opacity: 0.9; transform: translateY(0) scale(1); filter: blur(0); }
+  85% { opacity: 0.8; transform: translateY(-15px) scale(1); filter: blur(0); }
+  100% { opacity: 0; transform: translateY(-25px) scale(1.05); filter: blur(3px); }
+}
+
+@media (max-width: 768px) {
+  .sms__symbol:nth-child(n+10) { display: none; }
+  .sms__grid { background-size: 30px 30px; }
+}

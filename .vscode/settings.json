@@ -1,0 +1,10 @@
+{
+  "remote.portsAttributes": {
+    "80": { "label": "Nginx (Web công cộng)" },
+    "8001": { "label": "Backend (Uvicorn)" },
+    "6432": { "label": "PgBouncer" },
+    "5672": { "label": "RabbitMQ" },
+    "15672": { "label": "RabbitMQ Management" },
+    "6379": { "label": "Redis" }
+  }
+}

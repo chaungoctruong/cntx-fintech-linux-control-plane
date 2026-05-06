@@ -1,0 +1,110 @@
+# Cursor context budget guard.
+# Keep active backend/frontend source readable; ignore generated, runtime, and frozen lanes.
+
+# Python virtualenvs and caches
+venv/**
+.venv/**
+env/**
+backend_ai/backend/venv/**
+backend-ctrader/.venv/**
+hubbot/venv_hub/**
+**/__pycache__/**
+.pytest_cache/**
+.ruff_cache/**
+.mypy_cache/**
+htmlcov/**
+.coverage
+
+# Node dependencies and build output
+node_modules/**
+frontend-v2/node_modules/**
+.next/**
+frontend-v2/.next/**
+frontend-v2/out/**
+frontend-v2/dist/**
+dist/**
+build/**
+**/*.tsbuildinfo
+**/*.map
+
+# Runtime data, database files, and bulky local artifacts
+logs/**
+worker_logs/**
+reports/**
+!reports/
+!reports/stress/
+!reports/stress/**/
+!reports/stress/**/summary.md
+!reports/stress/**/final_verdict*.md
+!reports/stress/**/windows_tickets.md
+!reports/stress/**/errors_excerpt*.txt
+!reports/stress/**/debug_excerpt*.txt
+!reports/stress/**/triage*.md
+postgres_data/**
+data/**
+ops/artifacts/**
+ops/archives/**
+ops/backup/**
+ops/releases/**
+*.log
+*.jsonl
+!reports/stress/**/errors_excerpt*.jsonl
+!reports/stress/**/debug_excerpt*.jsonl
+!reports/stress/**/important_errors*.jsonl
+*.sqlite
+*.db
+*.dump
+*.bak
+
+# Frozen / reserved lanes per repo directive
+legacy/API-ic/**
+backend-ctrader/**
+bot-trading/**
+backend_ai/backend/app/legacy/ctrader/**
+backend_ai/backend/scripts/legacy/ctrader/**
+backend_ai/backend/tests/legacy/**
+
+# Large binary/model/archive outputs
+**/*.parquet
+**/*.pkl
+**/*.pickle
+**/*.joblib
+**/*.onnx
+**/*.pt
+**/*.pth
+**/*.h5
+**/*.npy
+**/*.npz
+**/*.so
+**/*.dll
+**/*.exe
+**/*.node
+**/*.wasm
+**/*.pack
+**/*.pack.gz
+**/*.zip
+**/*.tar.gz
+**/*.tgz
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+
+# Allow Cursor to read environment files as requested.
+!.env
+!.env.*
+!**/.env
+!**/.env.*
+
+# Keep repo-level directives and architecture docs available to agents.
+!AGENTS.md
+!backend_ai/AGENTS.md
+!backend_ai/backend/AGENTS.md
+!docs/linux-backend-control-plane-mt5-directive.md
+!docs/ARCHITECTURE_BACKEND.md
+!docs/TWO_TASK_EXECUTION_PLAN.md
+!WINDOWS_RUNNER_CLUSTER_SPEC.md
+!ARCHITECTURE_RUNNER.md
+!LINUX_BACKEND_RUNNER_HANDOFF.md
+!docs/WINDOWS_RUNNER_DEBUG_WORKFLOW.md
+!docs/M4_RUNNER_CLUSTER_EXPANSION_SPEC.md

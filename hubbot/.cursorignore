@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.log
+data/
+
+# Cho phép Cursor đọc file .env (whitelist)
+!.env
+!.env.*
+!**/.env
+!**/.env.*

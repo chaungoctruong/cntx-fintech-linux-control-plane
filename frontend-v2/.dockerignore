@@ -1,0 +1,13 @@
+# Frontend container/build boundary.
+# `bot-trading/` belongs to backend-side bot flows such as `backend-ctrader`,
+# not to the Mini App image.
+bot-trading/
+trading-bot/
+../bot-trading/
+../trading-bot/
+
+node_modules/
+.next/
+out/
+.vercel/
+*.tsbuildinfo

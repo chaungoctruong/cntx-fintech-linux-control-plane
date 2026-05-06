@@ -1,0 +1,244 @@
+{
+  "allowed_domains": [
+    "ai.google.dev",
+    "developers.google.com",
+    "docs.github.com",
+    "docs.sqlalchemy.org",
+    "alembic.sqlalchemy.org",
+    "fastapi.tiangolo.com",
+    "github.com",
+    "pydantic.dev",
+    "raw.githubusercontent.com",
+    "ollama.com",
+    "qwen.readthedocs.io",
+    "redis.io",
+    "www.psycopg.org",
+    "www.python-httpx.org",
+    "www.sbert.net",
+    "www.postgresql.org"
+  ],
+  "defaults": {
+    "source_type": "web",
+    "trust_level": 72,
+    "max_chars": 1800,
+    "timeout_sec": 20.0,
+    "refresh_interval_sec": 3600
+  },
+  "sources": [
+    {
+      "source_key": "internet:google:gemini-api-docs",
+      "title": "Google Gemini API documentation",
+      "url": "https://ai.google.dev/gemini-api/docs",
+      "trust_level": 76,
+      "tags": ["google", "gemini", "ai"]
+    },
+    {
+      "source_key": "internet:google:search-central-crawling",
+      "title": "Google Search Central crawling and indexing",
+      "url": "https://developers.google.com/search/docs/crawling-indexing/overview-google-crawlers",
+      "trust_level": 70,
+      "tags": ["google", "search", "crawler"]
+    },
+    {
+      "source_key": "internet:github:docs-rest-api",
+      "title": "GitHub REST API documentation",
+      "url": "https://docs.github.com/en/rest",
+      "trust_level": 78,
+      "tags": ["github", "api"]
+    },
+    {
+      "source_key": "internet:github:docs-actions",
+      "title": "GitHub Actions documentation",
+      "url": "https://docs.github.com/en/actions",
+      "trust_level": 74,
+      "tags": ["github", "ci"]
+    },
+    {
+      "source_key": "internet:redis:docs-data-types",
+      "title": "Redis data types documentation",
+      "url": "https://redis.io/docs/latest/develop/data-types/",
+      "trust_level": 76,
+      "tags": ["redis", "queue", "cache"]
+    },
+    {
+      "source_key": "internet:redis:docs-streams",
+      "title": "Redis Streams documentation",
+      "url": "https://redis.io/docs/latest/develop/data-types/streams/",
+      "trust_level": 76,
+      "tags": ["redis", "queue", "events"]
+    },
+    {
+      "source_key": "internet:postgresql:current-docs",
+      "title": "PostgreSQL current documentation",
+      "url": "https://www.postgresql.org/docs/current/index.html",
+      "trust_level": 78,
+      "tags": ["postgresql", "database"]
+    },
+    {
+      "source_key": "internet:postgresql:json-docs",
+      "title": "PostgreSQL JSON documentation",
+      "url": "https://www.postgresql.org/docs/current/functions-json.html",
+      "trust_level": 76,
+      "tags": ["postgresql", "jsonb"]
+    },
+    {
+      "source_key": "internet:fastapi:user-guide",
+      "title": "FastAPI user guide",
+      "url": "https://fastapi.tiangolo.com/tutorial/",
+      "trust_level": 74,
+      "tags": ["fastapi", "backend"]
+    },
+    {
+      "source_key": "internet:sqlalchemy:orm-queryguide",
+      "title": "SQLAlchemy ORM query guide",
+      "url": "https://docs.sqlalchemy.org/en/20/orm/queryguide/index.html",
+      "trust_level": 74,
+      "tags": ["sqlalchemy", "database"]
+    },
+    {
+      "source_key": "internet:ollama:api",
+      "title": "Ollama API documentation",
+      "url": "https://raw.githubusercontent.com/ollama/ollama/main/docs/api.md",
+      "trust_level": 70,
+      "tags": ["ollama", "local-ai"]
+    },
+    {
+      "source_key": "oss:pydantic:models",
+      "title": "Pydantic model concepts",
+      "url": "https://pydantic.dev/docs/validation/latest/concepts/models/",
+      "source_type": "open_source_doc",
+      "trust_level": 72,
+      "license": "project_docs_review_before_training",
+      "training_use": "rag_only_pending_review",
+      "tags": ["oss", "pydantic", "validation", "python"]
+    },
+    {
+      "source_key": "oss:pydantic:settings",
+      "title": "Pydantic settings management",
+      "url": "https://pydantic.dev/docs/validation/latest/concepts/pydantic_settings/",
+      "source_type": "open_source_doc",
+      "trust_level": 72,
+      "license": "project_docs_review_before_training",
+      "training_use": "rag_only_pending_review",
+      "tags": ["oss", "pydantic", "settings", "python"]
+    },
+    {
+      "source_key": "oss:alembic:tutorial",
+      "title": "Alembic tutorial",
+      "url": "https://alembic.sqlalchemy.org/en/latest/tutorial.html",
+      "source_type": "open_source_doc",
+      "trust_level": 72,
+      "license": "project_docs_review_before_training",
+      "training_use": "rag_only_pending_review",
+      "tags": ["oss", "alembic", "migrations", "postgresql"]
+    },
+    {
+      "source_key": "oss:psycopg:basic",
+      "title": "Psycopg basic module usage",
+      "url": "https://www.psycopg.org/psycopg3/docs/basic/index.html",
+      "source_type": "open_source_doc",
+      "trust_level": 72,
+      "license": "project_docs_review_before_training",
+      "training_use": "rag_only_pending_review",
+      "tags": ["oss", "psycopg", "postgresql", "python"]
+    },
+    {
+      "source_key": "oss:pgvector:readme",
+      "title": "pgvector README",
+      "url": "https://raw.githubusercontent.com/pgvector/pgvector/master/README.md",
+      "source_type": "open_source_doc",
+      "trust_level": 72,
+      "license": "project_license_review_before_training",
+      "training_use": "rag_only_pending_review",
+      "tags": ["oss", "pgvector", "postgresql", "vector-search"]
+    },
+    {
+      "source_key": "oss:llamafactory:readme",
+      "title": "LLaMA-Factory README",
+      "url": "https://raw.githubusercontent.com/hiyouga/LLaMA-Factory/main/README.md",
+      "source_type": "open_source_doc",
+      "trust_level": 70,
+      "license": "project_license_review_before_training",
+      "training_use": "rag_only_pending_review",
+      "tags": ["oss", "llamafactory", "lora", "fine-tune"]
+    },
+    {
+      "source_key": "oss:qwen:docs",
+      "title": "Qwen documentation",
+      "url": "https://qwen.readthedocs.io/en/latest/",
+      "source_type": "open_source_doc",
+      "trust_level": 70,
+      "license": "project_docs_review_before_training",
+      "training_use": "rag_only_pending_review",
+      "tags": ["oss", "qwen", "local-ai", "llm"]
+    },
+    {
+      "source_key": "oss:sentence-transformers:usage",
+      "title": "Sentence Transformers usage",
+      "url": "https://www.sbert.net/docs/sentence_transformer/usage/usage.html",
+      "source_type": "open_source_doc",
+      "trust_level": 70,
+      "license": "project_docs_review_before_training",
+      "training_use": "rag_only_pending_review",
+      "tags": ["oss", "sentence-transformers", "embeddings", "rag"]
+    },
+    {
+      "source_key": "oss:httpx:quickstart",
+      "title": "HTTPX quickstart",
+      "url": "https://www.python-httpx.org/quickstart/",
+      "source_type": "open_source_doc",
+      "trust_level": 70,
+      "license": "project_docs_review_before_training",
+      "training_use": "rag_only_pending_review",
+      "tags": ["oss", "httpx", "python", "http-client"]
+    },
+    {
+      "source_key": "internal:ai-policy",
+      "title": "Internal AI answer policy",
+      "file": "../../../ai_knowledge/ai_answer_policy.md",
+      "source_type": "internal_doc",
+      "trust_level": 92,
+      "tags": ["internal", "ai-policy"]
+    },
+    {
+      "source_key": "internal:linux-backend-runtime",
+      "title": "Internal Linux backend runtime knowledge",
+      "file": "../../../ai_knowledge/runtime/linux_backend.md",
+      "source_type": "internal_doc",
+      "trust_level": 95,
+      "tags": ["internal", "control-plane"]
+    },
+    {
+      "source_key": "internal:windows-runner-runtime",
+      "title": "Internal Windows runner runtime knowledge",
+      "file": "../../../ai_knowledge/runtime/windows_runner.md",
+      "source_type": "internal_doc",
+      "trust_level": 95,
+      "tags": ["internal", "runner"]
+    },
+    {
+      "source_key": "internal:deployment-lifecycle",
+      "title": "Internal deployment lifecycle knowledge",
+      "file": "../../../ai_knowledge/runtime/deployment_lifecycle.md",
+      "source_type": "internal_doc",
+      "trust_level": 95,
+      "tags": ["internal", "deployment"]
+    },
+    {
+      "source_key": "internal:sticky-slot",
+      "title": "Internal sticky slot knowledge",
+      "file": "../../../ai_knowledge/runtime/sticky_slot.md",
+      "source_type": "internal_doc",
+      "trust_level": 95,
+      "tags": ["internal", "slot"]
+    },
+    {
+      "source_key": "internal:runtime-common-errors",
+      "title": "Internal runtime common errors",
+      "file": "../../../ai_knowledge/runtime/common_errors.md",
+      "source_type": "internal_doc",
+      "trust_level": 94,
+      "tags": ["internal", "mt5", "errors"]
+    }
+  ]
+}
