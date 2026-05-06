@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r /tmp/backend-requirements.txt
 
 COPY backend_ai/backend /app/backend_ai/backend
 COPY runner /app/runner
+COPY ops_telegram_alerts.py /app/ops_telegram_alerts.py
 
 WORKDIR /app/backend_ai/backend
 

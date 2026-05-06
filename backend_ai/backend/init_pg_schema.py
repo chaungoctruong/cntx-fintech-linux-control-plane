@@ -984,9 +984,6 @@ def init_postgres_schema():
                 ));
         """)
 
-        tracker.step("control_plane_scale_indexes")
-        _create_control_plane_scale_indexes(cur)
-
         tracker.step("execution_audit")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS execution_audit (
@@ -1077,6 +1074,11 @@ def init_postgres_schema():
             CREATE INDEX IF NOT EXISTS idx_runtime_logs_deployment_id ON runtime_logs(deployment_id);
             CREATE INDEX IF NOT EXISTS idx_runtime_logs_created_at ON runtime_logs(created_at DESC);
         """)
+
+        # Composite/scale indexes phụ thuộc runtime_logs nên phải tạo sau khi bảng tồn tại
+        # (trước đây gọi sớm ở giữa init -> fail trên DB mới vì runtime_logs chưa được tạo).
+        tracker.step("control_plane_scale_indexes")
+        _create_control_plane_scale_indexes(cur)
 
         tracker.step("runner_bot_state_records")
         cur.execute("""
