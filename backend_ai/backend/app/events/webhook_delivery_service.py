@@ -13,6 +13,8 @@ from typing import Any, Protocol
 
 import httpx
 
+from app.core.error_log import log_agent_event, log_agent_failure, log_agent_warning
+from app.core.log_context import bind_log_context
 from app.core.log_hygiene import log_periodic, noisy_log_cooldown_sec
 from app.core.redis_client import (
     get_redis_write,
@@ -172,23 +174,75 @@ class WebhookDeliveryService:
 
     async def _deliver_to_webhook(self, *, webhook: dict[str, Any], body_payload: dict[str, Any]) -> bool:
         body = _json_body_bytes(body_payload)
+        webhook_id = int(webhook.get("id") or 0)
+        webhook_url = str(webhook.get("url") or "")
+        webhook_ctx = {
+            "webhook_id": webhook_id,
+            "webhook_url": webhook_url,
+            "event_type": str(body_payload.get("event_type") or ""),
+            "event_id": str(body_payload.get("event_id") or ""),
+            "stream_id": str(body_payload.get("stream_id") or ""),
+            "account_id": body_payload.get("account_id"),
+            "deployment_id": body_payload.get("deployment_id"),
+            "fail_count_before": int(webhook.get("fail_count") or 0),
+        }
+        post_started = time.monotonic()
         try:
             signature = build_webhook_signature(body=body, secret_hex=str(webhook.get("secret_hex") or ""))
-            status_code = await self._post(url=str(webhook.get("url") or ""), body=body, signature=signature)
+            status_code = await self._post(url=webhook_url, body=body, signature=signature)
+            elapsed_ms = round((time.monotonic() - post_started) * 1000, 1)
             if 200 <= status_code < 300:
-                self._repo.mark_webhook_delivery_success(webhook_id=int(webhook["id"]))
+                self._repo.mark_webhook_delivery_success(webhook_id=webhook_id)
+                log_agent_event(
+                    log,
+                    logging.INFO,
+                    "webhook.delivery.ok",
+                    operation="webhook_delivery",
+                    outcome="ok",
+                    http_status=status_code,
+                    elapsed_ms=elapsed_ms,
+                    **webhook_ctx,
+                )
                 return True
             self._repo.mark_webhook_delivery_failure(
-                webhook_id=int(webhook["id"]),
+                webhook_id=webhook_id,
                 error_text=f"http_{status_code}",
                 deactivate_after_failures=WEBHOOK_DEACTIVATE_AFTER_FAILURES,
             )
+            log_agent_warning(
+                log,
+                "webhook.delivery.http_error",
+                hint=(
+                    f"User webhook returned HTTP {status_code}. After "
+                    f"{WEBHOOK_DEACTIVATE_AFTER_FAILURES} consecutive failures the webhook is "
+                    "auto-deactivated. Inspect the user's endpoint or the request body."
+                ),
+                error_code=f"http_{status_code}",
+                operation="webhook_delivery",
+                http_status=status_code,
+                elapsed_ms=elapsed_ms,
+                **webhook_ctx,
+            )
             return False
         except Exception as exc:
+            elapsed_ms = round((time.monotonic() - post_started) * 1000, 1)
             self._repo.mark_webhook_delivery_failure(
-                webhook_id=int(webhook["id"]),
+                webhook_id=webhook_id,
                 error_text=f"{exc.__class__.__name__}:{str(exc)[:180]}",
                 deactivate_after_failures=WEBHOOK_DEACTIVATE_AFTER_FAILURES,
+            )
+            log_agent_failure(
+                log,
+                "webhook.delivery.exception",
+                error=exc,
+                error_code="webhook_post_exception",
+                operation="webhook_delivery",
+                hint=(
+                    "Webhook POST raised before getting a status. Likely DNS, TLS, or timeout issue. "
+                    "Verify the user URL is reachable and the secret_hex is valid hex."
+                ),
+                elapsed_ms=elapsed_ms,
+                **webhook_ctx,
             )
             return False
 
@@ -259,7 +313,19 @@ class WebhookDeliveryService:
                             await self._process_stream_entry(stream_id=str(stream_id), fields=dict(fields or {}))
                             await redis.xack(self._stream_key, self._group_name, stream_id)
                         except Exception as exc:
-                            log.warning("webhook delivery failed stream_id=%s: %s", stream_id, exc)
+                            log_agent_failure(
+                                log,
+                                "webhook.stream.process_failed",
+                                error=exc,
+                                error_code="stream_entry_process_failed",
+                                operation="webhook_stream_entry",
+                                hint=(
+                                    "Failed processing one Redis stream entry. The entry is NOT acked so "
+                                    "it will retry on next iteration. If the same stream_id keeps failing, "
+                                    "the event payload may be malformed — inspect with `XRANGE`."
+                                ),
+                                stream_id=str(stream_id),
+                            )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

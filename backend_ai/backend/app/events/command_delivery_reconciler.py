@@ -5,6 +5,8 @@ import logging
 import time
 from typing import Any, Optional
 
+from app.core.error_log import log_agent_event, log_agent_failure, log_agent_warning
+from app.core.log_context import bind_log_context
 from app.infra.redis_streams import RedisStreamPublisher
 from app.repositories.control_plane_repository import ControlPlaneRepository
 from app.runner.protocol import build_runner_command_from_row
@@ -129,13 +131,24 @@ class CommandDeliveryReconcilerService:
                         marker = getattr(self._repo, "mark_command_replay_failure", None)
                         if callable(marker):
                             marker(command_id=command_id, error_text=_safe_error_label(exc))
-                    log.warning(
-                        "command_delivery_replay_failed command_id=%s command_type=%s runner_id=%s slot_id=%s error=%s",
-                        command_id or "-",
-                        str(row.get("command_type") or "").strip() or "-",
-                        str(row.get("runner_id") or "").strip() or "-",
-                        str(row.get("slot_id") or "").strip() or "-",
-                        exc.__class__.__name__,
+                    log_agent_failure(
+                        log,
+                        "runner.command.replay_failed",
+                        error=exc,
+                        error_code="redis_publish_failed",
+                        operation="command_delivery_replay",
+                        hint=(
+                            "Reconciler tried to re-publish a stuck command to Redis and failed. "
+                            "Check Redis connectivity (REDIS_WRITE_URL) and the stream "
+                            "`mt5:account:{account_id}:commands`. If Redis is healthy, the command "
+                            "row may be malformed — inspect execution_commands.payload_json."
+                        ),
+                        command_id=command_id or None,
+                        command_type=str(row.get("command_type") or "").strip() or None,
+                        runner_id=str(row.get("runner_id") or "").strip() or None,
+                        slot_id=str(row.get("slot_id") or "").strip() or None,
+                        account_id=row.get("account_id"),
+                        deployment_id=row.get("deployment_id"),
                     )
                     schedule_error_alert(
                         area="Lệnh runner",
@@ -212,12 +225,23 @@ class CommandDeliveryReconcilerService:
                             result["processing_requeue_failed"] += 1
                             self._last_error_at = int(time.time())
                             self._last_error_class = exc.__class__.__name__
-                            log.warning(
-                                "command_processing_requeue_failed command_id=%s command_type=%s runner_id=%s error=%s",
-                                command_id or "-",
-                                str(row.get("command_type") or "").strip() or "-",
-                                runner_id or "-",
-                                exc.__class__.__name__,
+                            log_agent_failure(
+                                log,
+                                "runner.command.requeue_failed",
+                                error=exc,
+                                error_code="redis_processing_requeue_failed",
+                                operation="command_processing_requeue",
+                                hint=(
+                                    "A command appears stuck in the runner's processing list (timeout exceeded). "
+                                    "Reconciler tried to move it back to the pending list and failed. "
+                                    "Check Redis lists `mt5:runner:{runner_id}:commands:processing` vs "
+                                    "`mt5:runner:{runner_id}:commands`, and verify the Windows runner is alive."
+                                ),
+                                command_id=command_id or None,
+                                command_type=str(row.get("command_type") or "").strip() or None,
+                                runner_id=runner_id or None,
+                                account_id=row.get("account_id"),
+                                deployment_id=row.get("deployment_id"),
                             )
                             schedule_error_alert(
                                 area="Lệnh runner",
@@ -261,7 +285,18 @@ class CommandDeliveryReconcilerService:
                     result["http_claim_requeue_error"] += 1
                     self._last_error_at = int(time.time())
                     self._last_error_class = exc.__class__.__name__
-                    log.warning("http_claim_requeue_failed error=%s", exc.__class__.__name__)
+                    log_agent_failure(
+                        log,
+                        "runner.command.http_claim_requeue_failed",
+                        error=exc,
+                        error_code="db_http_claim_requeue_failed",
+                        operation="http_claim_requeue",
+                        hint=(
+                            "Backend failed to release HTTP-claimed commands whose lease expired. "
+                            "Check the DB function `requeue_stale_http_claimed_execution_commands` and "
+                            "`execution_commands.delivery_status`."
+                        ),
+                    )
                     schedule_error_alert(
                         area="Lệnh runner",
                         summary="Backend không thu hồi được lệnh HTTP-claim bị quá hạn.",
@@ -324,12 +359,20 @@ class CommandDeliveryReconcilerService:
                         result["stale_queued_start_error"] += 1
                         self._last_error_at = int(time.time())
                         self._last_error_class = exc.__class__.__name__
-                        log.warning(
-                            "stale_queued_start_reconcile_failed command_id=%s runner_id=%s deployment_id=%s error=%s",
-                            command_id or "-",
-                            runner_id or "-",
-                            deployment_id,
-                            exc.__class__.__name__,
+                        log_agent_failure(
+                            log,
+                            "runner.command.stale_start_reconcile_failed",
+                            error=exc,
+                            error_code="stale_start_reconcile_failed",
+                            operation="stale_queued_start_reconcile",
+                            hint=(
+                                "A START_BOT command sat in `queued` past the timeout but reconciliation to "
+                                "fail-fast it crashed. Check execution_commands row + deployment status; the "
+                                "deployment may stay `start_requested` until manually nudged."
+                            ),
+                            command_id=command_id or None,
+                            runner_id=runner_id or None,
+                            deployment_id=deployment_id,
                         )
         except Exception as exc:
             self._last_error = _safe_error_label(exc)
@@ -341,7 +384,17 @@ class CommandDeliveryReconcilerService:
                 try:
                     release_lock(lock_handle)
                 except Exception as exc:
-                    log.warning("command_delivery_replay_lock_release_failed error=%s", exc.__class__.__name__)
+                    log_agent_warning(
+                        log,
+                        "runner.command.lock_release_failed",
+                        error=exc,
+                        error_code="advisory_lock_release_failed",
+                        operation="command_delivery_replay_lock_release",
+                        hint=(
+                            "Reconciler advisory lock release threw — usually transient (DB conn dropped). "
+                            "Lock will time out automatically; safe to ignore unless it repeats."
+                        ),
+                    )
 
         self._run_count += 1
         self._last_success_at = int(time.time())
@@ -408,7 +461,18 @@ class CommandDeliveryReconcilerService:
                 self._last_error = _safe_error_label(exc)
                 self._last_error_at = int(time.time())
                 self._last_error_class = exc.__class__.__name__
-                log.warning("command_delivery_reconciler_iteration_failed error=%s", exc.__class__.__name__)
+                log_agent_failure(
+                    log,
+                    "runner.command.reconciler_iteration_failed",
+                    error=exc,
+                    error_code="reconciler_iteration_crashed",
+                    operation="command_delivery_reconciler",
+                    hint=(
+                        "The reconciler loop itself crashed. Backend will not auto-recover stuck "
+                        "commands until next iteration succeeds. Check Postgres + Redis health and "
+                        "the lock row in `command_delivery_replay_lock`."
+                    ),
+                )
                 schedule_error_alert(
                     area="Lệnh runner",
                     summary="Vòng kiểm tra lệnh runner bị lỗi.",

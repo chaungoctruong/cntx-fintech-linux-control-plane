@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any, Optional
 from urllib.parse import quote
 
 import httpx
 
+from app.core.error_log import log_agent_event, log_agent_failure
 from app.settings import settings
+
+
+_log = logging.getLogger("runner.control_plane_client")
 
 
 class MT5RunnerControlPlaneClient:
@@ -33,11 +39,79 @@ class MT5RunnerControlPlaneClient:
         headers = {}
         if self._api_key:
             headers["X-Backend-Api-Key"] = self._api_key
-        if self._client is not None:
-            response = await self._client.request(method, f"{self._base_url}{path}", json=json_payload, headers=headers)
+        url = f"{self._base_url}{path}"
+        started = time.monotonic()
+        try:
+            if self._client is not None:
+                response = await self._client.request(method, url, json=json_payload, headers=headers)
+            else:
+                async with httpx.AsyncClient(timeout=self._timeout_sec) as client:
+                    response = await client.request(method, url, json=json_payload, headers=headers)
+        except Exception as exc:
+            log_agent_failure(
+                _log,
+                "runner.control_plane.http.exception",
+                error=exc,
+                error_code="runner_http_exception",
+                operation="runner_http_request",
+                hint=(
+                    "Linux-side runner client failed before getting an HTTP response. "
+                    "Likely DNS/TLS/timeout. Verify RUNNER_CONTROL_PLANE_URL or BACKEND_URL "
+                    "is reachable from the runner host and BACKEND_API_KEY is set."
+                ),
+                http_method=method,
+                http_path=path,
+                elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+            )
+            raise
+        elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if status_code >= 500 or status_code == 0:
+            log_agent_event(
+                _log,
+                logging.ERROR,
+                "runner.control_plane.http.5xx",
+                hint=(
+                    "Backend returned 5xx for a runner-side call. Check backend logs for the same "
+                    "request_id (look in `logs/backend/api-instance-*.jsonl`)."
+                ),
+                operation="runner_http_request",
+                outcome="server_error",
+                http_method=method,
+                http_path=path,
+                http_status=status_code,
+                elapsed_ms=elapsed_ms,
+            )
+        elif status_code >= 400:
+            log_agent_event(
+                _log,
+                logging.WARNING,
+                "runner.control_plane.http.4xx",
+                hint=(
+                    "Backend rejected a runner-side call. Inspect the response body and the runner "
+                    "auth header (X-Backend-Api-Key)."
+                ),
+                operation="runner_http_request",
+                outcome="client_error",
+                http_method=method,
+                http_path=path,
+                http_status=status_code,
+                elapsed_ms=elapsed_ms,
+            )
         else:
-            async with httpx.AsyncClient(timeout=self._timeout_sec) as client:
-                response = await client.request(method, f"{self._base_url}{path}", json=json_payload, headers=headers)
+            _log.debug(
+                "runner.control_plane.http.ok %s %s -> %s in %sms",
+                method, path, status_code, elapsed_ms,
+                extra={
+                    "event": "runner.control_plane.http.ok",
+                    "http_method": method,
+                    "http_path": path,
+                    "http_status": status_code,
+                    "elapsed_ms": elapsed_ms,
+                    "operation": "runner_http_request",
+                    "outcome": "ok",
+                },
+            )
         response.raise_for_status()
         return response.json()
 

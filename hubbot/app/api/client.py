@@ -21,9 +21,10 @@ from app.config import (
     API_CACHE_TTL_SEC,
     CALLBACK_DEDUP_TTL_SEC,
 )
+from app.error_log import log_agent_event, log_agent_failure
 from ops_telegram_alerts import notify_error_sync
 
-log = logging.getLogger("hubbot")
+log = logging.getLogger("hubbot.api_client")
 
 _api_client: Optional[httpx.AsyncClient] = None
 _api_semaphore = asyncio.Semaphore(max(10, API_MAX_CONCURRENCY))
@@ -157,6 +158,7 @@ async def api_json(method: str, path: str, *, json_body: dict | None = None) -> 
         fut = loop.create_future()
         _api_singleflight[key] = fut
 
+    started_at = time.monotonic()
     try:
         for attempt in range(1, attempts + 1):
             try:
@@ -170,7 +172,23 @@ async def api_json(method: str, path: str, *, json_body: dict | None = None) -> 
                     js = r.json()
                 except Exception:
                     text = (r.text or "")[:600]
-                    log.error("api_json bad_json path=%s status=%s body=%s", path, r.status_code, text[:220])
+                    log_agent_failure(
+                        log,
+                        "hubbot.backend.bad_json",
+                        error=Exception("non_json_body"),
+                        error_code="backend_bad_json",
+                        operation="hubbot_backend_call",
+                        hint=(
+                            "Backend returned a non-JSON body where JSON was expected. Often happens "
+                            "if reverse proxy returns an HTML error page or backend crashed mid-response. "
+                            "Inspect the body snippet and check backend logs for the same path/timestamp."
+                        ),
+                        http_method=method,
+                        http_path=path,
+                        http_status=r.status_code,
+                        body_preview=text[:220],
+                        elapsed_ms=round((time.monotonic() - started_at) * 1000, 1),
+                    )
                     _maybe_send_backend_ops_alert(
                         alert_key=f"hubbot_backend_bad_json:{path}",
                         summary=f"Backend returned non-JSON for {path}",
@@ -186,6 +204,20 @@ async def api_json(method: str, path: str, *, json_body: dict | None = None) -> 
                     _cache_set(key, result, API_CACHE_TTL_SEC)
                 if fut is not None and not fut.done():
                     fut.set_result(result if isinstance(result, dict) else {"ok": True, "data": result})
+                # Light-touch trace at debug; the per-update logger already covers correlation.
+                log.debug(
+                    "hubbot.backend.ok %s %s -> %s",
+                    method, path, r.status_code,
+                    extra={
+                        "event": "hubbot.backend.ok",
+                        "operation": "hubbot_backend_call",
+                        "outcome": "ok",
+                        "http_method": method,
+                        "http_path": path,
+                        "http_status": r.status_code,
+                        "elapsed_ms": round((time.monotonic() - started_at) * 1000, 1),
+                    },
+                )
                 return result
             except httpx.HTTPStatusError as e:
                 text = ""
@@ -195,12 +227,44 @@ async def api_json(method: str, path: str, *, json_body: dict | None = None) -> 
                     pass
                 status_code = int(getattr(e.response, "status_code", 0) or 0)
                 if status_code >= 500:
-                    log.error("api_json backend_5xx path=%s status=%s body=%s", path, status_code, text[:220])
+                    log_agent_failure(
+                        log,
+                        "hubbot.backend.5xx",
+                        error=e,
+                        error_code=f"backend_http_{status_code}",
+                        operation="hubbot_backend_call",
+                        hint=(
+                            "Backend returned 5xx to hubbot. Check `logs/backend/api-instance-*.jsonl` "
+                            "for the same `http_path` near this timestamp; the error stack should be "
+                            "in the matching `request.exception` line."
+                        ),
+                        http_method=method,
+                        http_path=path,
+                        http_status=status_code,
+                        body_preview=text[:220],
+                        elapsed_ms=round((time.monotonic() - started_at) * 1000, 1),
+                    )
                     _maybe_send_backend_ops_alert(
                         alert_key=f"hubbot_backend_http5xx:{path}",
                         summary=f"Backend {status_code} on {path}",
                         detail=text or "(empty response body)",
                         cooldown_sec=300.0,
+                    )
+                else:
+                    log_agent_event(
+                        log,
+                        logging.WARNING,
+                        "hubbot.backend.4xx",
+                        hint=(
+                            "Backend rejected the call (4xx). Either hubbot sent a malformed body or "
+                            "backend tightened validation. Inspect the response body and the path."
+                        ),
+                        operation="hubbot_backend_call",
+                        outcome="client_error",
+                        http_method=method,
+                        http_path=path,
+                        http_status=status_code,
+                        body_preview=text[:220],
                     )
                 result = {"ok": False, "error": f"HTTP {e.response.status_code}", "detail": text}
                 if fut is not None and not fut.done():
@@ -208,7 +272,22 @@ async def api_json(method: str, path: str, *, json_body: dict | None = None) -> 
                 return result
             except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
                 last_err = {"ok": False, "error": "network_error", "detail": str(e)[:200]}
-                log.error("api_json network_error path=%s detail=%s", path, str(e)[:220])
+                log_agent_failure(
+                    log,
+                    "hubbot.backend.network_error",
+                    error=e,
+                    error_code="backend_unreachable",
+                    operation="hubbot_backend_call",
+                    hint=(
+                        "Hubbot could not reach backend (connect/read timeout / protocol error). "
+                        "Check that `BACKEND_URL` resolves, port 8001 is open, and backend is up "
+                        "(`docker compose ps`, `curl /ready`)."
+                    ),
+                    http_method=method,
+                    http_path=path,
+                    attempt=attempt,
+                    elapsed_ms=round((time.monotonic() - started_at) * 1000, 1),
+                )
                 _maybe_send_backend_ops_alert(
                     alert_key="hubbot_backend_network_error",
                     summary=f"Hubbot could not reach backend for {path}",
@@ -222,7 +301,20 @@ async def api_json(method: str, path: str, *, json_body: dict | None = None) -> 
                     fut.set_result(last_err)
                 return last_err
             except Exception as e:
-                log.exception("api_json unexpected_exception path=%s", path)
+                log_agent_failure(
+                    log,
+                    "hubbot.backend.unexpected_exception",
+                    error=e,
+                    error_code="backend_client_exception",
+                    operation="hubbot_backend_call",
+                    hint=(
+                        "Unexpected exception in hubbot's backend client. Read the stack trace below; "
+                        "if it's an httpx variant we don't handle, add it to the explicit branches."
+                    ),
+                    http_method=method,
+                    http_path=path,
+                    elapsed_ms=round((time.monotonic() - started_at) * 1000, 1),
+                )
                 _maybe_send_backend_ops_alert(
                     alert_key="hubbot_backend_client_exception",
                     summary=f"Unexpected backend client exception on {path}",

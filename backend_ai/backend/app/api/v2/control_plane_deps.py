@@ -7,6 +7,7 @@ from fastapi import Depends, HTTPException, status
 from app.api.v2.error_catalog import to_http_exception
 from app.core.auth import get_tg_user
 from app.risk.orchestration_policy import OrchestrationPolicyError
+from app.services import login_lease
 from app.services.control_plane_service import MT5ControlPlaneService, get_control_plane_service
 
 
@@ -67,13 +68,28 @@ def translate_control_plane_error(exc: Exception) -> HTTPException:
 
     Quy tac:
     - Neu da la HTTPException -> tra nguyen, route handler tu lo.
+    - Neu la LoginLeaseConflict -> 409 LOGIN_BUSY voi owner info trong error_info.
+    - Neu la RuntimeError("login_lease_unavailable") -> 503 (fail-closed).
     - Neu la UniqueViolation tu Postgres -> map theo constraint name.
     - Con lai dung error_catalog.to_http_exception (co fallback 400 + payload chuan).
     """
     if isinstance(exc, HTTPException):
         return exc
 
+    if isinstance(exc, login_lease.LoginLeaseConflict):
+        http_exc = to_http_exception("login_busy")
+        try:
+            http_exc.error_info["owner_runner_id"] = exc.result.owner_runner_id
+            http_exc.error_info["owner_command_id"] = exc.result.owner_command_id
+            http_exc.error_info["owner_leased_at"] = exc.result.owner_leased_at
+        except Exception:
+            pass
+        return http_exc
+
     detail = str(exc) or exc.__class__.__name__
+
+    if detail == "login_lease_unavailable":
+        return to_http_exception("login_lease_unavailable")
 
     unique_code = _detect_unique_violation_code(exc)
     if unique_code is not None:

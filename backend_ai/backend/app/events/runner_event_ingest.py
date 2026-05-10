@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 import uuid
 from threading import Lock
 from typing import Any
 
+from app.core.log_context import bind_log_context
 from app.events.command_router import CommandRouterService
 from app.infra.redis_streams import RedisStreamPublisher
 from app.models.control_plane import CommandType, DeploymentStatus, EventType
@@ -20,9 +22,13 @@ from app.orchestration.start_failure_policy import (
     start_failure_reason,
 )
 from app.repositories.control_plane_repository import ControlPlaneRepository
+from app.services import login_lease
 from app.settings import settings
 from runner.schemas.events import RunnerEvent, RunnerEventType
 from ops_telegram_alerts import schedule_error_alert
+
+
+_log = logging.getLogger("runner.event.ingest")
 
 _HEARTBEAT_STATE_KEYS = {
     "account_id",
@@ -112,7 +118,7 @@ def _normalize_slot_projection_state(payload: dict[str, Any]) -> str | None:
         return None
     if runner_state in {"ready", "empty", "stopped"}:
         return "ready"
-    if runner_state in {"active", "verifying", "preparing", "stopping"}:
+    if runner_state in {"active", "verifying", "preparing", "executor_preparing", "executor_ready", "listening", "stopping"}:
         return "allocated"
     if runner_state == "rebuilding":
         return "degraded"
@@ -865,6 +871,21 @@ class RunnerEventIngestService:
     ) -> dict[str, Any]:
         event_id = uuid.uuid4().hex
         slot_id_value = _canonical_slot_id(slot_id)
+        bind_log_context(
+            account_id=account_id,
+            deployment_id=deployment_id,
+            runner_id=runner_id,
+            trace_id=trace_id,
+        )
+        _log.debug(
+            "runner_event.heartbeat runner=%s slot=%s deployment=%s",
+            runner_id, slot_id_value, deployment_id,
+            extra={
+                "event_kind": "heartbeat",
+                "runner_event_id": event_id,
+                "slot_id": slot_id_value,
+            },
+        )
         event_model = RunnerEvent.model_validate(
             {
                 "event_id": event_id,
@@ -910,6 +931,14 @@ class RunnerEventIngestService:
             slot_id=slot_id_value,
             payload=payload,
         )
+        # Spec §2.3 — renew login lease on each heartbeat. Cheap (1 Redis GET +
+        # EXPIRE) and keyed by account_id via the reverse index. Disabled by
+        # default unless LOGIN_LEASE_ENABLED=True.
+        if account_id is not None and login_lease.is_enabled():
+            try:
+                await login_lease.renew_for_account(account_id=int(account_id), runner_id=runner_id)
+            except Exception:
+                pass
         event = self._repo.insert_execution_event(
             event_id=event_model.event_id,
             event_type=event_model.event_type.value,
@@ -957,6 +986,32 @@ class RunnerEventIngestService:
         created_at: str | None = None,
     ) -> dict[str, Any]:
         slot_id_value = _canonical_slot_id(slot_id)
+        bind_log_context(
+            account_id=account_id,
+            deployment_id=deployment_id,
+            runner_id=runner_id,
+            trace_id=trace_id,
+        )
+        is_heartbeat = str(event_type or "").strip().lower() == EventType.HEARTBEAT.value.lower()
+        if not is_heartbeat:
+            severity_norm = str(severity or "info").strip().lower()
+            log_level = logging.WARNING if severity_norm in {"warning", "warn"} else (
+                logging.ERROR if severity_norm in {"error", "critical", "fatal"} else logging.INFO
+            )
+            _log.log(
+                log_level,
+                "runner_event.ingest type=%s runner=%s slot=%s deployment=%s severity=%s",
+                event_type, runner_id, slot_id_value, deployment_id, severity,
+                extra={
+                    "event_kind": "runner_event",
+                    "runner_event_id": event_id,
+                    "runner_event_type": event_type,
+                    "runner_event_severity": severity,
+                    "slot_id": slot_id_value,
+                    "command_id": command_id,
+                    "bot_id": bot_id,
+                },
+            )
         event_model = RunnerEvent.model_validate(
             {
                 "event_id": event_id or uuid.uuid4().hex,
@@ -1031,6 +1086,9 @@ class RunnerEventIngestService:
         if event_command_id and event_type_value in {
             EventType.BOT_STARTED.value,
             EventType.BOT_STOPPED.value,
+            EventType.SIGNAL_EXECUTOR_READY.value,
+            EventType.SIGNAL_EXECUTOR_STOPPED.value,
+            EventType.BOT_LISTENING.value,
             EventType.ORDER_SENT.value,
             EventType.ORDER_FILLED.value,
             EventType.POSITION_UPDATED.value,
@@ -1049,7 +1107,7 @@ class RunnerEventIngestService:
                 payload={"last_event_type": event_type_value, "runner_id": event_model.runner_id, "slot_id": event_model.slot_id},
             )
 
-        if event_type_value == EventType.BOT_STARTED.value and event_model.deployment_id is not None:
+        if event_type_value in {EventType.BOT_STARTED.value, EventType.BOT_LISTENING.value} and event_model.deployment_id is not None:
             deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
             if not _deployment_wants_stopped(deployment):
                 self._reconcile_runtime_slot(
@@ -1091,7 +1149,51 @@ class RunnerEventIngestService:
                             result="bot_started",
                             trace_id=event_model.trace_id,
                         )
-        elif event_type_value == EventType.BOT_STOPPED.value and event_model.deployment_id is not None:
+        elif event_type_value == EventType.SIGNAL_EXECUTOR_READY.value and event_model.deployment_id is not None:
+            deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
+            if not _deployment_wants_stopped(deployment) and str((deployment or {}).get("status") or "").strip().lower() != DeploymentStatus.RUNNING.value:
+                self._repo.update_deployment_status(
+                    deployment_id=event_model.deployment_id,
+                    status=DeploymentStatus.STARTING.value,
+                    desired_state="running",
+                    is_active=True,
+                    health_status="executor_ready",
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                )
+        elif event_type_value == EventType.SIGNAL_EXECUTOR_PREPARING.value and event_model.deployment_id is not None:
+            deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
+            if not _deployment_wants_stopped(deployment) and str((deployment or {}).get("status") or "").strip().lower() != DeploymentStatus.RUNNING.value:
+                self._repo.update_deployment_status(
+                    deployment_id=event_model.deployment_id,
+                    status=DeploymentStatus.STARTING.value,
+                    desired_state="running",
+                    is_active=True,
+                    health_status="executor_preparing",
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                )
+        elif event_type_value == EventType.SIGNAL_EXECUTOR_STOPPING.value and event_model.deployment_id is not None:
+            self._repo.update_deployment_status(
+                deployment_id=event_model.deployment_id,
+                status=DeploymentStatus.STOP_REQUESTED.value,
+                desired_state="stopped",
+                is_active=True,
+                health_status="executor_stopping",
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+            )
+        elif event_type_value in {EventType.BOT_STOPPED.value, EventType.SIGNAL_EXECUTOR_STOPPED.value} and event_model.deployment_id is not None:
+            # Spec §2.4 — release login lease so a future START can be dispatched
+            # to a different runner. Idempotent + safe under enforced mode.
+            if event_model.account_id is not None and login_lease.is_enabled():
+                try:
+                    await login_lease.release_for_account(
+                        account_id=int(event_model.account_id),
+                        runner_id=event_model.runner_id,
+                    )
+                except Exception:
+                    pass
             # STOP events must be idempotent.  Do not call the runtime-slot
             # reconcile path here: that path marks a binding active/current and
             # can collide with a newer deployment for the same account.

@@ -43,6 +43,7 @@ class ControlPlaneAccessLogNoiseFilter(logging.Filter):
         ("GET", "/api/v2/system/ops-summary"),
         ("GET", "/api/v2/system/runner-readiness"),
         ("POST", "/api/v2/runner/heartbeat"),
+        ("POST", "/api/v2/runner/commands/claim"),
         ("POST", "/api/v2/runner/events"),
         ("POST", "/api/v2/runner/account-verifications/result"),
     }
