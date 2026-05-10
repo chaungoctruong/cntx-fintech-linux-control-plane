@@ -15,9 +15,12 @@ if _BACKEND_DIR not in sys.path:
 
 os.environ["CNTX_ROLE"] = "runner-event-consumer"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+from app.logging_config import configure_service_logging
+
+configure_service_logging(
+    "runner-event-consumer",
+    subdir="backend",
+    level=os.getenv("LOG_LEVEL", "INFO"),
 )
 log = logging.getLogger("runner_event_consumer_script")
 

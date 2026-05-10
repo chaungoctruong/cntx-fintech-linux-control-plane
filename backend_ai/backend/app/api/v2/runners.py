@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from pydantic import ValidationError
 
 from app.api.v2.control_plane_deps import service_dep, translate_control_plane_error
 from app.core.internal_auth import require_backend_api_key
@@ -23,6 +26,7 @@ from app.services.control_plane_service import MT5ControlPlaneService
 from ops_telegram_alerts import schedule_error_alert
 
 router = APIRouter(tags=["mt5-runners"])
+log = logging.getLogger(__name__)
 
 
 _RUNNER_EVENT_TOP_LEVEL_PAYLOAD_KEYS = (
@@ -59,6 +63,32 @@ def _runner_event_payload_for_service(payload: RunnerEventRequest) -> dict:
     return data
 
 
+def _runner_event_validation_summary(raw_payload: Any) -> dict[str, Any]:
+    if not isinstance(raw_payload, dict):
+        return {"payload_type": type(raw_payload).__name__}
+    safe_keys = {
+        "event_id",
+        "event_type",
+        "runner_id",
+        "slot_id",
+        "account_id",
+        "deployment_id",
+        "bot_id",
+        "severity",
+        "trace_id",
+        "command_id",
+        "created_at",
+        "payload",
+    }
+    return {
+        "keys": sorted(str(key) for key in raw_payload.keys()),
+        "safe_values": {key: raw_payload.get(key) for key in safe_keys if key in raw_payload and key != "payload"},
+        "payload_keys": sorted(str(key) for key in (raw_payload.get("payload") or {}).keys())
+        if isinstance(raw_payload.get("payload"), dict)
+        else [],
+    }
+
+
 @router.post("/runner/register")
 async def register_runner(
     payload: RunnerRegisterRequest,
@@ -85,12 +115,20 @@ async def runner_heartbeat(
 
 @router.post("/runner/events")
 async def runner_events(
-    payload: RunnerEventRequest,
+    raw_payload: Any = Body(...),
     _: dict = Depends(require_backend_api_key),
     service: MT5ControlPlaneService = Depends(service_dep),
 ) -> dict:
     try:
+        payload = RunnerEventRequest.model_validate(raw_payload)
         return await service.ingest_runner_event(**_runner_event_payload_for_service(payload))
+    except ValidationError as exc:
+        log.warning(
+            "runner_event_validation_failed errors=%s summary=%s",
+            exc.errors(),
+            _runner_event_validation_summary(raw_payload),
+        )
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
     except Exception as exc:
         raise translate_control_plane_error(exc) from exc
 

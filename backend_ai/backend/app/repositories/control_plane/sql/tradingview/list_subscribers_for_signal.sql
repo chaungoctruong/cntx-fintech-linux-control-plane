@@ -5,6 +5,7 @@ SELECT
   s.id              AS subscription_id,
   s.account_id      AS account_id,
   s.signal_id       AS signal_id,
+  s.bot_code        AS subscription_bot_code,
   s.volume_override AS volume_override,
   s.priority        AS subscription_priority,
   s.metadata_json   AS subscription_metadata,
@@ -27,5 +28,7 @@ WHERE s.signal_id = %s
   AND d.is_active = TRUE
   AND d.runner_id IS NOT NULL
   AND d.slot_id IS NOT NULL
+  AND (COALESCE(s.bot_code, '') = '' OR d.bot_code = s.bot_code)
+  AND (%s = '' OR d.bot_code = %s)
 ORDER BY s.priority DESC, s.id ASC
 LIMIT %s

@@ -1878,7 +1878,12 @@ class MT5ControlPlaneService:
             raw = body.get(key)
             if raw is not None and str(raw).strip():
                 return str(raw).strip()
-        raise ValueError("tradingview_alert_id_required")
+        signal = str(body.get("signal_id") or body.get("bot_code") or "signal").strip()
+        action = str(body.get("action") or body.get("signal") or body.get("side") or "alert").strip()
+        symbol = str(body.get("symbol") or body.get("ticker") or "").strip()
+        seed = f"{signal}:{action}:{symbol}:{time.time_ns()}:{uuid.uuid4().hex[:8]}"
+        digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
+        return f"tv-auto:{signal or 'signal'}:{action or 'alert'}:{digest}"
 
     @staticmethod
     def _deployment_trading_config(deployment: dict[str, Any]) -> dict[str, Any]:
@@ -2175,6 +2180,7 @@ class MT5ControlPlaneService:
           - symbol (str): required for PLACE_ORDER, optional for CLOSE.
 
         Optional:
+          - bot_code (str): optional bot guard for multi-bot signal routing.
           - default_volume (float): fallback if subscriber has no volume_override.
           - max_subscribers (int, default 5000): safety cap.
           - secret: shared secret if TRADINGVIEW_WEBHOOK_SECRET is set.
@@ -2202,6 +2208,7 @@ class MT5ControlPlaneService:
         signal_id = str(body.get("signal_id") or "").strip()
         if not signal_id:
             raise ValueError("tradingview_signal_id_required")
+        requested_bot_code = str(body.get("bot_code") or body.get("bot_id") or "").strip()
 
         action = body.get("action") or body.get("signal") or body.get("side")
         kind, meta = self._classify_tradingview_action(action)
@@ -2236,11 +2243,16 @@ class MT5ControlPlaneService:
         except (TypeError, ValueError):
             max_subs_i = 5000
 
-        subscribers = self._repo.list_subscribers_for_signal(signal_id=signal_id, limit=max_subs_i)
+        subscribers = self._repo.list_subscribers_for_signal(
+            signal_id=signal_id,
+            bot_code=requested_bot_code,
+            limit=max_subs_i,
+        )
         if not subscribers:
             return {
                 "alert_id": alert_id,
                 "signal_id": signal_id,
+                "bot_code": requested_bot_code,
                 "action": str(action),
                 "kind": kind,
                 "subscribers_total": 0,
@@ -2322,6 +2334,7 @@ class MT5ControlPlaneService:
                     "request": request,
                     "broadcast_signal_id": signal_id,
                     "broadcast_alert_id": alert_id,
+                    "broadcast_bot_code": requested_bot_code,
                 },
                 "_subscription_id": sub.get("subscription_id"),
             })
@@ -2360,6 +2373,7 @@ class MT5ControlPlaneService:
         return {
             "alert_id": alert_id,
             "signal_id": signal_id,
+            "bot_code": requested_bot_code,
             "action": str(action),
             "kind": kind,
             "subscribers_total": len(subscribers),
@@ -2720,6 +2734,12 @@ class MT5ControlPlaneService:
             CommandType.CLOSE_ORDER.value,
             CommandType.SYNC_STATE.value,
         ]
+        supported_transports = ["http_poll", "redis_queue"]
+        recommended_transport = str(
+            getattr(settings, "RUNNER_RECOMMENDED_TRANSPORT", "redis_queue") or "redis_queue"
+        ).strip().lower()
+        if recommended_transport not in supported_transports:
+            recommended_transport = "redis_queue"
         return {
             "server_time": datetime.now(timezone.utc).isoformat(),
             "runner_id": runner_id_s or None,
@@ -2729,8 +2749,8 @@ class MT5ControlPlaneService:
                 "auth_header": "X-Backend-Api-Key",
             },
             "transport": {
-                "recommended": "http_poll",
-                "supported": ["http_poll", "redis_queue"],
+                "recommended": recommended_transport,
+                "supported": supported_transports,
                 "http_poll": {
                     "claim_path": "/api/v2/runner/commands/claim",
                     "wait_timeout_sec": 10,

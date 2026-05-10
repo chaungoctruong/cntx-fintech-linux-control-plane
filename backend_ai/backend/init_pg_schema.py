@@ -399,6 +399,7 @@ def init_postgres_schema():
                 id BIGSERIAL PRIMARY KEY,
                 account_id BIGINT NOT NULL REFERENCES broker_accounts(id) ON DELETE CASCADE,
                 signal_id TEXT NOT NULL,
+                bot_code TEXT NULL,
                 volume_override DOUBLE PRECISION NULL,
                 priority INTEGER NOT NULL DEFAULT 50,
                 enabled BOOLEAN NOT NULL DEFAULT TRUE,
@@ -411,6 +412,10 @@ def init_postgres_schema():
                 ON tradingview_signal_subscriptions(signal_id) WHERE enabled = TRUE;
             CREATE INDEX IF NOT EXISTS idx_tv_sig_subs_account
                 ON tradingview_signal_subscriptions(account_id);
+            ALTER TABLE tradingview_signal_subscriptions
+                ADD COLUMN IF NOT EXISTS bot_code TEXT NULL;
+            CREATE INDEX IF NOT EXISTS idx_tv_sig_subs_bot_code
+                ON tradingview_signal_subscriptions(bot_code) WHERE bot_code IS NOT NULL;
         """)
 
         tracker.step("audit_logs_extensions")

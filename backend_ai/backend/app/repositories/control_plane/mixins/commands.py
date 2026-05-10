@@ -289,11 +289,12 @@ class ControlPlaneCommandsMixin:
         if not runner_id_s:
             raise ValueError("runner_id_required")
         slot_id_s = _norm_slot_id(slot_id) or None
+        default_types = ["STOP_BOT", "START_BOT", "UPDATE_BOT_CONFIG", "PLACE_ORDER", "CLOSE_ORDER", "SYNC_STATE"]
         command_types_s = [
             str(item or "").strip().upper()
-            for item in (command_types or ["STOP_BOT", "START_BOT", "UPDATE_BOT_CONFIG"])
+            for item in (command_types or default_types)
             if str(item or "").strip()
-        ] or ["STOP_BOT", "START_BOT", "UPDATE_BOT_CONFIG"]
+        ] or list(default_types)
 
         def _do(con: Any, cur: Any) -> Optional[dict[str, Any]]:
             cur.execute(
@@ -328,11 +329,12 @@ class ControlPlaneCommandsMixin:
         runner_id_s = _norm(runner_id) or None
         limit_i = max(1, min(int(limit or 100), 1000))
         older_than_i = max(10, int(older_than_sec or 180))
+        default_types = ["STOP_BOT", "START_BOT", "UPDATE_BOT_CONFIG", "PLACE_ORDER", "CLOSE_ORDER", "SYNC_STATE"]
         command_types_s = [
             str(item or "").strip().upper()
-            for item in (command_types or ["STOP_BOT", "START_BOT", "UPDATE_BOT_CONFIG"])
+            for item in (command_types or default_types)
             if str(item or "").strip()
-        ] or ["STOP_BOT", "START_BOT", "UPDATE_BOT_CONFIG"]
+        ] or list(default_types)
 
         def _do(con: Any, cur: Any) -> int:
             cur.execute(
