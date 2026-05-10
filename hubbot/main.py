@@ -30,6 +30,9 @@ from app.config import (
     USE_WEBHOOK,
     WEBHOOK_URL,
     WEBHOOK_PATH,
+    WEBHOOK_PORT,
+    WEBHOOK_LISTEN,
+    WEBHOOK_SECRET_TOKEN,
     RADAR_LOG_ALL_MESSAGES,
     TELEGRAM_MAX_CONCURRENT_UPDATES,
     SYSTEM_BOT_TOKEN,
@@ -51,6 +54,8 @@ from app.lifecycle import (
     notify_main_crash,
 )
 from app.debug import _dbg, _dbg_lock
+from app.lifecycle.handler_logger import install_update_logger
+from app.logging_config import configure_service_logging
 
 configure_runtime_alerts(
     system_bot_token=SYSTEM_BOT_TOKEN,
@@ -58,10 +63,7 @@ configure_runtime_alerts(
     dev_chat_id=DEV_CHAT_ID,
 )
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-)
+configure_service_logging("hubbot", level=LOG_LEVEL)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("hubbot")
@@ -86,6 +88,7 @@ def _build_application(*, post_init, post_stop) -> Application:
 
 def _register_handlers(app: Application) -> None:
     app.add_error_handler(global_error_handler)
+    install_update_logger(app)
     if RADAR_LOG_ALL_MESSAGES:
         app.add_handler(MessageHandler(filters.ALL, raw_message_logger), group=-1)
     app.add_handler(CommandHandler("ping", cmd_ping))
@@ -116,7 +119,7 @@ def main() -> None:
 
     if not acquired:
         raise SystemExit(
-            "Another hubbot polling instance is already running for this token. "
+            "Another hubbot instance is already running for this token. "
             f"Lock file: {lock_path}"
         )
 
@@ -152,22 +155,53 @@ def main() -> None:
     app = _build_application(post_init=post_init, post_stop=post_stop)
     _register_handlers(app)
 
-    log.info("Starting Hubbot Polling...")
-    _dbg(
-        "hubbot selected polling mode",
-        {"pid": os.getpid(), "drop_pending_updates": True},
-        hypothesis_id="H1_H2_H4",
-        run_id="post-fix",
-    )
+    use_webhook = bool(USE_WEBHOOK and WEBHOOK_URL)
+    allowed_updates = [Update.MESSAGE, Update.EDITED_MESSAGE, Update.CALLBACK_QUERY]
+    if use_webhook:
+        log.info("Starting Hubbot Webhook on %s:%s%s", WEBHOOK_LISTEN, WEBHOOK_PORT, WEBHOOK_PATH)
+        _dbg(
+            "hubbot selected webhook mode",
+            {
+                "pid": os.getpid(),
+                "listen": WEBHOOK_LISTEN,
+                "port": WEBHOOK_PORT,
+                "webhook_path": WEBHOOK_PATH,
+                "webhook_url_configured": True,
+                "secret_token_configured": bool(WEBHOOK_SECRET_TOKEN),
+                "drop_pending_updates": True,
+            },
+            hypothesis_id="H1_H2_H4",
+            run_id="post-fix",
+        )
+    else:
+        log.info("Starting Hubbot Polling...")
+        _dbg(
+            "hubbot selected polling mode",
+            {"pid": os.getpid(), "drop_pending_updates": True},
+            hypothesis_id="H1_H2_H4",
+            run_id="post-fix",
+        )
 
     try:
         notify_started()
         try:
-            app.run_polling(
-                close_loop=False,
-                allowed_updates=[Update.MESSAGE, Update.EDITED_MESSAGE, Update.CALLBACK_QUERY],
-                drop_pending_updates=True,
-            )
+            if use_webhook:
+                app.run_webhook(
+                    listen=WEBHOOK_LISTEN,
+                    port=WEBHOOK_PORT,
+                    url_path=WEBHOOK_PATH.lstrip("/"),
+                    webhook_url=WEBHOOK_URL,
+                    allowed_updates=allowed_updates,
+                    drop_pending_updates=True,
+                    secret_token=WEBHOOK_SECRET_TOKEN or None,
+                    close_loop=False,
+                )
+            else:
+                app.run_polling(
+                    close_loop=False,
+                    allowed_updates=allowed_updates,
+                    drop_pending_updates=True,
+                )
         except Conflict:
             _dbg_lock(
                 "telegram conflict caught in run_polling",

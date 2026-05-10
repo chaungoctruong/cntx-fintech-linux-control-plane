@@ -5,9 +5,18 @@ import { useEffect } from "react";
 import Toast from "@/components/Toast";
 import PageTransition from "@/components/PageTransition";
 import { initTelegramWebApp } from "@/lib/telegram";
+import { installClientLogger } from "@/lib/clientLogger";
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   useEffect(() => {
+    try {
+      installClientLogger({
+        release: process.env.NEXT_PUBLIC_RELEASE || undefined,
+      });
+    } catch {
+      /* never let telemetry break the shell */
+    }
+
     let timer: number | null = null;
     let disposed = false;
 
