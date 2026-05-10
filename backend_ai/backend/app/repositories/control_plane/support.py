@@ -797,8 +797,9 @@ def _decorate_account_verification_projection(
         decorated["connect_status"] = "PENDING_RUNTIME_LOGIN"
         decorated["connection_state"] = "PENDING_RUNTIME_LOGIN"
         decorated["runtime_login_required"] = True
-        decorated["verification_state"] = "VERIFIED"
-        decorated["verification_ui_state"] = "VERIFIED"
+        # Credentials are on control-plane; MT5 proof is still pending (runner verify or START_BOT).
+        decorated["verification_state"] = "VERIFYING"
+        decorated["verification_ui_state"] = "SUBMITTED"
         account_status = "connected"
     start_ready = bool(
         decorated["verification_state"] == "VERIFIED"

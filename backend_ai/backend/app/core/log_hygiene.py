@@ -54,6 +54,13 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[4]
 
 
+def _default_log_dir() -> Path:
+    raw = (os.getenv("CNTX_LOG_DIR") or os.getenv("LOG_DIR") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (_project_root() / "logs").resolve()
+
+
 def debug_trace_enabled() -> bool:
     return bool(getattr(settings, "DEBUG_TRACE_FILE_ENABLED", False))
 
@@ -62,7 +69,7 @@ def debug_trace_file_path() -> Path:
     raw = str(getattr(settings, "DEBUG_TRACE_FILE_PATH", "") or "").strip()
     if raw:
         return Path(raw).expanduser().resolve()
-    return (_project_root() / "debug-fc5226.log").resolve()
+    return (_default_log_dir() / "backend" / "debug-trace.jsonl").resolve()
 
 
 def debug_trace_file_max_bytes(default: int = 2_000_000) -> int:

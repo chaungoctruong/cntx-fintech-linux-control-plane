@@ -24,7 +24,10 @@ try:
     from app.ai.prompts import SYSTEM_REASSURANCE_PROMPT
     from app.ai.runtime_config import get_gemini_model
 except ImportError as e:
-    print(f"CRITICAL: Không thể import settings hoặc prompts. Path hiện tại: {sys.path}")
+    logging.getLogger("CNTx labs_Gemini").critical(
+        "Khong the import settings hoac prompts. sys_path=%s",
+        sys.path,
+    )
     raise e
 
 logger = logging.getLogger("CNTx labs_Gemini")

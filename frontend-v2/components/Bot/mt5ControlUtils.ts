@@ -6,18 +6,8 @@ import {
   type StartMt5DeploymentResponse,
 } from "@/lib/api";
 
-const PRIVATE_GSALGO_BOT_CODE = "gsalgo_mt5_bot";
 const GSALGO_DISPLAY_NAME = "Gs Algo";
-const GSALGO_BOT_IDENTITIES = new Set([PRIVATE_GSALGO_BOT_CODE, "gsalgo"]);
-
-export type TradingUnit = "price_distance" | "points";
-
-export const TRADING_CONFIG_DEFAULTS = {
-  lotSize: "0.00",
-  stopLoss: "",
-  takeProfit: "",
-  tradingUnit: "price_distance" as TradingUnit,
-};
+export const LOT_SIZE_DEFAULT = "0.01";
 
 export function isMt5AccountReady(account: MT5AccountItem | null): boolean {
   if (!account) {
@@ -61,30 +51,6 @@ export function formatBotDisplayName(value?: string | null): string {
     return GSALGO_DISPLAY_NAME;
   }
   return raw;
-}
-
-function isPrivateGsalgoBot(
-  bot: MT5BotCatalogItem | null,
-  fallbackName?: string | null
-): boolean {
-  const values = [bot?.bot_id, bot?.bot_name, bot?.display_name, fallbackName].map((value) =>
-    normalizeBotIdentity(value).replace(/[^a-z0-9_]/g, "")
-  );
-
-  return values.some((value) => GSALGO_BOT_IDENTITIES.has(value));
-}
-
-export function botSupportsTradingConfig(
-  bot: MT5BotCatalogItem | null,
-  fallbackName?: string | null
-): boolean {
-  if (isPrivateGsalgoBot(bot, fallbackName)) {
-    return true;
-  }
-  const required = new Set(
-    (bot?.required_params || []).map((item) => normalizeBotIdentity(item))
-  );
-  return ["lot_size", "stop_loss", "take_profit"].every((key) => required.has(key));
 }
 
 export function entitlementMatchesBot(
@@ -141,6 +107,26 @@ export function parsePositiveDecimalInput(value: string): number | null {
   return parsed;
 }
 
+function getRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+export function getDeploymentLotSize(config?: Record<string, unknown> | null): string | null {
+  const payload = getRecord(config);
+  const trading = getRecord(payload.trading);
+  const raw = trading.lot_size ?? payload.lot_size;
+  if (raw == null || raw === "") {
+    return null;
+  }
+  const parsed = Number(String(raw).replace(",", "."));
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  return String(raw);
+}
+
 export function humanizeAccountStatus(account: MT5AccountItem | null): string {
   if (!account) {
     return "Chưa có account";
@@ -158,16 +144,17 @@ export function humanizeDeploymentStatus(
   account: MT5AccountItem | null
 ): string {
   if (!deployment && !account?.active_deployment_id) {
-    return "Đang tắt";
+    return "Đã tắt";
   }
   const status = String(deployment?.status || account?.active_deployment_status || "")
     .trim()
     .toLowerCase();
   if (status === "running" || status === "start_requested" || status === "starting")
     return "Đang bật";
-  if (status === "stop_requested" || status === "stopped") return "Đang tắt";
+  if (status === "stop_requested") return "Đang tắt";
+  if (status === "stopped") return "Đã tắt";
   if (status === "failed" || status === "blocked") return "Lỗi";
-  return status ? status : "Đang tắt";
+  return status ? status : "Đã tắt";
 }
 
 export function getAccountStatusPillClassName(account: MT5AccountItem | null): string {

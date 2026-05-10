@@ -100,6 +100,8 @@ export function getFriendlyMt5ActionError(action: Mt5BotAction, error: unknown):
   }
 
   switch (code) {
+    case "telegram_init_data_missing":
+      return "Vui lòng mở trong Telegram Mini App để tiếp tục.";
     case "rate_limited":
       return "Bạn thao tác hơi nhanh. Vui lòng chờ vài giây rồi làm mới trạng thái.";
     case "account_not_found":

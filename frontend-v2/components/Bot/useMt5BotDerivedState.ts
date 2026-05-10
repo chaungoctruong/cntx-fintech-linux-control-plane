@@ -1,12 +1,10 @@
 "use client";
 
 import {
-  botSupportsTradingConfig,
   entitlementMatchesBot,
   formatBotDisplayName,
   getLatestDeploymentForAccount,
   isActiveDeploymentStatus,
-  type TradingUnit,
 } from "@/components/Bot/mt5ControlUtils";
 import { getActionHint } from "@/components/Bot/mt5ControlMessages";
 import type { MT5AccountItem, MT5BotCatalogItem, MT5BotTokenEntitlement, MT5DeploymentItem } from "@/lib/api";
@@ -83,7 +81,6 @@ export function useMt5BotDerivedState({
       ? selectedDeploymentBotName
       : formatBotDisplayName(selectedBot?.display_name || selectedBot?.bot_name) || "Chưa chọn bot";
   const selectedBotProfile = selectedDeployment?.profile_class || selectedBot?.profile_class || "Chưa có profile";
-  const showTradingConfig = botSupportsTradingConfig(selectedBot, selectedDeployment?.bot_name);
   const activeBotEntitlement =
     selectedAccount == null
       ? null
@@ -94,7 +91,6 @@ export function useMt5BotDerivedState({
             entitlementMatchesBot(entitlement, selectedBot)
         ) ?? null;
   const botAccessReady = mt5FullAccess || Boolean(activeBotEntitlement);
-  const tradingConfigDisabled = controlsLocked || selectedAccountHasActiveBot;
   const actionHint = telegramUserHasOtherActiveBot
     ? "Telegram ID này đang có bot hoạt động. Hãy tắt bot hiện tại trước khi bật bot khác."
     : getActionHint({
@@ -122,10 +118,8 @@ export function useMt5BotDerivedState({
     backgroundPollingPaused,
     selectedBotDisplayName,
     selectedBotProfile,
-    showTradingConfig,
     activeBotEntitlement,
     botAccessReady,
-    tradingConfigDisabled,
     actionHint,
   };
 }

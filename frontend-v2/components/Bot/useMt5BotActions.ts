@@ -19,7 +19,6 @@ import {
   isMt5AccountReady,
   normalizeDeploymentId,
   parsePositiveDecimalInput,
-  type TradingUnit,
 } from "@/components/Bot/mt5ControlUtils";
 import { getDeploymentFailureMessage, getFriendlyMt5ActionError } from "@/components/Bot/mt5ControlMessages";
 
@@ -61,11 +60,7 @@ type StartParams = {
   selectedAccountHasActiveBot: boolean;
   telegramUserHasOtherActiveBot: boolean;
   botAccessReady: boolean;
-  showTradingConfig: boolean;
-  tradingLotSize: string;
-  tradingStopLoss: string;
-  tradingTakeProfit: string;
-  tradingUnit: TradingUnit;
+  lotSizeInput: string;
   latestDeployment: MT5DeploymentItem | null;
   activeBotEntitlementId?: string;
   mt5FullAccess: boolean;
@@ -277,37 +272,10 @@ export function useMt5BotActions({
       onNotice("error", "Vui lòng nhập token để mở quyền cho bot đã chọn trước khi bật bot.");
       return;
     }
-
-    let botConfigOverrides: Record<string, unknown> = {};
-    if (params.showTradingConfig) {
-      const lotSize = parsePositiveDecimalInput(params.tradingLotSize);
-      const stopLoss = parsePositiveDecimalInput(params.tradingStopLoss);
-      const takeProfit = parsePositiveDecimalInput(params.tradingTakeProfit);
-      if (lotSize === null) {
-        onNotice("error", "Vui lòng nhập Lot lớn hơn 0 trước khi bật bot.");
-        return;
-      }
-      if (stopLoss === null && takeProfit === null) {
-        onNotice("error", "Vui lòng nhập Stop loss và Take profit trước khi bật bot.");
-        return;
-      }
-      if (stopLoss === null) {
-        onNotice("error", "Vui lòng nhập Stop loss lớn hơn 0 trước khi bật bot.");
-        return;
-      }
-      if (takeProfit === null) {
-        onNotice("error", "Vui lòng nhập Take profit lớn hơn 0 trước khi bật bot.");
-        return;
-      }
-
-      botConfigOverrides = {
-        trading: {
-          lot_size: lotSize,
-          stop_loss: stopLoss,
-          take_profit: takeProfit,
-          trading_unit: params.tradingUnit,
-        },
-      };
+    const lotSize = parsePositiveDecimalInput(params.lotSizeInput);
+    if (lotSize === null) {
+      onNotice("error", "Vui lòng nhập Lot lớn hơn 0 trước khi bật bot.");
+      return;
     }
 
     setStartingBot(true);
@@ -317,7 +285,7 @@ export function useMt5BotActions({
         account_id: params.selectedAccount.id,
         bot_name: params.selectedBot.bot_name,
         entitlement_id: mt5FullAccess ? undefined : params.activeBotEntitlementId,
-        bot_config_overrides: botConfigOverrides,
+        lot_size: lotSize,
       });
       const startedDeploymentId = getStartResponseDeploymentId(startResponse);
       await loadState({ silentErrors: true, spinner: false, includeBots: false });
@@ -360,10 +328,10 @@ export function useMt5BotActions({
       await loadState({ silentErrors: true, spinner: false, includeBots: false });
       const pollResult = await pollUntilStable("stop", params.selectedAccount.id);
       if (pollResult.settled && pollResult.success) {
-        onNotice("success", "Đang tắt");
+        onNotice("success", "Đã tắt");
         return;
       }
-      onNotice("info", "Đang tắt");
+      onNotice("info", "Đã gửi lệnh tắt, đang đồng bộ trạng thái.");
     } catch (error) {
       onNotice("error", getFriendlyMt5ActionError("stop", error));
     } finally {
