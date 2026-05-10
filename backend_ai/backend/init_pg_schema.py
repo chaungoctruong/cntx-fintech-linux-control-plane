@@ -1,7 +1,10 @@
+import logging
 import time
 
 import psycopg2
 from app.settings import settings
+
+log = logging.getLogger("schema_bootstrap")
 
 
 CONTROL_PLANE_SCALE_INDEXES: tuple[tuple[str, str], ...] = (
@@ -79,7 +82,10 @@ CONTROL_PLANE_SCALE_INDEXES: tuple[tuple[str, str], ...] = (
 
 
 def _schema_print(message: str) -> None:
-    print(message, flush=True)
+    if any(getattr(handler, "_cntx_marker", "") for handler in logging.getLogger().handlers):
+        log.info("%s", message)
+    else:
+        print(message, flush=True)
 
 
 def _schema_bootstrap_verbose() -> bool:
@@ -382,6 +388,29 @@ def init_postgres_schema():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
             CREATE INDEX IF NOT EXISTS idx_user_webhooks_user_id ON user_webhooks(user_id);
+        """)
+
+        tracker.step("tradingview_signal_subscriptions")
+        # Subscription map: which broker_account follows which TradingView
+        # signal. Backend uses this for fan-out dispatch on /public/tradingview/
+        # broadcast — 1 signal → SELECT subscribers → batch publish.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS tradingview_signal_subscriptions (
+                id BIGSERIAL PRIMARY KEY,
+                account_id BIGINT NOT NULL REFERENCES broker_accounts(id) ON DELETE CASCADE,
+                signal_id TEXT NOT NULL,
+                volume_override DOUBLE PRECISION NULL,
+                priority INTEGER NOT NULL DEFAULT 50,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (account_id, signal_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tv_sig_subs_signal_enabled
+                ON tradingview_signal_subscriptions(signal_id) WHERE enabled = TRUE;
+            CREATE INDEX IF NOT EXISTS idx_tv_sig_subs_account
+                ON tradingview_signal_subscriptions(account_id);
         """)
 
         tracker.step("audit_logs_extensions")
@@ -945,7 +974,7 @@ def init_postgres_schema():
                 id BIGSERIAL PRIMARY KEY,
                 event_id TEXT NOT NULL UNIQUE,
                 event_type TEXT NOT NULL
-                    CHECK (event_type IN ('HEARTBEAT', 'BOT_STARTED', 'BOT_STOPPED', 'ORDER_SENT', 'ORDER_FILLED', 'ORDER_REJECTED', 'POSITION_UPDATED', 'SLOT_DEGRADED', 'SLOT_BROKEN', 'RUNTIME_LOG', 'SLOT_STATE_CHANGED', 'COMMAND_REJECTED')),
+                    CHECK (event_type IN ('HEARTBEAT', 'BOT_STARTED', 'BOT_STOPPED', 'SIGNAL_EXECUTOR_PREPARING', 'SIGNAL_EXECUTOR_READY', 'SIGNAL_EXECUTOR_STOPPING', 'SIGNAL_EXECUTOR_STOPPED', 'BOT_LISTENING', 'ORDER_SENT', 'ORDER_FILLED', 'ORDER_REJECTED', 'POSITION_UPDATED', 'SLOT_DEGRADED', 'SLOT_BROKEN', 'RUNTIME_LOG', 'SLOT_STATE_CHANGED', 'SLOT_TERMINAL_KILL_BEGIN', 'SLOT_TERMINAL_KILL_DONE', 'COMMAND_REJECTED')),
                 account_id BIGINT NULL REFERENCES broker_accounts(id) ON DELETE CASCADE,
                 deployment_id BIGINT NULL REFERENCES bot_deployments(id) ON DELETE CASCADE,
                 bot_id TEXT NULL,
@@ -978,9 +1007,14 @@ def init_postgres_schema():
                 ADD CONSTRAINT execution_events_event_type_check
                 CHECK (event_type IN (
                     'HEARTBEAT', 'BOT_STARTED', 'BOT_STOPPED',
+                    'SIGNAL_EXECUTOR_PREPARING', 'SIGNAL_EXECUTOR_READY',
+                    'SIGNAL_EXECUTOR_STOPPING', 'SIGNAL_EXECUTOR_STOPPED',
+                    'BOT_LISTENING',
                     'ORDER_SENT', 'ORDER_FILLED', 'ORDER_REJECTED',
                     'POSITION_UPDATED', 'SLOT_DEGRADED', 'SLOT_BROKEN',
-                    'RUNTIME_LOG', 'SLOT_STATE_CHANGED', 'COMMAND_REJECTED'
+                    'RUNTIME_LOG', 'SLOT_STATE_CHANGED',
+                    'SLOT_TERMINAL_KILL_BEGIN', 'SLOT_TERMINAL_KILL_DONE',
+                    'COMMAND_REJECTED'
                 ));
         """)
 
