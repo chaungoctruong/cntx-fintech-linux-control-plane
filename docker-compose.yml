@@ -1,6 +1,13 @@
 # Local/dev compose only. Production deployment uses PM2/HA samples under
 # `ecosystem.config.js` and `ops/ha/`; do not treat this file as a production
 # Postgres/Redis/security baseline.
+#
+# Env file selection (gitignored .env*):
+#   prod (default): docker compose up -d            → reads .env
+#   dev:            ENV_FILE=.env.dev docker compose up -d
+#                   or use the helper: ops/compose-dev.sh up -d
+# Both LOCAL_* substitution vars and container env_file resolve from the same
+# file, so swapping ENV_FILE swaps everything atomically.
 services:
   hubbot:
     build:
@@ -8,7 +15,7 @@ services:
       dockerfile: hubbot/Dockerfile
     restart: unless-stopped
     env_file:
-      - .env
+      - ${ENV_FILE:-.env}
     volumes:
       - ./hubbot:/app/hubbot
       - ./logs:/app/logs
@@ -24,7 +31,7 @@ services:
       dockerfile: backend_ai/Dockerfile
     restart: unless-stopped
     env_file:
-      - .env
+      - ${ENV_FILE:-.env}
     ports:
       - "8001:8001"
     # Static export Next.js build local — backend mount /_next từ thư mục này.
@@ -66,7 +73,7 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     environment:
-      REDIS_PASSWORD: ${LOCAL_REDIS_PASSWORD:?set LOCAL_REDIS_PASSWORD in .env}
+      REDIS_PASSWORD: ${LOCAL_REDIS_PASSWORD:?set LOCAL_REDIS_PASSWORD in your env file}
     # Product-style single-node Redis: auth + AOF persistence. Full production
     # should still move Redis to managed/HA storage before real-money traffic.
     command: sh -c 'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"'
