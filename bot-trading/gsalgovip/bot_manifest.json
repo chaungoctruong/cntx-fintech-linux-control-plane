@@ -1,0 +1,153 @@
+{
+  "manifest_version": 1,
+  "bot_id": "gsalgovip",
+  "bot_code": "gsalgovip",
+  "bot_name": "GsAlgo VIP",
+  "owner": "cntx_labs",
+  "package_path": "bot-trading/gsalgovip",
+  "version": "0.3.0",
+  "version_file": "VERSION",
+  "description": "Multi-tenant TradingView->MT5 bot package for the Spider AI catalog. Linux backend distributes this package to multiple Windows runners; one OS process per tenant. Cloned from gsalgo with all account/path-specific data removed and the local SQLite store replaced by an isolated PostgreSQL database injected by the platform.",
+  "bot_type": "backend_webhook_signal",
+  "execution_owner": "linux_backend",
+  "windows_role": "mt5_executor_only",
+  "tradingview_webhook_owner": "linux",
+  "requires_executor_slot": true,
+  "based_on": {
+    "package": "bot-trading/gsalgo",
+    "relationship": "reference_clone_sanitized",
+    "note": "Source bot remains untouched. This package is the catalog/distribution variant."
+  },
+  "runtime_language": "python",
+  "runtime_python": ">=3.10,<3.13",
+  "entrypoint": "app.runner_impl:run",
+  "legacy_entrypoints": {
+    "fastapi_asgi": "app.main:app",
+    "worker_main": "app.run_worker:main"
+  },
+  "profile_class": "normal",
+  "strategy_tags": [
+    "mt5",
+    "xauusd",
+    "signal",
+    "gsalgo",
+    "tradingview_webhook",
+    "postgres_state",
+    "multi_tenant"
+  ],
+  "required_params": [
+    "lot_size",
+    "stop_loss",
+    "take_profit"
+  ],
+  "deployment_model": {
+    "kind": "one_process_per_tenant",
+    "isolation": "per_tenant_env_block",
+    "shared_runner_supported": true,
+    "tenant_routing": "platform_owned",
+    "tenant_envs_per_process": [
+      "TENANT_ID",
+      "INSTANCE_ID",
+      "APP_PORT",
+      "WEBHOOK_PATH",
+      "DATABASE_URL",
+      "WEBHOOK_SECRET",
+      "MT5_TERMINAL_PATH",
+      "MT5_LOGIN",
+      "MT5_PASSWORD",
+      "MT5_SERVER",
+      "MT5_MAGIC"
+    ],
+    "port_strategy": "platform_assigns_unique_port_per_tenant",
+    "webhook_path_strategy": "default_or_platform_overrides_per_tenant",
+    "logs_strategy": "instance_label_prefix_in_each_line"
+  },
+  "data_store": {
+    "kind": "postgresql",
+    "isolation": "per_bot_or_per_tenant",
+    "must_be_separate_from_linux_core_db": true,
+    "schema_file": "db/schema.sql",
+    "auto_init_on_startup": true,
+    "tables": [
+      "signals",
+      "executions"
+    ],
+    "min_postgres_version": "13",
+    "concurrency_pattern": "FOR UPDATE SKIP LOCKED",
+    "url_env": "DATABASE_URL"
+  },
+  "resource_hints": {
+    "runtime": "windows_mt5",
+    "lane": "mt5_runner",
+    "bot_type": "backend_webhook_signal",
+    "execution_owner": "linux_backend",
+    "windows_role": "mt5_executor_only",
+    "tradingview_webhook_owner": "linux",
+    "requires_executor_slot": true,
+    "requires_mt5": true,
+    "requires_single_slot": true,
+    "requires_clean_terminal_on_start": true,
+    "requires_terminal_kill_on_stop": true,
+    "max_symbols": 1,
+    "default_symbols": [
+      "XAUUSD"
+    ],
+    "dca_enabled": false,
+    "high_modify_frequency": false,
+    "needs_inbound_webhook": true,
+    "requires_postgres": true,
+    "default_webhook_port": 8017,
+    "memory_hint_mb": 256,
+    "cpu_hint_cores": 0.25
+  },
+  "risk_contract": {
+    "requires_sl": true,
+    "requires_tp": true,
+    "max_orders": 20,
+    "max_basket": 1,
+    "max_order_per_minute": 10,
+    "max_modify_per_minute": 30,
+    "default_volume_min": 0.01,
+    "default_volume_max": 1.0,
+    "trading_disabled_by_default": true,
+    "dry_run_by_default": true
+  },
+  "config_schema": "config/schema.json",
+  "default_config_path": "config/default.json",
+  "secrets_required": [
+    "WEBHOOK_SECRET",
+    "MT5_PASSWORD",
+    "DATABASE_URL"
+  ],
+  "secrets_optional": [
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID"
+  ],
+  "secrets_source": "runtime_context",
+  "platform_contract": {
+    "receives_runtime_context": true,
+    "receives_stop_event": true,
+    "must_not_kill_processes": true,
+    "must_not_choose_terminal_path": true,
+    "must_not_write_postgres_core": true,
+    "owns_its_own_postgres_db": true,
+    "must_not_call_redis_directly": true,
+    "must_not_hardcode_production_paths": true,
+    "lifecycle_managed_by_platform": true,
+    "tenant_isolated": true,
+    "platform_must_provision_per_tenant": [
+      "unique_app_port",
+      "unique_database_url",
+      "unique_webhook_secret",
+      "unique_mt5_credentials",
+      "unique_mt5_terminal_path",
+      "tenant_id_env",
+      "instance_id_env"
+    ]
+  },
+  "compliant_with": {
+    "standard": "bot-trading/PACKAGE_STANDARD.md",
+    "standard_version": 1,
+    "platform_plan": "bot-trading/PLATFORM_INTEGRATION_PLAN.md"
+  }
+}

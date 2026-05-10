@@ -47,6 +47,59 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+_BOT_EXECUTION_CONTRACT_TEXT_KEYS = (
+    "bot_type",
+    "execution_owner",
+    "windows_role",
+    "tradingview_webhook_owner",
+)
+_BOT_EXECUTION_CONTRACT_BOOL_KEYS = ("requires_executor_slot",)
+
+
+def _contract_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _iter_contract_sources(*sources: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        out.append(source)
+        for nested_key in ("execution_contract", "manifest_contract", "bot_contract"):
+            nested = source.get(nested_key)
+            if isinstance(nested, dict):
+                out.append(nested)
+        metadata = source.get("metadata") or source.get("metadata_json")
+        if isinstance(metadata, dict):
+            out.extend(_iter_contract_sources(metadata))
+    return out
+
+
+def _bot_execution_contract(*sources: Any) -> dict[str, Any]:
+    contract: dict[str, Any] = {}
+    for source in _iter_contract_sources(*sources):
+        for key in _BOT_EXECUTION_CONTRACT_TEXT_KEYS:
+            value = str(source.get(key) or "").strip()
+            if value and key not in contract:
+                contract[key] = value
+        for key in _BOT_EXECUTION_CONTRACT_BOOL_KEYS:
+            if key in source and key not in contract:
+                contract[key] = _contract_bool(source.get(key))
+    return contract
+
+
+def _merge_bot_execution_contract(target: dict[str, Any], contract: dict[str, Any]) -> dict[str, Any]:
+    for key, value in contract.items():
+        if value is not None:
+            target[key] = value
+    return target
+
+
 def _runner_queue_depths(runner_ids: list[str]) -> dict[str, dict[str, int]]:
     ids = sorted({str(item or "").strip() for item in runner_ids if str(item or "").strip()})
     if not ids:
@@ -166,21 +219,43 @@ class DeploymentManagerService:
         sticky_reused: bool,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        resource_hints = dict(bot.get("resource_hints") or {})
+        runtime_env = dict(bot.get("runtime_env") or {})
+        risk_profile = dict(bot.get("risk_profile") or {})
+        execution_contract = _bot_execution_contract(
+            bot,
+            resource_hints,
+            runtime_env,
+            risk_profile,
+            bot.get("metadata"),
+        )
+        _merge_bot_execution_contract(resource_hints, execution_contract)
+        _merge_bot_execution_contract(runtime_env, execution_contract)
+
         payload = {
             "account_id": int(account["id"]),
             "mode": mode,
             "broker": account.get("broker"),
             "server": account.get("server"),
             "login": account.get("login"),
+            "bot_code": bot.get("bot_code") or bot.get("bot_id") or deployment.get("bot_code"),
             "bot_name": bot.get("bot_name") or deployment.get("bot_name"),
             "bot_version": bot.get("version") or "",
             "runtime_entry": bot.get("runtime_entry") or "",
             "profile_class": bot.get("profile_class") or deployment.get("profile_class") or "",
-            "resource_hints": bot.get("resource_hints") or {},
+            "resource_hints": resource_hints,
             "config_contract_version": TRADING_CONFIG_SCHEMA_VERSION,
             "config": deployment_config,
             "sticky_reused": sticky_reused,
         }
+        payload.update(execution_contract)
+        required_params = list(bot.get("required_params") or [])
+        if required_params:
+            payload["required_params"] = required_params
+        if runtime_env:
+            payload["runtime_env"] = runtime_env
+        if risk_profile:
+            payload["risk_profile"] = risk_profile
         if extra:
             payload.update(dict(extra))
         return payload

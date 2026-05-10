@@ -6,6 +6,10 @@
 - Hỗ trợ onboarding nhân viên mới: nhìn một nơi là hiểu định dạng dữ liệu chuẩn của runner.
 
 ## Nhiệm vụ chính
+- Định nghĩa `bot_catalog.py`:
+  - Scan `BOT_TRADING_ROOT` / `bot-trading/` để tìm package có `bot_manifest.json`.
+  - Validate contract cơ bản v1 và xuất payload `available_bots` + `bot_catalog` cho register/heartbeat Windows Phase 1.
+  - Không import/chạy runtime bot, không mở MT5, không mở webhook.
 - Định nghĩa schema lệnh trong `schemas/commands.py`:
   - Enum loại lệnh (`START_BOT`, `STOP_BOT`, `PLACE_ORDER`, ...).
   - Model `RunnerCommand` với validate bắt buộc (account, deployment, runner, slot, trace...).
@@ -15,6 +19,8 @@
 - Export tập trung qua `schemas/__init__.py` để import thống nhất.
 
 ## Hành vi chuẩn bắt buộc
+- Windows Phase 1 catalog handoff chạy được bằng:
+  `python -m runner.bot_catalog --root bot-trading --expect-bot gsalgovip --expect-version 0.3.0`.
 - Mọi dữ liệu lệnh/sự kiện đi qua biên hệ thống phải map về các schema trong thư mục này.
 - Không tự ý thêm trường ngoài schema ở từng service riêng lẻ; nếu cần mở rộng thì cập nhật schema gốc trước.
 - Dùng enum chuẩn thay vì string tự do để tránh sai chính tả và lệch nghiệp vụ giữa các hệ.

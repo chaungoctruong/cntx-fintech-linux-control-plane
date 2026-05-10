@@ -20,11 +20,13 @@ Khong goi API user/Mini App tu runner. Runner chi duoc goi cac endpoint `/api/v2
 BACKEND_BASE_URL=https://<backend-host>
 BACKEND_API_KEY=<same-secret-as-backend>
 REDIS_URL=redis://:<password>@<redis-host>:6379/0
+RUNNER_TRANSPORT=redis_queue
 RUNNER_ID=runner-win-01
 RUNNER_LABEL=Windows MT5 Runner 01
-MAX_SLOTS=1
+MAX_SLOTS=10
 MT5_TERMINAL_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
 RUNNER_WORK_DIR=C:\spider-runner
+BOT_TRADING_ROOT=C:\spider-runner\bot-trading
 ```
 
 Khong log `BACKEND_API_KEY`, Redis password, MT5 password.
@@ -86,7 +88,7 @@ Response mau:
     "auth_header": "X-Backend-Api-Key"
   },
   "transport": {
-    "recommended": "http_poll",
+    "recommended": "redis_queue",
     "supported": ["http_poll", "redis_queue"],
     "http_poll": {
       "claim_path": "/api/v2/runner/commands/claim",
@@ -125,16 +127,35 @@ Call khi runner start va call lai khi bot catalog/slot thay doi.
   "capability_tags": ["windows", "mt5", "redis_queue", "http_callback"],
   "capabilities": {
     "os": "windows",
-    "transport": "http_poll",
+    "transport": "redis_queue",
     "supported_transports": ["http_poll", "redis_queue"],
     "mt5_recovery": true,
     "runtime_login_required": true,
     "stop_policy": "end_task"
   },
-  "available_bots": ["gsalgo_mt5_bot"],
-  "available_bot_names": ["gsalgo_mt5_bot"],
-  "bot_catalog": {},
-  "max_slots": 1,
+  "available_bots": ["gsalgovip"],
+  "available_bot_names": ["gsalgovip"],
+  "bot_catalog": {
+    "source": "disk",
+    "bots": [
+      {
+        "bot_id": "gsalgovip",
+        "bot_code": "gsalgovip",
+        "bot_name": "GsAlgo VIP",
+        "version": "0.3.0",
+        "runtime_language": "python",
+        "entrypoint": "app.runner_impl:run",
+        "profile_class": "normal",
+        "strategy_tags": ["mt5", "xauusd", "signal", "tradingview_webhook"],
+        "resource_hints": {"runtime": "windows_mt5", "lane": "mt5_runner", "requires_mt5": true},
+        "risk_contract": {"requires_sl": true, "requires_tp": true, "max_orders": 20},
+        "config_schema": "config/schema.json",
+        "default_config_path": "config/default.json",
+        "checksum": "<sha256-from-runner.bot_catalog>"
+      }
+    ]
+  },
+  "max_slots": 10,
   "slots": [
     {
       "slot_id": "slot-01",
@@ -169,7 +190,20 @@ Call moi 5-10 giay. Neu slot dang chay bot thi gui account/deployment hien tai.
     "terminal_pid": 1234,
     "worker_pid": 5678,
     "mt5_connected": true,
-    "available_bots": ["gsalgo_mt5_bot"]
+    "available_bots": ["gsalgovip"],
+    "available_bot_names": ["gsalgovip"],
+    "bot_catalog": {
+      "source": "disk",
+      "bots": [
+        {
+          "bot_id": "gsalgovip",
+          "bot_code": "gsalgovip",
+          "version": "0.3.0",
+          "entrypoint": "app.runner_impl:run",
+          "checksum": "<sha256-from-runner.bot_catalog>"
+        }
+      ]
+    }
   }
 }
 ```
@@ -201,8 +235,8 @@ Response co dang:
   },
   "deployment": {
     "deployment_id": 9001,
-    "bot_code": "gsalgo_mt5_bot",
-    "bot_name": "gsalgo_mt5_bot",
+    "bot_code": "gsalgovip",
+    "bot_name": "gsalgovip",
     "status": "starting",
     "desired_state": "running",
     "runner_id": "runner-win-01",
@@ -210,9 +244,9 @@ Response co dang:
     "config": {}
   },
   "bot": {
-    "bot_id": "gsalgo_mt5_bot",
-    "bot_name": "gsalgo_mt5_bot",
-    "runtime_entry": "main.py",
+    "bot_id": "gsalgovip",
+    "bot_name": "gsalgovip",
+    "runtime_entry": "app.runner_impl:run",
     "profile_class": "normal",
     "resource_hints": {
       "runner_id": "runner-win-01",
@@ -283,7 +317,7 @@ Response khi co command:
     "account_id": 101,
     "profile_id": 101,
     "deployment_id": 9001,
-    "bot_id": "gsalgo_mt5_bot",
+    "bot_id": "gsalgovip",
     "runner_id": "runner-win-01",
     "slot_id": "slot-01",
     "priority": 50,
@@ -334,7 +368,7 @@ Start thanh cong:
   "event_type": "BOT_STARTED",
   "account_id": 101,
   "deployment_id": 9001,
-  "bot_id": "gsalgo_mt5_bot",
+  "bot_id": "gsalgovip",
   "runner_id": "runner-win-01",
   "slot_id": "slot-01",
   "severity": "info",
@@ -356,7 +390,7 @@ Start that bai vi credential:
   "event_type": "COMMAND_REJECTED",
   "account_id": 101,
   "deployment_id": 9001,
-  "bot_id": "gsalgo_mt5_bot",
+  "bot_id": "gsalgovip",
   "runner_id": "runner-win-01",
   "slot_id": "slot-01",
   "severity": "error",
@@ -384,7 +418,7 @@ Stop thanh cong:
   "event_type": "BOT_STOPPED",
   "account_id": 101,
   "deployment_id": 9001,
-  "bot_id": "gsalgo_mt5_bot",
+  "bot_id": "gsalgovip",
   "runner_id": "runner-win-01",
   "slot_id": "slot-01",
   "severity": "info",
@@ -435,7 +469,7 @@ Item trong `mt5:runner:{runner_id}:commands` hoac response `command` cua HTTP cl
   "account_id": 101,
   "profile_id": 101,
   "deployment_id": 9001,
-  "bot_id": "gsalgo_mt5_bot",
+  "bot_id": "gsalgovip",
   "runner_id": "runner-win-01",
   "slot_id": "slot-01",
   "priority": 50,

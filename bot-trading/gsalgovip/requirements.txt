@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+pydantic
+httpx
+psycopg[binary]>=3.1
+# MetaTrader5 cài qua platform image trên Windows; KHÔNG cài khi validate trên Linux

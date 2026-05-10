@@ -1084,6 +1084,37 @@ class ControlPlaneDeploymentsMixin:
                     """,
                     (deployment_id_i,),
                 )
+            else:
+                cur.execute(
+                    """
+                    UPDATE bot_deployments AS d
+                    SET last_heartbeat_at = NOW(),
+                        health_status = CASE
+                            WHEN d.health_status IS NULL OR d.health_status = '' THEN 'running'
+                            WHEN LOWER(d.health_status) IN ('stale', 'offline', 'degraded', 'starting') THEN 'running'
+                            ELSE d.health_status
+                        END,
+                        updated_at = NOW()
+                    FROM bot_catalog AS c
+                    WHERE c.bot_code = d.bot_code
+                      AND d.runner_id = %s
+                      AND (%s IS NULL OR d.slot_id = %s)
+                      AND d.status = 'running'
+                      AND d.desired_state = 'running'
+                      AND COALESCE(d.is_active, FALSE) = TRUE
+                      AND LOWER(COALESCE(
+                          NULLIF(BTRIM(c.runtime_env->>'bot_type'), ''),
+                          NULLIF(BTRIM(c.resource_hints->>'bot_type'), ''),
+                          ''
+                      )) = 'backend_webhook_signal'
+                      AND LOWER(COALESCE(
+                          NULLIF(BTRIM(c.runtime_env->>'windows_role'), ''),
+                          NULLIF(BTRIM(c.resource_hints->>'windows_role'), ''),
+                          ''
+                      )) = 'mt5_executor_only'
+                    """,
+                    (runner_id_s, slot_id_s, slot_id_s),
+                )
             if account_id_i is not None:
                 cur.execute(
                     """
