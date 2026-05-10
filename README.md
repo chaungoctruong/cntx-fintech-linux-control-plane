@@ -9,6 +9,27 @@ Monorepo gồm:
 - **`docker-compose.yml`** — local/dev: Postgres + Redis + spider-app + hubbot.
 - **`ecosystem.config.js`** — PM2 cho production-style trên Linux host (`/root/spider-ai/...`).
 
+## Tài liệu vận hành nội bộ
+
+Khi chuẩn bị chạy theo hướng test/product, nhân viên nên đọc theo thứ tự này:
+
+| Tài liệu | Khi nào đọc |
+|---|---|
+| [README.md](README.md) | Tổng quan repo, Docker Compose, health check, lệnh vận hành chung |
+| [backend_ai/backend/README.md](backend_ai/backend/README.md) | Backend Linux control-plane, DB/Redis, catalog bot, runner heartbeat |
+| [frontend-v2/README.md](frontend-v2/README.md) | Frontend Mini App, biến `NEXT_PUBLIC_BACKEND_URL`, build/rebuild |
+| [bot-trading/README.md](bot-trading/README.md) | Registry bot package trên Linux, contract `gsalgovip`, quy tắc không chứa secret |
+| [runner/README.md](runner/README.md) | Schema/chia sẻ hợp đồng với Windows runner |
+| [config/README.md](config/README.md) | Nginx/config handoff và quyền sở hữu file cấu hình |
+
+Quy ước quan trọng:
+
+- Repo root `.env` là file runtime chính cho Docker Compose trên Linux.
+- `backend_ai/backend/.env` chỉ dùng khi chạy backend trực tiếp ngoài compose.
+- `frontend-v2/.env` chỉ dùng cho frontend khi build/chạy riêng.
+- Windows runner dùng file `.env` riêng ở máy Windows, không dùng trực tiếp DB Linux.
+- Không commit hoặc dán secret thật vào tài liệu, issue, log hay chat.
+
 Tài liệu này tập trung **luồng A — Docker Compose** vì đây là cách nhanh nhất đưa toàn bộ chạy trên 1 máy. Luồng PM2 được nhắc cuối file.
 
 ---
@@ -37,11 +58,12 @@ Tạo bot mới qua [@BotFather](https://t.me/BotFather) → `/newbot`. Lấy to
 
 > ⚠️ **Không dùng token bot prod cho dev.** Telegram chỉ cho 1 consumer/`getUpdates` cùng token — chạy hubbot local cùng token với hubbot prod sẽ làm cả hai trả `Conflict: terminated by other getUpdates request`.
 
-### 2.2 File `.env.linux` (override compose)
+### 2.2 File `.env` (compose runtime)
 
-`docker-compose.yml` đọc env theo thứ tự `.env.linux.example` → `.env.linux` (override, optional). File `.env.linux` đã được `.gitignore` qua pattern `.env*` nên an toàn để chứa secret.
+`docker-compose.yml` đọc trực tiếp `.env`. File này đã được `.gitignore`
+qua pattern `.env*`, nên có thể chứa secret local/test và không được commit.
 
-Tạo `.env.linux` ở repo root:
+Tạo `.env` ở repo root:
 
 ```env
 # Bind uvicorn ra 0.0.0.0 để Docker port-forward 8001 đến được container.
@@ -51,10 +73,15 @@ API_HOST=0.0.0.0
 # Token bot Telegram cho compose local.
 TELEGRAM_BOT_TOKEN=<paste-token-bot-test-cua-ban>
 
-# (Tuỳ chọn) URL HTTPS công khai trỏ về backend, cần cho Mini App.
-# Sau khi mở tunnel ở mục 3, điền URL vào đây và restart.
-# PUBLIC_BASE_URL=https://<random>.trycloudflare.com
-# BACKEND_URL=https://<random>.trycloudflare.com
+# URL công khai trỏ về backend. Khi chạy server test/product, dùng IP/domain của Linux.
+# PUBLIC_BASE_URL=http://<linux-ip-hoac-domain>:8001
+
+# URL nội bộ để container hubbot gọi backend trong Docker network.
+# Giữ giá trị này khi chạy bằng Docker Compose.
+# BACKEND_URL=http://spider-app:8001
+
+# URL public để Windows runner đăng ký/heartbeat về Linux control-plane.
+# RUNNER_CONTROL_PLANE_URL=http://<linux-ip-hoac-domain>:8001
 ```
 
 ---
@@ -89,11 +116,11 @@ Lúc này:
 
 ---
 
-## 4. Mini App: tunnel HTTPS + build frontend
+## 4. Mini App: public URL + build frontend
 
-Telegram chặn mọi `web_app` URL không phải HTTPS, nên cần URL HTTPS công khai trỏ về backend local. Quá trình gồm 2 bước, làm theo thứ tự.
+Telegram chặn mọi `web_app` URL không phải HTTPS. Khi chạy product thật, dùng domain + TLS qua Nginx/Cloudflare và set `PUBLIC_BASE_URL=https://<domain>`. Khi chỉ test backend/runner bằng IP public, HTTP vẫn đủ cho runner register/heartbeat nhưng chưa đủ cho Mini App Telegram.
 
-### 4.1 Mở tunnel HTTPS
+### 4.1 Mở tunnel HTTPS khi chạy local
 
 Cách nhanh nhất là **Cloudflare Quick Tunnel** (không cần đăng ký, URL random):
 
@@ -105,13 +132,14 @@ Cloudflared in ra dòng dạng `https://<adj>-<noun>-<adj>-<noun>.trycloudflare.
 
 > 🔁 **URL random sẽ đổi mỗi lần restart tunnel.** Stable hơn: `cloudflared tunnel create <name>` + DNS route Cloudflare (cần Cloudflare account + domain). Hoặc `ngrok` với reserved domain (paid).
 
-### 4.2 Update `.env.linux`
+### 4.2 Update `.env`
 
-Mở `.env.linux`, set hai biến trỏ về URL tunnel vừa lấy:
+Mở `.env`, set URL công khai cho Mini App và runner. Với Docker Compose, giữ `BACKEND_URL=http://spider-app:8001` để hubbot/container gọi backend qua mạng nội bộ:
 
 ```env
 PUBLIC_BASE_URL=https://<your-tunnel>.trycloudflare.com
-BACKEND_URL=https://<your-tunnel>.trycloudflare.com
+RUNNER_CONTROL_PLANE_URL=https://<your-tunnel>.trycloudflare.com
+BACKEND_URL=http://spider-app:8001
 ```
 
 ### 4.3 Build frontend Next.js
@@ -136,13 +164,13 @@ docker run --rm \
 
 ### 4.4 Apply
 
-`docker-compose.yml` đã có volume mount `./frontend-v2/out:/app/frontend-v2/out:ro`. Chỉ cần restart spider-app + hubbot để đọc `.env.linux` mới:
+`docker-compose.yml` đã có volume mount `./frontend-v2/out:/app/frontend-v2/out:ro`. Chỉ cần restart spider-app + hubbot để đọc `.env` mới:
 
 ```bash
 docker compose up -d spider-app hubbot
 ```
 
-Verify Mini App home (qua tunnel):
+Verify Mini App home (qua public URL):
 
 ```bash
 curl -sS -o /dev/null -w "%{http_code}\n" https://<your-tunnel>.trycloudflare.com/
@@ -157,7 +185,7 @@ Trong log hubbot phải thấy:
 Telegram menu button configured for Mini App home.
 ```
 
-Nếu vẫn thấy `Menu button web app url '...' is invalid: only https links are allowed` → `.env.linux` chưa được load (kiểm tra path) hoặc chưa restart hubbot.
+Nếu vẫn thấy `Menu button web app url '...' is invalid: only https links are allowed` → `.env` chưa được load (kiểm tra path) hoặc chưa restart hubbot.
 
 ---
 
@@ -206,14 +234,9 @@ Quy ước an toàn theo [backend_ai/backend/migrations/README.md](backend_ai/ba
 
 | File | Vai trò | Có commit không |
 |---|---|---|
-| `.env.linux.example` | Defaults compose local — luôn được load | ✅ committed |
-| `.env.linux` | Override per-machine, chứa secret | ❌ gitignored (`.env*`) |
-| `backend_ai/backend/.env.connect.example` | Adapter cTrader legacy, đã đóng băng | ✅ committed |
-| `backend_ai/backend/.env.control-plane.example` | Baseline cho deploy production-style | ✅ committed |
-| `backend_ai/backend/.env.mt5-runner.example` | Cho runner Windows | ✅ committed |
-| `backend_ai/backend/.env.redis.example` | Mẫu Redis prod | ✅ committed |
+| `.env` | Runtime Docker Compose, chứa secret local/test | ❌ gitignored (`.env*`) |
 | `backend_ai/backend/.env` | Production thực — KHÔNG commit | ❌ gitignored |
-| `frontend-v2/.env.example` | Mẫu cho frontend dev | ✅ committed |
+| `frontend-v2/.env` | Runtime frontend local/test | ❌ gitignored (`.env*`) |
 
 Biến quan trọng nhất ở compose layer:
 
@@ -222,7 +245,8 @@ Biến quan trọng nhất ở compose layer:
 | `TELEGRAM_BOT_TOKEN` | Token bot — bắt buộc để hubbot khởi động |
 | `BACKEND_HOST` | Phải `0.0.0.0` trong container để port-forward Docker tới được |
 | `PUBLIC_BASE_URL` | URL công khai — Mini App URL build từ đây |
-| `BACKEND_URL` | URL hubbot dùng để gọi backend |
+| `BACKEND_URL` | URL nội bộ để hubbot/container gọi backend. Với Docker Compose giữ `http://spider-app:8001` |
+| `RUNNER_CONTROL_PLANE_URL` | URL public để Windows runner gọi register/heartbeat/job API |
 | `BACKEND_API_KEY` | Khoá hubbot ↔ backend, phải khớp 2 phía |
 | `REDIS_URL`, `BOT_COMMAND_QUEUE_REDIS_URL` | DB index 0 = prod, dev có thể đổi `/1` |
 | `DRY_RUN` | `1` = không gửi lệnh thật xuống MT5 |
@@ -241,7 +265,7 @@ Bug thứ tự trong [backend_ai/backend/init_pg_schema.py](backend_ai/backend/i
 
 ### Curl `/health` trả `Empty reply from server` mặc dù container Up
 
-Uvicorn bind `127.0.0.1` trong container thay vì `0.0.0.0`. Set `BACKEND_HOST=0.0.0.0` trong `.env.linux`, restart spider-app.
+Uvicorn bind `127.0.0.1` trong container thay vì `0.0.0.0`. Set `BACKEND_HOST=0.0.0.0` trong `.env`, restart spider-app.
 
 ### Bot trả "Hệ thống đang xử lý nhiều yêu cầu"
 
@@ -306,7 +330,7 @@ Production dùng PM2 trên Linux host theo [ecosystem.config.js](ecosystem.confi
 
 Các path được hard-code cho Linux host — **không** chạy được trên Windows native. Compose là cách duy nhất để dev/test trên Windows hoặc macOS.
 
-Baseline env: [backend_ai/backend/.env.control-plane.example](backend_ai/backend/.env.control-plane.example).
+Runtime env nằm trong `backend_ai/backend/.env` khi chạy trực tiếp trên host.
 
 ---
 
@@ -317,7 +341,7 @@ Baseline env: [backend_ai/backend/.env.control-plane.example](backend_ai/backend
 | `GET /health` | Liveness chi tiết (DB, Redis, runtime, AI) |
 | `GET /ready` | Readiness gọn cho load balancer |
 | `GET /api/v2/system/healthz` | Legacy nginx probe |
-| `GET /` (qua tunnel) | Mini App home (Next.js export) |
+| `GET /` (qua public URL) | Mini App home (Next.js export) |
 
 | File | Tài liệu chuyên đề |
 |---|---|

@@ -16,6 +16,9 @@
   - Giả lập runner MT5 cho mục đích test tích hợp.
 - `apply_control_plane_scale_indexes.py`:
   - Áp dụng index tối ưu hiệu năng cho control-plane.
+- `setup_tradingview_signal.py`:
+  - Gắn account vào `signal_id`, kiểm tra trạng thái fan-out, sinh JSON alert
+    TradingView BUY/SELL/CLOSE và gửi thử webhook khi cần.
 
 - `export_ai_training_dataset.py`:
   - Xuất dữ liệu huấn luyện AI từ nguồn nội bộ.

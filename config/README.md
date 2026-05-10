@@ -1,26 +1,37 @@
-# Config Ownership
+# Quyền sở hữu cấu hình
 
-This directory holds the handoff-facing config artifacts for the active Linux control-plane workstream.
+Thư mục này chứa các file cấu hình handoff cho Linux control-plane.
 
-## Canonical Nginx Files
+## File Nginx chuẩn
 
 - `config/nginx-spider.conf`
-  - canonical single-node control-plane nginx sample for release manifests and handoff
+  - mẫu Nginx cho control-plane một node
+  - dùng khi chuẩn bị release manifest hoặc bàn giao vận hành
 - `ops/ha/nginx/control-plane-edge.conf`
-  - canonical HA edge/include sample for the shared control-plane endpoint
+  - mẫu edge/include cho HA control-plane
 
-## Legacy / Local File Kept For Reference
+## File legacy/local giữ để tham khảo
 
 - `../nginx.conf`
-  - local or legacy host-level example kept for operator context
-  - not the canonical release artifact
-  - do not treat it as the source of truth when preparing a clean handoff
+  - file local hoặc legacy ở host-level
+  - không phải artifact release chuẩn
+  - không dùng làm nguồn sự thật khi bàn giao sạch
 
-## Environment Baselines
+## File env runtime
 
-- `../.env.linux.example`
-  - local `docker-compose.yml` compatibility baseline only
-- `../backend_ai/backend/.env.control-plane.example`
-  - active control-plane baseline for PM2/systemd style deployment
-- `../backend_ai/backend/.env.connect.example`
-  - frozen legacy broker/API adapter reference only
+- `../.env`
+  - runtime chính cho Docker Compose trên Linux
+  - không commit, không dán secret ra ngoài
+- `../backend_ai/backend/.env`
+  - chỉ dùng khi chạy backend trực tiếp ngoài compose
+- `../frontend-v2/.env`
+  - chỉ dùng cho frontend khi build/chạy riêng
+
+Các file `.env.example` ở root/backend/frontend đã được bỏ để tránh nhân viên sửa nhầm. Riêng bot package có thể vẫn có `.env.example` rỗng để document contract của package, không phải runtime secret.
+
+## Quy tắc khi sửa cấu hình
+
+- Sửa đúng file runtime đang được service đọc.
+- Không chỉnh Nginx khi chỉ muốn đổi DB/Redis/API key.
+- Không restart production nếu chưa kiểm `docker compose config --quiet`.
+- Không để Windows runner dùng trực tiếp DB Linux; runner gọi backend/control-plane qua HTTP.

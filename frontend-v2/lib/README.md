@@ -16,6 +16,7 @@
 - Chuẩn hóa xử lý lỗi tại `lib/` trước khi đẩy lên UI.
 - Không để component tự ghép URL/headers tùy tiện.
 - Hạn chế side-effect toàn cục ngoài các file adapter chuyên trách.
+- Endpoint cần Telegram auth chỉ được gọi khi có `Telegram.WebApp.initData`; nếu mở ngoài Telegram thì báo người dùng mở trong Mini App, không spam backend bằng request 401.
 
 ## Quy tắc dễ debug
 - Lỗi mạng: kiểm tra tại `lib/api.ts` trước, rồi mới kiểm tra component.

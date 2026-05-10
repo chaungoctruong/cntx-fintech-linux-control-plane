@@ -43,7 +43,6 @@ postgres_data
 *.bak
 
 backend-ctrader
-bot-trading
 bot-token
 
 *.tar.gz

@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 
 from dotenv import load_dotenv
 from telegram import Bot
 from telegram.error import NetworkError, TimedOut
+
+from app.logging_config import configure_service_logging
+
+log = logging.getLogger("hubbot.reset_webhook")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -38,12 +43,13 @@ async def _delete_webhook(bot: Bot, *, drop_pending_updates: bool, retries: int,
             break
 
     if last_err:
-        print(f"[error] delete_webhook failed: {type(last_err).__name__}: {str(last_err)[:200]}")
+        log.error("delete_webhook failed: %s: %s", type(last_err).__name__, str(last_err)[:200])
     return False
 
 
 async def main() -> None:
     load_dotenv()
+    configure_service_logging("reset-webhook", level=os.getenv("LOG_LEVEL", "INFO"))
 
     token = _env_str("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -58,9 +64,9 @@ async def main() -> None:
     # Identify bot (nice debug)
     try:
         me = await bot.get_me(read_timeout=timeout_sec)
-        print(f"[info] bot=@{me.username} id={me.id} drop_pending_updates={drop_pending}")
+        log.info("bot=@%s id=%s drop_pending_updates=%s", me.username, me.id, drop_pending)
     except Exception:
-        print(f"[info] bot loaded drop_pending_updates={drop_pending}")
+        log.info("bot loaded drop_pending_updates=%s", drop_pending)
 
     ok = await _delete_webhook(
         bot, 
@@ -70,7 +76,7 @@ async def main() -> None:
     )
     
     if ok:
-        print("[ok] webhook deleted")
+        log.info("webhook deleted")
         raise SystemExit(0)
 
     raise SystemExit(1)
