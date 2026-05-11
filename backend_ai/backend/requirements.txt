@@ -1,3 +1,10 @@
+# Default control-plane runtime for spider-app (see backend_ai/Dockerfile: pip install -r requirements.txt).
+# Python: 3.11 (image python:3.11-slim).
+# Optional / not installed by default Docker build:
+#   requirements-ai-vector.txt  — vector semantic retrieval (enable only if AI_PLATFORM_KNOWLEDGE_VECTOR_ENABLED)
+#   requirements-ai-lora.txt    — LoRA training stack (dedicated GPU/training host)
+#   requirements_enterprise_v1.txt — frozen dependency tree snapshot + Google GenAI stack; treat as reference,
+#                                    not auto-merged into this file (versions may intentionally differ).
 fastapi==0.115.8
 uvicorn[standard]==0.30.6
 python-dotenv==1.0.1

@@ -1,29 +1,47 @@
 # Deploy Spider AI lên VPS Linux mới (Rocky 9 / RHEL family)
 
-Chạy lần lượt từng phần. Mỗi phần có dòng **CHECK** để biết phần đó đã làm chưa. Output ở **CHECK** đúng kỳ vọng → bỏ qua phần đó.
+Runbook cho **VPS mới** hoặc **môi trường cô lập**. Mỗi mục có **CHECK** để bỏ qua bước đã làm.
 
-> Mọi giá trị cần thay đổi đánh dấu `# THAY:`. Đọc trước khi paste.
+**An toàn dữ liệu**
+
+- Không dán token, password, API key thật vào file hay chat. Dùng biến môi trường cục bộ hoặc secret manager.
+- File `.env` runtime phải `chmod 600`, không commit.
+- `docker compose down -v` **xoá volume Postgres/Redis** — chỉ trong cửa sổ bảo trì có chủ đích.
+
+**Mục lục**
+
+1. [Vào server](#0-vào-server)
+2. [Base packages + git](#1-base-packages--git)
+3. [Clone repo](#2-clone-repo)
+4. [Docker Engine + Compose v2](#3-docker-engine--plugin-compose-v2)
+5. [Cloudflared (tuỳ chọn, Mini App)](#4-cloudflared-chỉ-cần-nếu-dùng-mini-app)
+6. [Sanity check — 3 fix đã merge](#5-sanity-check--3-fix-đã-merge-trong-main)
+7. [Tạo `.env` (override compose)](#6-tạo-env-override-compose)
+8. [Tunnel HTTPS (tuỳ chọn)](#7-mở-cloudflare-tunnel-nếu-cần-mini-app)
+9. [Build + start compose](#maintenance-window-only--build--start-compose)
+10. [Build frontend Mini App](#maintenance-window-only--build-frontend-mini-app)
+11. [Recreate spider-app (mount + env)](#maintenance-window-only--force-recreate-spider-app)
+12. [Verify cuối](#12-verify-cuối-read-only)
+13. [Lệnh vận hành sau khi up](#13-lệnh-vận-hành-sau-khi-up)
+14. [Khi tunnel URL đổi](#maintenance-window-only--khi-tunnel-url-đổi)
+15. [Troubleshooting](#15-troubleshooting-nhanh)
 
 ---
 
 ## 0. Vào server
 
-Nếu **đã có SSH access** (bạn đang ở terminal VPS rồi) → skip phần này.
-
-Trên máy local, từ shell có quyền SSH:
+**CHECK**: Đang SSH vào VPS đích → skip.
 
 ```bash
-# THAY: port + IP của bạn
+# THAY: port + IP
 ssh -p 24700 root@<TEST_BACKEND_HOST>
 ```
-
-Nếu provider chỉ cho console web → vào console rồi `passwd root` set mật khẩu, sau đó SSH như trên.
 
 ---
 
 ## 1. Base packages + git
 
-**CHECK**: `git --version` ra version → skip.
+**CHECK**: `git --version` in ra version → skip.
 
 ```bash
 dnf update -y
@@ -34,32 +52,22 @@ dnf install -y git curl wget vim dnf-plugins-core
 
 ## 2. Clone repo
 
-**CHECK**: `ls /root/linux-root-backend-hubot-v1/docker-compose.yml` ra path → skip.
+**CHECK**: `test -f /root/linux-root-backend-hubot-v1/docker-compose.yml` → skip.
 
 ```bash
 cd /root
-# THAY: URL repo (HTTPS hoặc SSH). Nếu private repo cần SSH key.
+# THAY: URL repo (HTTPS hoặc SSH)
 git clone <REPO_URL> linux-root-backend-hubot-v1
 cd linux-root-backend-hubot-v1
 ```
 
-Nếu repo private + chưa có SSH key trên server → tạo key + add vào GitHub:
-
-**CHECK**: `ls ~/.ssh/id_ed25519` tồn tại → skip tạo key.
-
-```bash
-# THAY: email
-ssh-keygen -t ed25519 -C "your-email@example.com" -f ~/.ssh/id_ed25519 -N ""
-cat ~/.ssh/id_ed25519.pub
-# Paste public key vào GitHub Settings -> SSH and GPG keys -> New SSH key
-ssh -T git@github.com   # verify
-```
+SSH key (repo private): tạo key, add vào GitHub/GitLab, `ssh -T` verify — bỏ qua nếu đã có.
 
 ---
 
 ## 3. Docker Engine + plugin compose v2
 
-**CHECK**: `docker compose version` ra version → skip.
+**CHECK**: `docker compose version` in ra version → skip.
 
 ```bash
 dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
@@ -68,13 +76,13 @@ systemctl enable --now docker
 docker --version && docker compose version
 ```
 
+> `systemctl enable --now` có tác động dịch vụ — chỉ trên VPS mới hoặc trong cửa sổ bảo trì.
+
 ---
 
 ## 4. Cloudflared (chỉ cần nếu dùng Mini App)
 
-Mini App Telegram bắt HTTPS. Tạm dùng Cloudflare quick tunnel cho đến khi có domain.
-
-**CHECK**: `cloudflared --version` ra version → skip.
+**CHECK**: `cloudflared --version` → skip.
 
 ```bash
 dnf install -y https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-x86_64.rpm
@@ -84,8 +92,6 @@ cloudflared --version
 ---
 
 ## 5. Sanity check — 3 fix đã merge trong main
-
-3 fix bắt buộc (Dockerfile copy `ops_telegram_alerts.py`, thứ tự index `runtime_logs` trong `init_pg_schema.py`, mount `frontend-v2/out` trong `docker-compose.yml`) đã commit trong `2cf8257 fix: build error`. Lệnh dưới chỉ verify checkout đang có đủ:
 
 ```bash
 cd /root/linux-root-backend-hubot-v1
@@ -97,37 +103,47 @@ awk '/tracker\.step\("control_plane_scale_indexes"\)/{n++} END{exit !(n==1)}' \
   backend_ai/backend/init_pg_schema.py                            && echo "fix#2 OK"  || echo "fix#2 MISSING — git pull / merge"
 ```
 
-Cả 3 dòng phải in `OK`. Nếu thấy `MISSING` → checkout đang ở branch/commit cũ, fix lại bằng `git fetch && git checkout main && git pull` rồi check lại.
+Cả 3 dòng phải `OK`. Nếu `MISSING` → `git fetch && git checkout main && git pull` rồi kiểm tra lại.
 
 ---
 
 ## 6. Tạo `.env` (override compose)
 
-**CHECK**: `[ -f .env ] && grep -q '^TELEGRAM_BOT_TOKEN=[0-9]' .env` → đã có token thật, skip.
+**CHECK**: `[ -f .env ] && grep -q '^TELEGRAM_BOT_TOKEN=' .env` với token thật đã set → skip phần tạo mới (chỉ bổ sung biến thiếu).
+
+**Không lưu token thật trong tài liệu.** Tạo token qua [@BotFather](https://t.me/BotFather). Nhập token trên máy bạn (stdin), không ghi vào shell history:
 
 ```bash
-# THAY: token bot Telegram (lấy từ @BotFather, KHÁC bot prod nếu prod đang chạy)
-BOT_TOKEN='8768154090:AAHaqpy01dag10l2kBBaxiFfiTMjVk2KcHg'
+cd /root/linux-root-backend-hubot-v1
+set -o history off
+read -r -s -p "Paste TELEGRAM_BOT_TOKEN (hidden): " BOT_TOKEN
+echo
+set -o history on
 
+umask 077
 cat > .env <<ENV
 BACKEND_HOST=0.0.0.0
 API_HOST=0.0.0.0
 TELEGRAM_BOT_TOKEN=${BOT_TOKEN}
-# PUBLIC_BASE_URL + BACKEND_URL điền sau khi mở tunnel ở phần 7
+# Hubbot trong Docker Compose nên gọi backend qua service nội bộ (tránh loop qua tunnel).
+BACKEND_URL=http://spider-app:8001
+# Bổ sung sau khi có HTTPS: PUBLIC_BASE_URL, RUNNER_CONTROL_PLANE_URL, REDIS_URL, BACKEND_API_KEY, LOCAL_* — xem README.md mục biến môi trường.
 ENV
 chmod 600 .env
 ```
+
+**Ghi chú `docker-compose.yml`**: Compose yêu cầu `LOCAL_REDIS_PASSWORD` (và có thể các biến `LOCAL_POSTGRES_*`) trong cùng file env — đối chiếu comment trong `docker-compose.yml` và [README.md](README.md).
 
 ---
 
 ## 7. Mở Cloudflare tunnel (nếu cần Mini App)
 
-**CHECK**: `pgrep -f 'cloudflared tunnel'` ra PID → đã chạy, skip mở lại. Lấy URL hiện tại bằng `journalctl -u cloudflared-quick --since "10 min ago" | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1`.
+**CHECK**: Đã có URL HTTPS cố định (domain + TLS) hoặc quick tunnel đang chạy → chỉ cập nhật `.env`.
 
-Tạo systemd service để cloudflared tự khởi động lại nếu chết:
+Quick tunnel (URL random, đổi khi restart process):
 
 ```bash
-cat > /etc/systemd/system/cloudflared-quick.service <<'UNIT'
+sudo tee /etc/systemd/system/cloudflared-quick.service >/dev/null <<'UNIT'
 [Unit]
 Description=Cloudflared quick tunnel to backend:8001
 After=network.target
@@ -141,150 +157,165 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 UNIT
-systemctl daemon-reload
-systemctl enable --now cloudflared-quick
+sudo systemctl daemon-reload
+sudo systemctl enable --now cloudflared-quick
 sleep 8
-
-# Lấy URL random vừa cấp
-TUNNEL_URL=$(journalctl -u cloudflared-quick --since "2 min ago" | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1)
+TUNNEL_URL=$(sudo journalctl -u cloudflared-quick --since "2 min ago" | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1)
 echo "Tunnel URL: $TUNNEL_URL"
-
-# Ghi vào .env (xoá dòng cũ nếu có rồi append)
-sed -i '/^PUBLIC_BASE_URL=/d; /^BACKEND_URL=/d' .env
-echo "PUBLIC_BASE_URL=${TUNNEL_URL}" >> .env
-echo "BACKEND_URL=${TUNNEL_URL}" >> .env
 ```
 
-> ⚠️ URL `*.trycloudflare.com` random — đổi mỗi lần restart cloudflared. Production thật: dùng domain riêng + Nginx + Let's Encrypt thay vì quick tunnel.
+Ghi HTTPS vào `.env` — **không** ghi đè `BACKEND_URL` (giữ `http://spider-app:8001` cho hubbot):
+
+```bash
+cd /root/linux-root-backend-hubot-v1
+sed -i '/^PUBLIC_BASE_URL=/d; /^RUNNER_CONTROL_PLANE_URL=/d' .env
+grep -q '^PUBLIC_BASE_URL=' .env || echo "PUBLIC_BASE_URL=${TUNNEL_URL}" >> .env
+grep -q '^RUNNER_CONTROL_PLANE_URL=' .env || echo "RUNNER_CONTROL_PLANE_URL=${TUNNEL_URL}" >> .env
+```
+
+> Production: ưu tiên domain + Nginx + Let's Encrypt thay vì `*.trycloudflare.com`.
 
 ---
 
-## 8. Build + start compose
+## Maintenance window only — Build + start compose
 
-**CHECK**: `docker compose ps --format json | grep -c '"State":"running"'` ra `4` → đã Up, skip `--build` chỉ cần `up -d`.
+**CHECK**: Bốn service đều `running` → chỉ cần xem log / health.
 
 ```bash
-docker compose up -d --build       # lần đầu 5–15 phút
+cd /root/linux-root-backend-hubot-v1
+docker compose up -d --build
 sleep 8
 docker compose ps
 
-# Mở firewall 8001 nếu muốn truy cập IP:8001 trực tiếp (bỏ qua nếu chỉ qua tunnel)
 firewall-cmd --permanent --add-port=8001/tcp 2>/dev/null && firewall-cmd --reload || true
-
-# Verify backend
-curl -fsS http://127.0.0.1:8001/ready  | head -c 80; echo
-curl -fsS http://127.0.0.1:8001/health | head -c 80; echo
 ```
 
 ---
 
-## 9. Build frontend Mini App
+## Maintenance window only — Build frontend Mini App
 
-**CHECK**: `[ -f frontend-v2/out/index.html ]` true → đã build. Nếu URL tunnel khác URL build cũ thì vẫn phải build lại (NEXT_PUBLIC_* inline tại build time).
+**CHECK**: `[ -f frontend-v2/out/index.html ]` và URL `NEXT_PUBLIC_*` vẫn đúng → skip.
 
 ```bash
+cd /root/linux-root-backend-hubot-v1
 TUNNEL_URL=$(grep '^PUBLIC_BASE_URL=' .env | cut -d= -f2-)
 
 docker run --rm \
   -v "$(pwd)/frontend-v2:/app" -w /app \
-  -e NEXT_PUBLIC_BACKEND_URL=${TUNNEL_URL} \
-  -e NEXT_PUBLIC_API_URL=${TUNNEL_URL} \
+  -e NEXT_PUBLIC_BACKEND_URL="${TUNNEL_URL}" \
+  -e NEXT_PUBLIC_API_URL="${TUNNEL_URL}" \
   node:20-bookworm-slim \
   bash -c "rm -rf node_modules out .next && npm install --no-audit --no-fund && npm run build"
 ```
 
+**Node**: image `node:20-bookworm-slim` khớp khuyến nghị Node 20 LTS (xem [README.md](README.md)).
+
 ---
 
-## 10. Force recreate spider-app (apply mount + env mới)
+## Maintenance window only — Force recreate spider-app
 
-**CHECK**: `docker compose exec spider-app ls /app/frontend-v2/out/ | grep -q index.html` → mount đã thấy file. Skip.
+**CHECK**: `docker compose exec spider-app test -f /app/frontend-v2/out/index.html` → skip.
 
 ```bash
+cd /root/linux-root-backend-hubot-v1
 docker compose up -d --force-recreate --no-deps spider-app
 sleep 6
-
 docker compose exec spider-app ls /app/frontend-v2/out/ | head -5
 ```
 
 ---
 
-## 11. Verify cuối
+## 12. Verify cuối (read-only)
 
 ```bash
+cd /root/linux-root-backend-hubot-v1
 TUNNEL_URL=$(grep '^PUBLIC_BASE_URL=' .env | cut -d= -f2-)
 
 curl -sS -o /dev/null -w "local /        -> HTTP %{http_code}\n" http://127.0.0.1:8001/
 curl -sS -o /dev/null -w "local /health  -> HTTP %{http_code}\n" http://127.0.0.1:8001/health
-curl -sS -o /dev/null -w "tunnel /       -> HTTP %{http_code}\n" ${TUNNEL_URL}/
-curl -sS -o /dev/null -w "tunnel /ready  -> HTTP %{http_code}\n" ${TUNNEL_URL}/ready
+curl -sS -o /dev/null -w "local /ready  -> HTTP %{http_code}\n" http://127.0.0.1:8001/ready
+curl -sS -o /dev/null -w "tunnel /       -> HTTP %{http_code}\n" "${TUNNEL_URL}/"
+curl -sS -o /dev/null -w "tunnel /ready  -> HTTP %{http_code}\n" "${TUNNEL_URL}/ready"
 
-docker compose logs --tail=15 hubbot | grep -E "menu button|Application started|Conflict|InvalidToken"
+docker compose logs --tail=15 hubbot | grep -E "menu button|Application started|Conflict|InvalidToken" || true
 ```
 
-Mong đợi cả 4 curl đều `200`. Hubbot log phải có `Telegram menu button configured for Mini App home.` và `Application started`. Trên Telegram `/start` bot → có nút Mini App, click vào load được trang.
+Kỳ vọng: các `curl` trả `200` (hoặc `000` nếu tunnel chưa sẵn sàng). Hubbot: menu Mini App HTTPS + `Application started`.
 
 ---
 
-## 12. Lệnh thường dùng sau khi up
+## 13. Lệnh vận hành sau khi up
+
+### Read-only / an toàn
 
 ```bash
-# Trạng thái
 docker compose ps
-docker compose logs -f spider-app
-docker compose logs -f hubbot
-
-# Restart 1 service (đọc lại .env)
-docker compose up -d spider-app hubbot
-
-# Sau khi tunnel URL đổi: chạy lại phần 7 (lấy URL) → 9 (rebuild frontend) → 10 (force recreate)
-
-# Tắt
-docker compose down            # giữ volume db/redis
-docker compose down -v         # XOÁ volume → mất DB
-
-# Cloudflared service
-systemctl status cloudflared-quick
-systemctl restart cloudflared-quick
-journalctl -u cloudflared-quick -f
+docker compose logs --tail=80 spider-app
+docker compose logs --tail=80 hubbot
+curl -fsS http://127.0.0.1:8001/ready | head -c 200; echo
+systemctl status cloudflared-quick 2>/dev/null || true
 ```
+
+### Maintenance window only (restart / recreate)
+
+```bash
+docker compose up -d spider-app hubbot
+docker compose restart hubbot
+docker compose up -d --force-recreate --no-deps spider-app
+sudo systemctl restart cloudflared-quick
+sudo journalctl -u cloudflared-quick -n 50 --no-pager
+```
+
+### Destructive — chỉ khi chủ đích reset môi trường
+
+```bash
+docker compose down
+docker compose down -v
+```
+
+`down -v` **xoá volume** Postgres + Redis.
 
 ---
 
-## 13. Khi tunnel URL đổi (cloudflared restart hoặc reboot VPS)
-
-Quick tunnel có URL random. Mỗi lần đổi:
+## Maintenance window only — Khi tunnel URL đổi
 
 ```bash
 cd /root/linux-root-backend-hubot-v1
-NEW_URL=$(journalctl -u cloudflared-quick --since "5 min ago" | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1)
+NEW_URL=$(sudo journalctl -u cloudflared-quick --since "5 min ago" | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | tail -1)
 echo "URL mới: $NEW_URL"
 
-sed -i '/^PUBLIC_BASE_URL=/d; /^BACKEND_URL=/d' .env
+sed -i '/^PUBLIC_BASE_URL=/d; /^RUNNER_CONTROL_PLANE_URL=/d' .env
 echo "PUBLIC_BASE_URL=${NEW_URL}" >> .env
-echo "BACKEND_URL=${NEW_URL}"     >> .env
+echo "RUNNER_CONTROL_PLANE_URL=${NEW_URL}" >> .env
 
-# Rebuild frontend với URL mới
 docker run --rm -v "$(pwd)/frontend-v2:/app" -w /app \
-  -e NEXT_PUBLIC_BACKEND_URL=${NEW_URL} \
-  -e NEXT_PUBLIC_API_URL=${NEW_URL} \
+  -e NEXT_PUBLIC_BACKEND_URL="${NEW_URL}" \
+  -e NEXT_PUBLIC_API_URL="${NEW_URL}" \
   node:20-bookworm-slim \
   bash -c "rm -rf out .next && npm run build"
 
 docker compose up -d --force-recreate --no-deps spider-app hubbot
 ```
 
-Trên Telegram, user phải `/start` lại để bot set menu button mới.
+User Telegram nên `/start` lại để cập nhật menu button.
 
 ---
 
-## 14. Troubleshooting nhanh
+## 15. Troubleshooting nhanh
 
-| Triệu chứng | Nguyên nhân | Fix |
-|---|---|---|
-| `spider-app` exit(1) `ModuleNotFoundError: ops_telegram_alerts` | Fix #1 chưa áp | Phần 5 |
-| `init_postgres_schema_failed: relation "runtime_logs" does not exist` | Fix #2 chưa áp | Phần 5 |
-| Curl `/health` `Empty reply from server` | Backend bind 127.0.0.1 trong container | `BACKEND_HOST=0.0.0.0` trong `.env` |
-| Hubbot `InvalidToken` | Token còn placeholder | Phần 6, set token thật |
-| Hubbot `Conflict: terminated by other getUpdates` | Token đang dùng nơi khác | Tắt instance kia hoặc tạo bot mới |
-| Mini App `503` + log `frontend-v2 export missing` | `frontend-v2/out` rỗng hoặc mount cũ | Phần 9 build + phần 10 force recreate |
-| Bot menu báo `only https links are allowed` | `PUBLIC_BASE_URL` còn HTTP | Phần 7 đặt URL HTTPS rồi restart spider-app+hubbot |
+| Triệu chứng | Nguyên nhân | Gợi ý |
+|-------------|----------------|-------|
+| `spider-app` exit(1) `ModuleNotFoundError: ops_telegram_alerts` | Thiếu copy trong image | Mục 5 |
+| `init_postgres_schema_failed: relation "runtime_logs" does not exist` | Schema init cũ | Mục 5, cập nhật code |
+| Curl `/health` `Empty reply from server` | Bind sai trong container | `BACKEND_HOST=0.0.0.0` trong `.env` |
+| Hubbot `InvalidToken` | Token sai/placeholder | Mục 6 |
+| Hubbot `Conflict: terminated by other getUpdates` | Hai process cùng token | Một bot một consumer |
+| Mini App `503` + export missing | Chưa build `frontend-v2/out` | Mục build frontend |
+| `only https links are allowed` | `PUBLIC_BASE_URL` không HTTPS | Mục 7 |
+
+---
+
+## Rollback (tài liệu / repo)
+
+- Chỉ rollback **git** cho thay đổi doc/local: `git checkout -- DEPLOY_FRESH_VPS.md` (và file liên quan).
+- **Không** rollback Postgres/Redis/production state bằng tay từ runbook này.
