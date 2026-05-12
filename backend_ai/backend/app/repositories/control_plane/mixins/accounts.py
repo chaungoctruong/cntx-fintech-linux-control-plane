@@ -496,6 +496,7 @@ class ControlPlaneAccountsMixin:
                     a.status AS account_status,
                     a.label,
                     a.last_error AS account_last_error,
+                    a.risk_policy_json AS account_risk_policy,
                     c.password_encrypted,
                     bind.runner_id AS binding_runner_id,
                     bind.slot_id AS binding_slot_id,
