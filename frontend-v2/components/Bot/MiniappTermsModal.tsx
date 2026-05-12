@@ -31,6 +31,11 @@ const checkboxItems = [
 export const MINIAPP_RISK_WARNING_SHORT =
   "Cảnh báo: Bot giao dịch tự động không cam kết lợi nhuận. Giao dịch đòn bẩy có thể gây mất vốn. Nền tảng chỉ cung cấp công nghệ, không nhận ủy thác đầu tư, không giữ tiền và không chịu trách nhiệm đối với lời hứa/cam kết từ đối tác hoặc bên thứ ba.";
 
+export const MINIAPP_DISCLAIMER_NOTICE_PARAGRAPHS = [
+  "CNTx Labs cung cấp công cụ công nghệ hỗ trợ vận hành bot, không cam kết lợi nhuận, không nhận ủy thác đầu tư và không thay mặt người dùng ra quyết định tài chính.",
+  "Giao dịch tài chính luôn có rủi ro. Người dùng tự chịu trách nhiệm với tài khoản, vốn và quyết định giao dịch của mình.",
+] as const;
+
 function FullTermsContent() {
   return (
     <div className="space-y-5 text-sm leading-6 text-slate-200">

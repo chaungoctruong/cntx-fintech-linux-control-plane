@@ -42,6 +42,15 @@ async def start_deployment(
     _terms_accepted: None = Depends(require_miniapp_terms_accepted),
 ) -> dict:
     del _terms_accepted
+    if payload.lot_size is None:
+        return {
+            "deployment_id": None,
+            "runner_id": None,
+            "slot_id": None,
+            "status": "start_skipped",
+            "reason": "lot_size_required",
+            "message": "Account đã được lưu. Hãy bật bot từ panel điều khiển sau khi chọn lot.",
+        }
     entitlement_id = str(payload.entitlement_id or "").strip()
     full_access = has_miniapp_full_access(user["telegram_id"])
     if not entitlement_id and not full_access:

@@ -1,70 +1,80 @@
-# Scripts - Hướng Dẫn Nhiệm Vụ và Vận Hành
+# `scripts/` — Lệnh vận hành, smoke, AI (không phải request API)
 
-## Mục tiêu thư mục
-- Chứa các script vận hành/offline dùng cho backend CNTx labs.
-- Hỗ trợ triển khai, bảo trì dữ liệu, huấn luyện AI, và chạy tác vụ nền theo ngữ cảnh môi trường.
-- Giúp đội vận hành và nhân viên mới thực thi công việc lặp lại theo chuẩn an toàn.
+Python/shell chạy **ngoài** vòng đời request HTTP thông thường: entry PM2, consumer nền, smoke TradingView, pipeline AI, one-off (cẩn thận).
 
-## Nhóm nhiệm vụ theo script
-- `run_api.py`:
-  - Chạy API backend ở chế độ script/local.
-- `start_backend_cluster.sh`:
-  - Khởi động backend theo cụm/tiến trình phục vụ môi trường vận hành.
-- `run_runner_event_consumer.py`:
-  - Chạy consumer nhận event từ runner.
-- `run_mt5_runner_stub.py`:
-  - Giả lập runner MT5 cho mục đích test tích hợp.
-- `apply_control_plane_scale_indexes.py`:
-  - Áp dụng index tối ưu hiệu năng cho control-plane.
+## Chạy script như thế nào?
 
-- `export_ai_training_dataset.py`:
-  - Xuất dữ liệu huấn luyện AI từ nguồn nội bộ.
-- `review_ai_training_examples.py`:
-  - Rà soát mẫu dữ liệu training trước khi huấn luyện.
-- `evaluate_ai_training_dataset.py`:
-  - Đánh giá chất lượng dataset training.
-- `build_lora_training_job.py`:
-  - Tạo job huấn luyện LoRA theo cấu hình.
-- `register_ai_model_version.py`:
-  - Đăng ký phiên bản model sau huấn luyện/đánh giá.
+- **Trong Docker:** `docker compose exec spider-app bash -lc 'cd /app/backend_ai/backend && python scripts/<file>.py ...'`
+- **Trên host có venv:** `cd backend_ai/backend && ./venv/bin/python scripts/<file>.py ...`
+- Luôn xác nhận **`APP_ENV` / DB URL** trước khi ghi dữ liệu.
 
-- `ingest_platform_knowledge.py`:
-  - Nạp tri thức nền tảng vào kho dữ liệu tri thức.
-- `ingest_platform_sources.py`:
-  - Nạp nguồn tri thức thô/phụ trợ.
-- `backfill_platform_knowledge_embeddings.py`:
-  - Backfill embedding cho dữ liệu tri thức đã có.
+## Danh mục file (inventory)
 
-- `ops/zingserver_probe.py`, `ops/zingserver_plan_create_vps.py`:
-  - Script hỗ trợ vận hành hạ tầng liên quan ZingServer.
+### API / backend process
 
-## Hành vi bắt buộc khi chạy script
-- Luôn xác nhận môi trường (`dev/staging/prod`) trước khi chạy.
-- Không chạy script có tác động ghi dữ liệu production nếu chưa có backup/kế hoạch rollback.
-- Không sửa dữ liệu production bằng tay nếu đã có script chuẩn cho thao tác đó.
-- Không hard-code secret/token trong script; luôn đọc từ env/config an toàn.
-- Luôn ghi lại log chạy script và kết quả đầu ra để phục vụ audit/điều tra.
+| Script | Mục đích |
+|--------|----------|
+| **`run_api.py`** | Entry Uvicorn/PM2 — khởi động app (xem `ecosystem.config.js` monorepo). |
 
-## Logic vận hành an toàn
-- Script thay đổi schema/index:
-  - Chạy ngoài giờ cao điểm nếu có thể.
-  - Theo dõi lock/thời gian chạy.
-- Script xử lý dữ liệu lớn:
-  - Ưu tiên batch.
-  - Có checkpoint hoặc khả năng chạy lại idempotent.
-- Script AI pipeline:
-  - Dữ liệu đầu vào phải qua bước review/evaluate.
-  - Chỉ đăng ký model khi đạt tiêu chí chất lượng nội bộ.
+*(Chỉ liệt kê file có trong thư mục `scripts/` — không có shell khởi động cụm riêng trong repo này.)*
 
-## Quy trình chuẩn khi nhận task script
-1. Xác định script thuộc nhóm nào (runtime, DB/index, AI data, hạ tầng).
-2. Kiểm tra tác động đọc/ghi và phạm vi môi trường.
-3. Chạy thử trên local hoặc staging trước.
-4. Chạy chính thức với log đầy đủ.
-5. Xác minh hậu kiểm (DB/API/metrics) và lưu biên bản ngắn.
+### Runner / control-plane
 
-## Mục tiêu đào tạo nhân viên mới
-- Tuần 1: nhận diện từng script và mục đích sử dụng.
-- Tuần 2: thực hành chạy script read-only trên môi trường dev.
-- Tuần 3: thực hành quy trình staging với checklist an toàn.
-- Tuần 4: phối hợp vận hành script production dưới giám sát, có hậu kiểm đầy đủ.
+| Script | Mục đích |
+|--------|----------|
+| **`run_runner_event_consumer.py`** | Consumer xử lý stream event runner (tiến trình nền). |
+| **`run_mt5_runner_stub.py`** | Stub Linux: register + heartbeat + **dequeue Redis** (test tích hợp, không phải MT5 thật). |
+| **`measure_command_latency.py`** | Đo độ trễ publish/command (dev/benchmark). |
+
+### TradingView / broadcast
+
+| Script | Mục đích |
+|--------|----------|
+| **`setup_tradingview_signal.py`** | Gắn subscription signal ↔ account, kiểm tra fan-out. |
+| **`smoke_tradingview_webhook.py`** | Gửi thử webhook broadcast (cần secret/env đúng). |
+
+### AI / knowledge
+
+| Script | Mục đích |
+|--------|----------|
+| **`ingest_platform_knowledge.py`** | Nạp knowledge vào store nội bộ. |
+| **`ingest_platform_sources.py`** | Nạp nguồn thô. |
+| **`backfill_platform_knowledge_embeddings.py`** | Backfill embedding. |
+| **`export_ai_training_dataset.py`** | Xuất JSONL training. |
+| **`review_ai_training_examples.py`** | Duyệt ví dụ (approve/reject). |
+| **`evaluate_ai_training_dataset.py`** | Đánh giá dataset export. |
+| **`build_lora_training_job.py`** | Sinh gói job LoRA (train ngoài máy GPU). |
+| **`register_ai_model_version.py`** | Đăng ký phiên bản model sau train. |
+
+### DB / index
+
+| Script | Mục đích |
+|--------|----------|
+| **`apply_control_plane_scale_indexes.py`** | Áp index scale cho control-plane (chạy cửa sổ bảo trì). |
+
+### Ops / hạ tầng khác
+
+| Script | Mục đích |
+|--------|----------|
+| **`ops/zingserver_probe.py`** | Probe ZingServer API. |
+| **`ops/zingserver_plan_create_vps.py`** | Tạo plan/VPS (vận hành — đọc kỹ). |
+
+### ⚠️ Nguy hiểm / one-off (chỉ khi có ticket rõ ràng)
+
+| Script | Ghi chú |
+|--------|---------|
+| **`bulk_login_start_bot.py`** | Khối lượng lớn — chỉ chạy khi có kế hoạch + rollback. |
+| **`_oneoff_place_order_*.py`** | Script tạm theo ticket; không dùng như công cụ chung. |
+
+## Quy tắc an toàn
+
+- Không chạy script ghi **production** khi chưa backup / chưa staging.
+- Không hard-code secret; đọc từ env.
+- Ghi lại lệnh đã chạy + output (audit).
+
+## Đào tạo
+
+1. Tuần 1: `run_api.py`, `run_runner_event_consumer.py`, smoke read-only.
+2. Tuần 2: TradingView scripts trên dev.
+3. Tuần 3: pipeline AI export/evaluate trên staging.
+4. Tuần 4: tham gia chạy script prod có người giám sát + hậu kiểm.

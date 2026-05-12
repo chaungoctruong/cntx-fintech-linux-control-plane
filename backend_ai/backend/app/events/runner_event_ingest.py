@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 import uuid
 from threading import Lock
 from typing import Any
 
+from app.core.log_context import bind_log_context
 from app.events.command_router import CommandRouterService
 from app.infra.redis_streams import RedisStreamPublisher
 from app.models.control_plane import CommandType, DeploymentStatus, EventType
@@ -20,9 +22,13 @@ from app.orchestration.start_failure_policy import (
     start_failure_reason,
 )
 from app.repositories.control_plane_repository import ControlPlaneRepository
+from app.services import login_lease
 from app.settings import settings
 from runner.schemas.events import RunnerEvent, RunnerEventType
 from ops_telegram_alerts import schedule_error_alert
+
+
+_log = logging.getLogger("runner.event.ingest")
 
 _HEARTBEAT_STATE_KEYS = {
     "account_id",
@@ -112,7 +118,7 @@ def _normalize_slot_projection_state(payload: dict[str, Any]) -> str | None:
         return None
     if runner_state in {"ready", "empty", "stopped"}:
         return "ready"
-    if runner_state in {"active", "verifying", "preparing", "stopping"}:
+    if runner_state in {"active", "verifying", "preparing", "executor_preparing", "executor_ready", "listening", "stopping"}:
         return "allocated"
     if runner_state == "rebuilding":
         return "degraded"
@@ -139,6 +145,25 @@ def _event_reason(payload: dict[str, Any]) -> str:
         or payload.get("message")
         or ""
     ).strip().lower()
+
+
+def _command_requests_terminal_kill(command: dict[str, Any] | None) -> bool:
+    payload = command.get("payload_json") if isinstance(command, dict) else {}
+    if not isinstance(payload, dict):
+        return False
+    command_type = str(command.get("command_type") or payload.get("command_type") or "").strip().upper()
+    if command_type != CommandType.STOP_BOT.value:
+        return False
+    return any(str(payload.get(key, "")).strip().lower() in {"1", "true", "yes", "on"} for key in ("kill_mt5", "terminate_mt5"))
+
+
+def _payload_confirms_terminal_stopped(payload: dict[str, Any]) -> bool:
+    terminal_running_raw = payload.get("terminal_running")
+    terminal_running = "" if terminal_running_raw is None else str(terminal_running_raw).strip().lower()
+    if terminal_running in {"0", "false", "no", "off"}:
+        return True
+    terminal_pid = "" if payload.get("terminal_pid") is None else str(payload.get("terminal_pid")).strip().lower()
+    return bool(terminal_pid) and terminal_pid in {"0", "none", "null"}
 
 
 def _should_fallback_config_hot_update(reason: str) -> bool:
@@ -371,6 +396,45 @@ class RunnerEventIngestService:
             account_id=account_id,
             runner_id=runner_id,
             slot_id=slot_id,
+        )
+
+    async def _finalize_stopped_deployment(
+        self,
+        *,
+        event_model: RunnerEvent,
+        command_id: str | None,
+    ) -> None:
+        if event_model.account_id is not None and login_lease.is_enabled():
+            try:
+                await login_lease.release_for_account(
+                    account_id=int(event_model.account_id),
+                    runner_id=event_model.runner_id,
+                )
+            except Exception:
+                pass
+        self._repo.update_deployment_status(
+            deployment_id=event_model.deployment_id,
+            status=DeploymentStatus.STOPPED.value,
+            desired_state="stopped",
+            is_active=False,
+            health_status="stopped",
+            stopped=True,
+            runner_id=event_model.runner_id,
+            slot_id=event_model.slot_id,
+        )
+        self._repo.release_deployment_slot(deployment_id=event_model.deployment_id, keep_sticky=False)
+        self._repo.fail_pending_start_commands_for_deployment(
+            deployment_id=event_model.deployment_id,
+            reason="start_command_superseded_by_bot_stopped",
+        )
+        self._repo.reconcile_terminal_bot_control_commands(deployment_id=event_model.deployment_id)
+        await self._restart_after_config_stop(
+            deployment_id=event_model.deployment_id,
+            command_id=command_id,
+        )
+        await self._start_queued_replacement_after_stop(
+            previous_deployment_id=event_model.deployment_id,
+            command_id=command_id,
         )
 
     async def _fallback_config_hot_update_restart(
@@ -691,6 +755,57 @@ class RunnerEventIngestService:
             )
             return
 
+        # Latest-intent guard: the queued replacement may have been cancelled
+        # by a later user OFF press. Re-read state and skip the START_BOT if
+        # the user is no longer asking for a running bot on this account.
+        intent_state = self._repo.get_deployment_intent_state(deployment_id=replacement_deployment_id)
+        replacement_desired = str((intent_state or {}).get("desired_state") or "").strip().lower()
+        replacement_status = str((intent_state or {}).get("status") or "").strip().lower()
+        if not intent_state or replacement_desired != "running" or replacement_status != "queued":
+            drop_reason = (
+                "replacement_missing"
+                if not intent_state
+                else "desired_state_stopped"
+                if replacement_desired != "running"
+                else "replacement_not_queued"
+            )
+            self._repo.insert_deployment_audit(
+                deployment_id=replacement_deployment_id,
+                action="deployment.replacement_start_dropped",
+                payload={
+                    "deployment_id": replacement_deployment_id,
+                    "previous_deployment_id": previous_deployment_id,
+                    "stop_command_id": stop_command.get("command_id"),
+                    "drop_reason": drop_reason,
+                    "desired_state": replacement_desired or None,
+                    "deployment_status": replacement_status or None,
+                },
+                result="dropped",
+                trace_id=stop_command.get("trace_id"),
+            )
+            _log.info(
+                "runner.command.dispatch.dropped previous_deployment_id=%s replacement_deployment_id=%s drop_reason=%s desired_state=%s status=%s stop_command_id=%s",
+                previous_deployment_id,
+                replacement_deployment_id,
+                drop_reason,
+                replacement_desired or "",
+                replacement_status or "",
+                stop_command.get("command_id"),
+                extra={
+                    "event": "runner.command.dispatch.dropped",
+                    "dispatch_decision": "dropped",
+                    "drop_reason": drop_reason,
+                    "command_type": "START_BOT",
+                    "account_id": stop_command.get("account_id"),
+                    "deployment_id": replacement_deployment_id,
+                    "previous_deployment_id": previous_deployment_id,
+                    "trace_id": stop_command.get("trace_id"),
+                    "desired_state": replacement_desired or None,
+                    "deployment_status": replacement_status or None,
+                },
+            )
+            return
+
         previous = self._repo.get_deployment(deployment_id=previous_deployment_id) or {
             "id": previous_deployment_id,
             "account_id": stop_command.get("account_id"),
@@ -865,6 +980,21 @@ class RunnerEventIngestService:
     ) -> dict[str, Any]:
         event_id = uuid.uuid4().hex
         slot_id_value = _canonical_slot_id(slot_id)
+        bind_log_context(
+            account_id=account_id,
+            deployment_id=deployment_id,
+            runner_id=runner_id,
+            trace_id=trace_id,
+        )
+        _log.debug(
+            "runner_event.heartbeat runner=%s slot=%s deployment=%s",
+            runner_id, slot_id_value, deployment_id,
+            extra={
+                "event_kind": "heartbeat",
+                "runner_event_id": event_id,
+                "slot_id": slot_id_value,
+            },
+        )
         event_model = RunnerEvent.model_validate(
             {
                 "event_id": event_id,
@@ -910,6 +1040,14 @@ class RunnerEventIngestService:
             slot_id=slot_id_value,
             payload=payload,
         )
+        # Spec §2.3 — renew login lease on each heartbeat. Cheap (1 Redis GET +
+        # EXPIRE) and keyed by account_id via the reverse index. Disabled by
+        # default unless LOGIN_LEASE_ENABLED=True.
+        if account_id is not None and login_lease.is_enabled():
+            try:
+                await login_lease.renew_for_account(account_id=int(account_id), runner_id=runner_id)
+            except Exception:
+                pass
         event = self._repo.insert_execution_event(
             event_id=event_model.event_id,
             event_type=event_model.event_type.value,
@@ -957,6 +1095,32 @@ class RunnerEventIngestService:
         created_at: str | None = None,
     ) -> dict[str, Any]:
         slot_id_value = _canonical_slot_id(slot_id)
+        bind_log_context(
+            account_id=account_id,
+            deployment_id=deployment_id,
+            runner_id=runner_id,
+            trace_id=trace_id,
+        )
+        is_heartbeat = str(event_type or "").strip().lower() == EventType.HEARTBEAT.value.lower()
+        if not is_heartbeat:
+            severity_norm = str(severity or "info").strip().lower()
+            log_level = logging.WARNING if severity_norm in {"warning", "warn"} else (
+                logging.ERROR if severity_norm in {"error", "critical", "fatal"} else logging.INFO
+            )
+            _log.log(
+                log_level,
+                "runner_event.ingest type=%s runner=%s slot=%s deployment=%s severity=%s",
+                event_type, runner_id, slot_id_value, deployment_id, severity,
+                extra={
+                    "event_kind": "runner_event",
+                    "runner_event_id": event_id,
+                    "runner_event_type": event_type,
+                    "runner_event_severity": severity,
+                    "slot_id": slot_id_value,
+                    "command_id": command_id,
+                    "bot_id": bot_id,
+                },
+            )
         event_model = RunnerEvent.model_validate(
             {
                 "event_id": event_id or uuid.uuid4().hex,
@@ -1013,6 +1177,13 @@ class RunnerEventIngestService:
                 slot_id=event_model.slot_id,
                 payload=payload_map,
             )
+            if event_model.deployment_id is not None and _payload_confirms_terminal_stopped(payload_map):
+                deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
+                if str((deployment or {}).get("health_status") or "").strip().lower() == "terminal_cleanup_pending":
+                    await self._finalize_stopped_deployment(
+                        event_model=event_model,
+                        command_id=event_command_id,
+                    )
 
         event = self._repo.insert_execution_event(
             event_id=normalized_event_id,
@@ -1031,6 +1202,9 @@ class RunnerEventIngestService:
         if event_command_id and event_type_value in {
             EventType.BOT_STARTED.value,
             EventType.BOT_STOPPED.value,
+            EventType.SIGNAL_EXECUTOR_READY.value,
+            EventType.SIGNAL_EXECUTOR_STOPPED.value,
+            EventType.BOT_LISTENING.value,
             EventType.ORDER_SENT.value,
             EventType.ORDER_FILLED.value,
             EventType.POSITION_UPDATED.value,
@@ -1049,7 +1223,7 @@ class RunnerEventIngestService:
                 payload={"last_event_type": event_type_value, "runner_id": event_model.runner_id, "slot_id": event_model.slot_id},
             )
 
-        if event_type_value == EventType.BOT_STARTED.value and event_model.deployment_id is not None:
+        if event_type_value in {EventType.BOT_STARTED.value, EventType.BOT_LISTENING.value} and event_model.deployment_id is not None:
             deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
             if not _deployment_wants_stopped(deployment):
                 self._reconcile_runtime_slot(
@@ -1091,34 +1265,93 @@ class RunnerEventIngestService:
                             result="bot_started",
                             trace_id=event_model.trace_id,
                         )
-        elif event_type_value == EventType.BOT_STOPPED.value and event_model.deployment_id is not None:
-            # STOP events must be idempotent.  Do not call the runtime-slot
-            # reconcile path here: that path marks a binding active/current and
-            # can collide with a newer deployment for the same account.
+        elif event_type_value == EventType.SIGNAL_EXECUTOR_READY.value and event_model.deployment_id is not None:
+            deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
+            if not _deployment_wants_stopped(deployment) and str((deployment or {}).get("status") or "").strip().lower() != DeploymentStatus.RUNNING.value:
+                self._repo.update_deployment_status(
+                    deployment_id=event_model.deployment_id,
+                    status=DeploymentStatus.STARTING.value,
+                    desired_state="running",
+                    is_active=True,
+                    health_status="executor_ready",
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                )
+        elif event_type_value == EventType.SIGNAL_EXECUTOR_PREPARING.value and event_model.deployment_id is not None:
+            deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
+            if not _deployment_wants_stopped(deployment) and str((deployment or {}).get("status") or "").strip().lower() != DeploymentStatus.RUNNING.value:
+                self._repo.update_deployment_status(
+                    deployment_id=event_model.deployment_id,
+                    status=DeploymentStatus.STARTING.value,
+                    desired_state="running",
+                    is_active=True,
+                    health_status="executor_preparing",
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                )
+        elif event_type_value == EventType.SIGNAL_EXECUTOR_STOPPING.value and event_model.deployment_id is not None:
             self._repo.update_deployment_status(
                 deployment_id=event_model.deployment_id,
-                status=DeploymentStatus.STOPPED.value,
+                status=DeploymentStatus.STOP_REQUESTED.value,
                 desired_state="stopped",
-                is_active=False,
-                health_status="stopped",
-                stopped=True,
+                is_active=True,
+                health_status="executor_stopping",
                 runner_id=event_model.runner_id,
                 slot_id=event_model.slot_id,
             )
-            self._repo.release_deployment_slot(deployment_id=event_model.deployment_id, keep_sticky=False)
-            self._repo.fail_pending_start_commands_for_deployment(
-                deployment_id=event_model.deployment_id,
-                reason="start_command_superseded_by_bot_stopped",
-            )
-            self._repo.reconcile_terminal_bot_control_commands(deployment_id=event_model.deployment_id)
-            await self._restart_after_config_stop(
-                deployment_id=event_model.deployment_id,
-                command_id=event_command_id,
-            )
-            await self._start_queued_replacement_after_stop(
-                previous_deployment_id=event_model.deployment_id,
-                command_id=event_command_id,
-            )
+        elif event_type_value in {EventType.BOT_STOPPED.value, EventType.SIGNAL_EXECUTOR_STOPPED.value} and event_model.deployment_id is not None:
+            # STOP events must be idempotent.  Do not call the runtime-slot
+            # reconcile path here: that path marks a binding active/current and
+            # can collide with a newer deployment for the same account.
+            command = self._repo.get_execution_command(command_id=event_command_id or "")
+            deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
+            cleanup_done = str((deployment or {}).get("health_status") or "").strip().lower() == "terminal_cleanup_done"
+            if _command_requests_terminal_kill(command) and not cleanup_done:
+                self._repo.update_deployment_status(
+                    deployment_id=event_model.deployment_id,
+                    status=DeploymentStatus.STOP_REQUESTED.value,
+                    desired_state="stopped",
+                    is_active=True,
+                    health_status="terminal_cleanup_pending",
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                )
+            else:
+                await self._finalize_stopped_deployment(
+                    event_model=event_model,
+                    command_id=event_command_id,
+                )
+        elif event_type_value == EventType.SLOT_TERMINAL_KILL_DONE.value and event_model.deployment_id is not None:
+            deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
+            if _deployment_wants_stopped(deployment):
+                if str((deployment or {}).get("health_status") or "").strip().lower() == "terminal_cleanup_pending":
+                    await self._finalize_stopped_deployment(
+                        event_model=event_model,
+                        command_id=event_command_id,
+                    )
+                else:
+                    self._repo.update_deployment_status(
+                        deployment_id=event_model.deployment_id,
+                        status=DeploymentStatus.STOP_REQUESTED.value,
+                        desired_state="stopped",
+                        is_active=True,
+                        health_status="terminal_cleanup_done",
+                        runner_id=event_model.runner_id,
+                        slot_id=event_model.slot_id,
+                    )
+        elif event_type_value == EventType.SLOT_TERMINAL_KILL_BEGIN.value and event_model.deployment_id is not None:
+            deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
+            current_health = str((deployment or {}).get("health_status") or "").strip().lower()
+            if _deployment_wants_stopped(deployment) and current_health not in {"terminal_cleanup_pending", "terminal_cleanup_done"}:
+                self._repo.update_deployment_status(
+                    deployment_id=event_model.deployment_id,
+                    status=DeploymentStatus.STOP_REQUESTED.value,
+                    desired_state="stopped",
+                    is_active=True,
+                    health_status="terminal_cleanup_started",
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                )
         elif event_type_value == EventType.SLOT_BROKEN.value:
             if event_model.slot_id:
                 self._repo.update_runner_slot_state(

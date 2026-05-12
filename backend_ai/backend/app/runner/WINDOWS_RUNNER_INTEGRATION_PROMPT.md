@@ -1,80 +1,95 @@
-# Windows Runner Integration Prompt
+# Prompt tích hợp Windows Runner
 
-Copy prompt nay sang ben Windows runner/coding agent. Muc tieu la Windows runner noi vao backend FastAPI lam control-plane callback, doc Redis queue, tu dang nhap MT5, bat/tat bot va bao ket qua ve backend.
+**Cách dùng:** Sao chép toàn bộ nội dung file này (hoặc từng mục) gửi cho team Windows / coding agent trong repo runner (`windowns-runner-mt5-user-v1`). Đây là **hợp đồng kỹ thuật** để implement runner Python production cho MT5.
 
-## Vai tro
+**Tóm tắt:** Runner kết nối backend FastAPI (control-plane) qua HTTP có header `X-Backend-Api-Key`, **đọc lệnh từ Redis** (`RUNNER_TRANSPORT=redis_queue`), tự đăng nhập MT5, bật/tắt bot và báo **event** + **delivery** về backend. **Không** gọi API người dùng / Mini App — chỉ được gọi các đường dẫn `/api/v2/runner/*`.
 
-Ban la coding agent tren may Windows runner. Hay implement runner Python chay production cho MT5.
+**Không có HTTP poll lệnh:** control-plane **không** cung cấp endpoint để runner “kéo” / long-poll từng lệnh qua HTTP. **Mọi lệnh điều khiển bot** (`START_BOT`, `STOP_BOT`, …) chỉ đến runner qua **Redis list** `mt5:runner:{RUNNER_ID}:commands`. HTTP chỉ dùng cho **callback ngắn** (đăng ký, heartbeat, events, delivery, package, xác minh) — không thay thế Redis cho lệnh.
 
-Backend da co san:
-- Control-plane API: `BACKEND_BASE_URL`
-- Auth noi bo: header `X-Backend-Api-Key: BACKEND_API_KEY`
-- Redis command queue per runner
-- Schema command/event chung trong `runner/schemas`
+---
 
-Khong goi API user/Mini App tu runner. Runner chi duoc goi cac endpoint `/api/v2/runner/*`.
+## Vai trò
 
-## Env bat buoc
+Bạn là coding agent trên máy **Windows runner**. Cần implement runner Python chạy production cho MT5.
+
+Backend Linux đã có sẵn:
+
+- API control-plane: `BACKEND_BASE_URL`
+- Xác thực nội bộ: header `X-Backend-Api-Key: BACKEND_API_KEY`
+- Hàng đợi lệnh Redis theo từng runner
+- Schema lệnh / sự kiện chung trong `runner/schemas` (repo monorepo Linux hoặc bản đồng bộ trên Windows)
+
+**Cấm:** gọi API user / Mini App từ runner. Runner **chỉ** được gọi các endpoint `/api/v2/runner/*`.
+
+---
+
+## Biến môi trường bắt buộc
 
 ```env
 BACKEND_BASE_URL=https://<backend-host>
 BACKEND_API_KEY=<same-secret-as-backend>
 REDIS_URL=redis://:<password>@<redis-host>:6379/0
+RUNNER_TRANSPORT=redis_queue
 RUNNER_ID=runner-win-01
 RUNNER_LABEL=Windows MT5 Runner 01
-MAX_SLOTS=1
+MAX_SLOTS=10
 MT5_TERMINAL_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
 RUNNER_WORK_DIR=C:\spider-runner
+BOT_TRADING_ROOT=C:\spider-runner\bot-trading
 ```
 
-Khong log `BACKEND_API_KEY`, Redis password, MT5 password.
+**Không** ghi log `BACKEND_API_KEY`, mật khẩu Redis, mật khẩu MT5.
 
-`REDIS_URL` chi bat buoc neu runner chon transport `redis_queue`. Neu chon `http_poll`, runner chi can outbound HTTPS den backend.
+`REDIS_URL` là **bắt buộc**: runner lấy lệnh qua Redis list gắn với `RUNNER_ID`.
 
-## Ket noi hien tai
+---
 
-Backend -> Windows runner co 2 transport hop le:
-- Product/fallback API mode: `POST /api/v2/runner/commands/claim`
-- Redis queue mode:
-  - Redis list: `mt5:runner:{RUNNER_ID}:commands`
-  - Redis list: `mt5:runner:{RUNNER_ID}:verification`
-  - Khi claim thi dung processing list:
-    - `mt5:runner:{RUNNER_ID}:commands:processing`
-    - `mt5:runner:{RUNNER_ID}:verification:processing`
+## Luồng kết nối hiện tại
 
-Neu Windows khong noi Redis truc tiep duoc, dung `http_poll`. Neu da dung `http_poll` cho mot `RUNNER_ID`, khong chay them Redis consumer cho cung runner do.
+**Backend → Windows runner (lệnh thực thi):** chỉ qua **Redis queue**
 
-Windows runner -> Backend:
-- HTTP callback vao FastAPI, header `X-Backend-Api-Key`.
+- List lệnh: `mt5:runner:{RUNNER_ID}:commands`
+- List xác minh tài khoản: `mt5:runner:{RUNNER_ID}:verification`
+- Khi dequeue, dùng list **processing**:
+  - `mt5:runner:{RUNNER_ID}:commands:processing`
+  - `mt5:runner:{RUNNER_ID}:verification:processing`
 
-## Dependencies de cai tren Windows
+Windows phải **kết nối được Redis** (mesh/VPN nội bộ hoặc chính sách mạng cho phép).
 
-Dung Python 3.11+.
+**Windows runner → Backend:** HTTP callback vào FastAPI (request ngắn), kèm header `X-Backend-Api-Key`. **Không** dùng chuỗi HTTP này để nhận lệnh — lệnh chỉ từ Redis như trên.
+
+---
+
+## Phụ thuộc cài trên Windows
+
+Dùng **Python 3.11+**.
 
 ```powershell
 pip install httpx redis pydantic psutil MetaTrader5
 ```
 
-Neu runner repo co san package rieng thi dung package do, nhung van phai giu dung contract ben duoi.
+Nếu repo runner đã có package riêng thì dùng package đó, nhưng **vẫn phải** giữ đúng hợp đồng dưới đây.
+
+---
 
 ## API control-plane
 
 Base URL: `${BACKEND_BASE_URL}/api/v2`
 
-Tat ca request them:
+Mọi request thêm:
 
 ```http
 X-Backend-Api-Key: ${BACKEND_API_KEY}
 Content-Type: application/json
 ```
 
-### Register runner
+### Đăng ký runner (register)
 
-Truoc khi register, runner nen goi bootstrap de lay contract moi nhat:
+Trước khi `register`, runner **nên** gọi `bootstrap` để lấy contract mới nhất:
 
 `GET /api/v2/runner/bootstrap?runner_id=runner-win-01`
 
-Response mau:
+Ví dụ response (rút gọn — thực tế có thể dài hơn):
 
 ```json
 {
@@ -86,14 +101,13 @@ Response mau:
     "auth_header": "X-Backend-Api-Key"
   },
   "transport": {
-    "recommended": "http_poll",
-    "supported": ["http_poll", "redis_queue"],
-    "http_poll": {
-      "claim_path": "/api/v2/runner/commands/claim",
-      "wait_timeout_sec": 10,
-      "idle_poll_sec": 1,
-      "claim_lease_sec": 180,
-      "command_types": ["STOP_BOT", "START_BOT", "UPDATE_BOT_CONFIG"]
+    "recommended": "redis_queue",
+    "supported": ["redis_queue"],
+    "redis_queue": {
+      "commands": "mt5:runner:runner-win-01:commands",
+      "commands_processing": "mt5:runner:runner-win-01:commands:processing",
+      "verification": "mt5:runner:runner-win-01:verification",
+      "verification_processing": "mt5:runner:runner-win-01:verification:processing"
     }
   },
   "contract": {
@@ -105,13 +119,13 @@ Response mau:
     "stop_bot": {
       "stop_policy": "end_task",
       "kill_worker": true,
-      "kill_mt5": true
+      "kill_mt5": false
     }
   }
 }
 ```
 
-Call khi runner start va call lai khi bot catalog/slot thay doi.
+Gọi khi runner khởi động và **gọi lại** khi catalog bot / slot thay đổi.
 
 `POST /api/v2/runner/register`
 
@@ -122,19 +136,38 @@ Call khi runner start va call lai khi bot catalog/slot thay doi.
   "host": "WIN-MT5-01",
   "status": "online",
   "supported_profiles": ["light", "normal", "heavy"],
-  "capability_tags": ["windows", "mt5", "redis_queue", "http_callback"],
+  "capability_tags": ["windows", "mt5", "redis_queue"],
   "capabilities": {
     "os": "windows",
-    "transport": "http_poll",
-    "supported_transports": ["http_poll", "redis_queue"],
+    "transport": "redis_queue",
+    "supported_transports": ["redis_queue"],
     "mt5_recovery": true,
     "runtime_login_required": true,
     "stop_policy": "end_task"
   },
-  "available_bots": ["gsalgo_mt5_bot"],
-  "available_bot_names": ["gsalgo_mt5_bot"],
-  "bot_catalog": {},
-  "max_slots": 1,
+  "available_bots": ["gsalgovip"],
+  "available_bot_names": ["gsalgovip"],
+  "bot_catalog": {
+    "source": "disk",
+    "bots": [
+      {
+        "bot_id": "gsalgovip",
+        "bot_code": "gsalgovip",
+        "bot_name": "GsAlgo VIP",
+        "version": "0.3.0",
+        "runtime_language": "python",
+        "entrypoint": "app.runner_impl:run",
+        "profile_class": "normal",
+        "strategy_tags": ["mt5", "xauusd", "signal", "tradingview_webhook"],
+        "resource_hints": {"runtime": "windows_mt5", "lane": "mt5_runner", "requires_mt5": true},
+        "risk_contract": {"requires_sl": true, "requires_tp": true, "max_orders": 20},
+        "config_schema": "config/schema.json",
+        "default_config_path": "config/default.json",
+        "checksum": "<sha256-from-runner.bot_catalog>"
+      }
+    ]
+  },
+  "max_slots": 10,
   "slots": [
     {
       "slot_id": "slot-01",
@@ -151,9 +184,9 @@ Call khi runner start va call lai khi bot catalog/slot thay doi.
 }
 ```
 
-### Heartbeat
+### Heartbeat (nhịp tim)
 
-Call moi 5-10 giay. Neu slot dang chay bot thi gui account/deployment hien tai.
+Gọi mỗi **5–10 giây**. Nếu slot đang chạy bot thì gửi `account_id` / `deployment_id` hiện tại.
 
 `POST /api/v2/runner/heartbeat`
 
@@ -169,18 +202,31 @@ Call moi 5-10 giay. Neu slot dang chay bot thi gui account/deployment hien tai.
     "terminal_pid": 1234,
     "worker_pid": 5678,
     "mt5_connected": true,
-    "available_bots": ["gsalgo_mt5_bot"]
+    "available_bots": ["gsalgovip"],
+    "available_bot_names": ["gsalgovip"],
+    "bot_catalog": {
+      "source": "disk",
+      "bots": [
+        {
+          "bot_id": "gsalgovip",
+          "bot_code": "gsalgovip",
+          "version": "0.3.0",
+          "entrypoint": "app.runner_impl:run",
+          "checksum": "<sha256-from-runner.bot_catalog>"
+        }
+      ]
+    }
   }
 }
 ```
 
-### Fetch deployment package
+### Tải gói deployment (package)
 
-Dung khi xu ly `START_BOT`.
+Dùng khi xử lý lệnh `START_BOT`.
 
 `GET /api/v2/runner/deployments/{deployment_id}/package`
 
-Response co dang:
+Ví dụ dạng response:
 
 ```json
 {
@@ -201,8 +247,8 @@ Response co dang:
   },
   "deployment": {
     "deployment_id": 9001,
-    "bot_code": "gsalgo_mt5_bot",
-    "bot_name": "gsalgo_mt5_bot",
+    "bot_code": "gsalgovip",
+    "bot_name": "gsalgovip",
     "status": "starting",
     "desired_state": "running",
     "runner_id": "runner-win-01",
@@ -210,9 +256,9 @@ Response co dang:
     "config": {}
   },
   "bot": {
-    "bot_id": "gsalgo_mt5_bot",
-    "bot_name": "gsalgo_mt5_bot",
-    "runtime_entry": "main.py",
+    "bot_id": "gsalgovip",
+    "bot_name": "gsalgovip",
+    "runtime_entry": "app.runner_impl:run",
     "profile_class": "normal",
     "resource_hints": {
       "runner_id": "runner-win-01",
@@ -223,13 +269,13 @@ Response co dang:
 }
 ```
 
-### Delivery status
+### Trạng thái giao lệnh (delivery)
 
-Call khi claim command va khi hoan tat. Neu dung `POST /runner/commands/claim`, backend da tu mark `dispatched`, runner khong can call `dispatched` lan nua.
+Gọi khi nhận lệnh từ Redis và khi hoàn tất (delivery + event nếu cần).
 
 `POST /api/v2/runner/commands/{command_id}/delivery`
 
-Allowed `delivery_status`: `queued`, `dispatched`, `acknowledged`, `failed`.
+Giá trị `delivery_status` được phép (theo tuple nghiệp vụ backend): `queued`, `dispatched`, `acknowledged`, `failed`.
 
 ```json
 {
@@ -238,86 +284,17 @@ Allowed `delivery_status`: `queued`, `dispatched`, `acknowledged`, `failed`.
   "delivery_status": "dispatched",
   "error_text": null,
   "payload": {
-    "phase": "claimed_by_windows_runner"
+    "phase": "dequeued_by_windows_runner"
   }
 }
 ```
 
-### HTTP claim command
-
-Dung endpoint nay neu Windows runner khong doc Redis truc tiep, hoac muon chi di qua HTTPS API.
-
-`POST /api/v2/runner/commands/claim`
-
-Request:
-
-```json
-{
-  "runner_id": "runner-win-01",
-  "slot_id": "slot-01",
-  "command_types": ["STOP_BOT", "START_BOT", "UPDATE_BOT_CONFIG"],
-  "wait_timeout_sec": 10
-}
-```
-
-Response khi co command:
-
-```json
-{
-  "empty": false,
-  "runner_id": "runner-win-01",
-  "slot_id": "slot-01",
-  "command_id": "cmd-id",
-  "delivery_status": "dispatched",
-  "delivery_transport": "http_poll",
-  "claim_lease_sec": 180,
-  "lease_expires_at_epoch": 1770000180,
-  "requeued_expired_claims": 0,
-  "next_poll_sec": 0,
-  "redis_cleanup": {"removed": 1},
-  "command": {
-    "command_id": "cmd-id",
-    "command_type": "START_BOT",
-    "cmd_type": "start_bot",
-    "requested_cmd_type": "start_bot",
-    "account_id": 101,
-    "profile_id": 101,
-    "deployment_id": 9001,
-    "bot_id": "gsalgo_mt5_bot",
-    "runner_id": "runner-win-01",
-    "slot_id": "slot-01",
-    "priority": 50,
-    "payload": {
-      "runtime_login_required": true,
-      "credential_check_policy": "login_before_start",
-      "mt5_recovery_policy": "recover_or_launch"
-    },
-    "created_at": "2026-05-05T00:00:00Z",
-    "trace_id": "trace-id"
-  }
-}
-```
-
-Response khi khong co command:
-
-```json
-{
-  "empty": true,
-  "command": null,
-  "runner_id": "runner-win-01",
-  "slot_id": "slot-01",
-  "delivery_transport": "http_poll",
-  "next_poll_sec": 1,
-  "claim_lease_sec": 180,
-  "requeued_expired_claims": 0
-}
-```
-
-### Emit event
+### Gửi sự kiện (emit event)
 
 `POST /api/v2/runner/events`
 
-Event types quan trong:
+Các `event_type` quan trọng:
+
 - `BOT_STARTED`
 - `BOT_STOPPED`
 - `COMMAND_REJECTED`
@@ -326,7 +303,7 @@ Event types quan trong:
 - `SLOT_DEGRADED`
 - `SLOT_BROKEN`
 
-Start thanh cong:
+**Khởi động thành công:**
 
 ```json
 {
@@ -334,7 +311,7 @@ Start thanh cong:
   "event_type": "BOT_STARTED",
   "account_id": 101,
   "deployment_id": 9001,
-  "bot_id": "gsalgo_mt5_bot",
+  "bot_id": "gsalgovip",
   "runner_id": "runner-win-01",
   "slot_id": "slot-01",
   "severity": "info",
@@ -348,7 +325,7 @@ Start thanh cong:
 }
 ```
 
-Start that bai vi credential:
+**Khởi động thất bại do thông tin đăng nhập:**
 
 ```json
 {
@@ -356,7 +333,7 @@ Start that bai vi credential:
   "event_type": "COMMAND_REJECTED",
   "account_id": 101,
   "deployment_id": 9001,
-  "bot_id": "gsalgo_mt5_bot",
+  "bot_id": "gsalgovip",
   "runner_id": "runner-win-01",
   "slot_id": "slot-01",
   "severity": "error",
@@ -370,13 +347,14 @@ Start that bai vi credential:
 }
 ```
 
-Dung cac `error_code` nay de backend nhan dien sai account/password/server:
+Dùng các `error_code` sau để backend nhận diện sai tài khoản / mật khẩu / server:
+
 - `INVALID_CREDENTIALS`
 - `INVALID_PASSWORD`
 - `INVALID_SERVER`
 - `ACCOUNT_NOT_FOUND`
 
-Stop thanh cong:
+**Dừng thành công:**
 
 ```json
 {
@@ -384,7 +362,7 @@ Stop thanh cong:
   "event_type": "BOT_STOPPED",
   "account_id": 101,
   "deployment_id": 9001,
-  "bot_id": "gsalgo_mt5_bot",
+  "bot_id": "gsalgovip",
   "runner_id": "runner-win-01",
   "slot_id": "slot-01",
   "severity": "info",
@@ -398,33 +376,24 @@ Stop thanh cong:
 }
 ```
 
-## Transport claim/ack rules
+---
 
-### HTTP poll mode
+## Quy tắc dequeue / xác nhận Redis
 
-1. Loop call `POST /api/v2/runner/commands/claim` voi `wait_timeout_sec` 5-10.
-2. Neu `empty=true`, tiep tuc heartbeat va poll lai.
-3. Neu co `command`, xu ly command do.
-4. Khi command thanh cong, emit event domain (`BOT_STARTED`, `BOT_STOPPED`, ...) roi call delivery `acknowledged`.
-5. Khi command loi product/credential, emit `COMMAND_REJECTED` roi call delivery `failed`.
-6. Neu loi tam thoi va muon retry, call delivery `queued` de command quay lai hang doi HTTP claim.
-7. Phai hoan tat truoc `lease_expires_at_epoch`; neu runner chet/qua han, backend se tu requeue command cho lan claim sau.
-8. Command phai idempotent theo `command_id`.
+1. Khi runner khởi động, **khôi phục** lệnh đang xử lý (inflight):
+   - Chuyển toàn bộ phần tử từ `verification:processing` về `verification`
+   - Chuyển toàn bộ phần tử từ `commands:processing` về `commands`
+2. Dequeue bằng `BRPOPLPUSH source processing timeout`.
+3. Sau khi pop lệnh từ queue, gọi delivery với trạng thái `dispatched`.
+4. Xử lý xong và callback backend thành công thì `LREM processing 1 raw`.
+5. Nếu lỗi tạm thời thì **requeue**: `LREM processing 1 raw`, sau đó `RPUSH source raw`.
+6. Lệnh phải **idempotent** theo `command_id`: nếu đã xử lý thành công rồi thì chỉ emit lại event/delivery khi cần, **không** khởi động trùng MT5/bot.
 
-### Redis queue mode
+---
 
-1. Khi runner start, recover inflight:
-   - move het item tu `verification:processing` ve `verification`
-   - move het item tu `commands:processing` ve `commands`
-2. Claim bang `BRPOPLPUSH source processing timeout`.
-3. Sau khi claim command, call delivery `dispatched`.
-4. Xu ly xong va callback backend thanh cong thi `LREM processing 1 raw`.
-5. Neu loi tam thoi thi requeue: `LREM processing 1 raw`, sau do `RPUSH source raw`.
-6. Command phai idempotent theo `command_id`: neu da xu ly thanh cong roi thi chi emit lai event/delivery neu can, khong start duplicate MT5/bot.
+## Schema một phần tử lệnh trong Redis
 
-## Command schema
-
-Item trong `mt5:runner:{runner_id}:commands` hoac response `command` cua HTTP claim la JSON:
+Phần tử trong `mt5:runner:{runner_id}:commands` là JSON:
 
 ```json
 {
@@ -435,7 +404,7 @@ Item trong `mt5:runner:{runner_id}:commands` hoac response `command` cua HTTP cl
   "account_id": 101,
   "profile_id": 101,
   "deployment_id": 9001,
-  "bot_id": "gsalgo_mt5_bot",
+  "bot_id": "gsalgovip",
   "runner_id": "runner-win-01",
   "slot_id": "slot-01",
   "priority": 50,
@@ -457,90 +426,101 @@ Item trong `mt5:runner:{runner_id}:commands` hoac response `command` cua HTTP cl
 }
 ```
 
-## START_BOT behavior bat buoc
+---
 
-Khi gap `command_type = START_BOT`:
+## Hành vi bắt buộc với `START_BOT`
 
-1. Validate command target:
-   - `runner_id` phai bang env `RUNNER_ID`
-   - `slot_id` phai la slot local co san
-2. Call delivery `dispatched`.
-3. Fetch package: `GET /api/v2/runner/deployments/{deployment_id}/package`.
-4. Lay account:
-   - `server`
-   - `login`
-   - `password`
-5. Neu payload co:
+Khi gặp `command_type = START_BOT`:
+
+1. **Kiểm tra** mục tiêu lệnh:
+   - `runner_id` phải bằng biến môi trường `RUNNER_ID`
+   - `slot_id` phải là slot cục bộ đang có
+2. Gọi delivery `dispatched`.
+3. Tải package: `GET /api/v2/runner/deployments/{deployment_id}/package`.
+4. Lấy thông tin tài khoản: `server`, `login`, `password`.
+5. Nếu payload có:
    - `runtime_login_required=true`
    - `credential_check_policy=login_before_start`
    - `mt5_recovery_policy=recover_or_launch`
 
-   thi runner phai:
-   - recover hoac launch MT5 neu chua chay
-   - login MT5 bang account trong package
-   - verify account login/server match
-   - chi start bot sau khi login OK
-6. Neu login fail:
-   - emit `COMMAND_REJECTED`
-   - payload co `reason`, `error_code`, `phase=mt5_login`
-   - delivery `failed`
-   - ack Redis item
-   - khong start bot
-7. Neu login OK:
-   - start worker/bot process cho deployment
-   - emit `BOT_STARTED`
-   - delivery `acknowledged`
-   - ack Redis item
+   thì runner phải:
 
-Backend se mark account `connected` khi nhan `BOT_STARTED`.
+   - Khôi phục hoặc khởi chạy MT5 nếu chưa chạy
+   - Đăng nhập MT5 bằng tài khoản trong package
+   - Xác minh server / tài khoản khớp
+   - **Chỉ** start bot sau khi đăng nhập **thành công**
 
-## STOP_BOT behavior bat buoc
+6. Nếu đăng nhập **thất bại**:
+   - Emit `COMMAND_REJECTED`
+   - Payload có `reason`, `error_code`, `phase=mt5_login`
+   - Delivery `failed`
+   - Ack phần tử Redis
+   - **Không** start bot
 
-Khi gap `command_type = STOP_BOT`, payload backend da set:
+7. Nếu đăng nhập **thành công**:
+   - Start process worker/bot cho deployment
+   - Emit `BOT_STARTED`
+   - Delivery `acknowledged`
+   - Ack phần tử Redis
+
+Backend sẽ đánh dấu tài khoản `connected` khi nhận `BOT_STARTED`.
+
+---
+
+## Hành vi bắt buộc với `STOP_BOT`
+
+Khi gặp `command_type = STOP_BOT`, payload từ backend có thể tương tự:
 
 ```json
 {
   "stop_policy": "end_task",
   "end_task": true,
   "kill_worker": true,
-  "kill_mt5": true,
-  "terminate_mt5": true,
+  "kill_mt5": false,
+  "terminate_mt5": false,
   "release_terminal": true
 }
 ```
 
-Runner phai:
-1. Call delivery `dispatched`.
-2. Stop bot process neu con song.
-3. Kill worker process cua deployment.
-4. Kill MT5 terminal cua slot neu `kill_mt5=true` hoac `terminate_mt5=true`.
-5. Release local slot state ve `ready`.
+Runner phải:
+
+1. Gọi delivery `dispatched`.
+2. Dừng process bot nếu còn sống.
+3. Kill process worker của deployment.
+4. Không kill terminal MT5 mặc định; chỉ kill nếu payload chủ động gửi `kill_mt5=true` hoặc `terminate_mt5=true`.
+5. Đưa trạng thái slot cục bộ về `ready`.
 6. Emit `BOT_STOPPED`.
-7. Call delivery `acknowledged`.
-8. Ack Redis item.
+7. Gọi delivery `acknowledged`.
+8. Ack phần tử Redis.
 
-Stop phai idempotent: neu process da chet thi van emit `BOT_STOPPED` va acknowledged.
+Thao tác dừng phải **idempotent**: nếu process đã chết vẫn emit `BOT_STOPPED` và `acknowledged`.
 
-## UPDATE_BOT_CONFIG behavior
+---
 
-Neu runner support update nong config:
-1. Apply config vao bot dang chay.
-2. Emit `RUNTIME_LOG` hoac event domain neu co.
+## Hành vi `UPDATE_BOT_CONFIG`
+
+Nếu runner hỗ trợ cập nhật cấu hình nóng:
+
+1. Áp dụng config vào bot đang chạy.
+2. Emit `RUNTIME_LOG` hoặc event domain nếu có quy ước.
 3. Delivery `acknowledged`.
 
-Neu khong support:
-1. Emit `COMMAND_REJECTED` voi:
+Nếu **không** hỗ trợ:
+
+1. Emit `COMMAND_REJECTED` với:
    - `reason=unsupported_command`
    - `phase=update_bot_config`
 2. Delivery `failed`.
 
-Backend co fallback restart neu hot-update bi reject/timeout.
+Backend có thể fallback restart nếu hot-update bị từ chối / timeout.
 
-## Verification queue behavior
+---
 
-Queue `mt5:runner:{runner_id}:verification` la legacy/standalone verification. Van implement de tuong thich.
+## Hàng đợi xác minh (verification)
 
-Item:
+Queue `mt5:runner:{runner_id}:verification` là luồng xác minh legacy / độc lập. Vẫn nên implement để **tương thích**.
+
+Một job mẫu:
 
 ```json
 {
@@ -553,14 +533,15 @@ Item:
 }
 ```
 
-Flow:
-1. Claim verification.
-2. Fetch account bundle: `GET /api/v2/runner/accounts/{account_id}/bundle`.
-3. Launch/recover MT5.
-4. Login and verify account/server.
-5. Submit result:
+Luồng:
 
-`POST /api/v2/runner/account-verifications/result`
+1. Dequeue job từ Redis (`mt5:runner:{runner_id}:verification` → `:processing` giống lệnh bot).
+2. Tải bundle tài khoản: `GET /api/v2/runner/accounts/{account_id}/bundle`.
+3. Launch / recover MT5.
+4. Đăng nhập và xác minh server / tài khoản.
+5. Gửi kết quả: `POST /api/v2/runner/account-verifications/result`
+
+**Thành công:**
 
 ```json
 {
@@ -576,7 +557,7 @@ Flow:
 }
 ```
 
-Fail credential:
+**Thất bại thông tin đăng nhập:**
 
 ```json
 {
@@ -593,9 +574,11 @@ Fail credential:
 }
 ```
 
-## Local process model
+---
 
-Moi slot nen co state rieng:
+## Mô hình process cục bộ
+
+Mỗi slot nên có state riêng:
 
 ```json
 {
@@ -610,43 +593,51 @@ Moi slot nen co state rieng:
 }
 ```
 
-Can luu state local vao file JSON trong `RUNNER_WORK_DIR` de restart runner co the recover/kill process cu.
+Nên lưu state cục bộ ra file JSON trong `RUNNER_WORK_DIR` để khi **restart** runner có thể recover / kill process cũ.
 
-## MT5 login rules
+---
 
-Implement ham `ensure_mt5_logged_in(account, terminal_path, slot)`:
-1. Neu terminal stale/duplicate thi kill dung process cua slot.
-2. Launch terminal neu chua chay.
-3. Goi `MetaTrader5.initialize(path=terminal_path)`.
-4. Goi `MetaTrader5.login(login=int(account["login"]), password=..., server=...)`.
-5. Check `account_info()`:
-   - account_info.login match
-   - server/account connected
-6. Return OK hoac error code ro rang.
+## Quy tắc đăng nhập MT5
 
-Khong start bot khi login fail.
+Implement hàm `ensure_mt5_logged_in(account, terminal_path, slot)`:
 
-## Required error mapping
+1. Nếu terminal bị treo / trùng thì kill đúng process của slot.
+2. Khởi chạy terminal nếu chưa chạy.
+3. Gọi `MetaTrader5.initialize(path=terminal_path)`.
+4. Gọi `MetaTrader5.login(login=int(account["login"]), password=..., server=...)`.
+5. Kiểm tra `account_info()`:
+   - `account_info.login` khớp
+   - server / tài khoản đã kết nối
+6. Trả về OK hoặc mã lỗi rõ ràng.
 
-Map loi MT5 sang backend payload:
+**Không** start bot khi đăng nhập thất bại.
 
-- Sai password/login: `reason=invalid_credentials`, `error_code=INVALID_CREDENTIALS`
+---
+
+## Ánh xạ lỗi bắt buộc
+
+Ánh xạ lỗi MT5 sang payload backend:
+
+- Sai mật khẩu / đăng nhập: `reason=invalid_credentials`, `error_code=INVALID_CREDENTIALS`
 - Sai server: `reason=invalid_server`, `error_code=INVALID_SERVER`
-- Account khong ton tai: `reason=account_not_found`, `error_code=ACCOUNT_NOT_FOUND`
-- Terminal khong launch duoc: `reason=mt5_launch_failed`
-- MT5 initialize fail: `reason=mt5_initialize_failed`
-- Bot worker fail: `reason=bot_worker_start_failed`
-- Slot dang loi: `reason=slot_bootstrap_failed:fatal_<detail>`
+- Không tìm thấy tài khoản: `reason=account_not_found`, `error_code=ACCOUNT_NOT_FOUND`
+- Không launch được terminal: `reason=mt5_launch_failed`
+- `MetaTrader5.initialize` thất bại: `reason=mt5_initialize_failed`
+- Worker bot không start: `reason=bot_worker_start_failed`
+- Slot lỗi bootstrap: `reason=slot_bootstrap_failed:fatal_<detail>`
 
-Credential error phai dung code o tren de backend mark account `verification_failed`.
+Lỗi credential **phải** dùng đúng các mã trên để backend đánh dấu tài khoản `verification_failed`.
 
-## Done criteria
+---
 
-Runner duoc xem la dung khi:
-1. Start runner -> backend thay runner online va heartbeat.
-2. Mini App connect account + start bot -> backend day `START_BOT`.
-3. Windows runner doc queue, fetch package, login MT5.
-4. Sai credential -> backend nhan `COMMAND_REJECTED`, account thanh `verification_failed`.
-5. Dung credential -> runner start bot, backend nhan `BOT_STARTED`, account thanh `connected`, deployment `running`.
-6. User stop bot -> runner kill worker + MT5, backend nhan `BOT_STOPPED`, deployment `stopped`.
-7. Restart Windows runner khong lam duplicate bot; processing queue duoc recover.
+## Tiêu chí hoàn thành (done)
+
+Runner được coi là **đúng hợp đồng** khi:
+
+1. Khởi động runner → backend thấy runner **online** và có **heartbeat**.
+2. Mini App kết nối tài khoản + start bot → backend đẩy lệnh `START_BOT`.
+3. Windows runner đọc queue, tải package, đăng nhập MT5.
+4. Sai credential → backend nhận `COMMAND_REJECTED`, tài khoản thành `verification_failed`.
+5. Đúng credential → runner start bot, backend nhận `BOT_STARTED`, tài khoản `connected`, deployment `running`.
+6. User stop bot → runner dừng worker/bot, giữ MT5 terminal mặc định, backend nhận `BOT_STOPPED`, deployment `stopped`.
+7. Restart Windows runner **không** tạo bot trùng; queue `processing` được khôi phục đúng.

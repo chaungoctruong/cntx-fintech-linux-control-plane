@@ -1,9 +1,17 @@
-# User Webhooks SQL
+# `user_webhooks/` — SQL webhook user
 
-## Nhiệm vụ
-- Chứa SQL CRUD webhook của user và truy vấn danh sách cho worker delivery.
-- Hỗ trợ list có/không có secret phục vụ các use-case khác nhau.
+CRUD webhook URL user dùng cho **delivery** worker (HTTP callback ra ngoài).
+
+## File `.sql` (inventory)
+
+- `insert_user_webhook.sql` / `delete_user_webhook.sql`
+- `list_user_webhooks.sql` / `list_user_webhooks_with_secret.sql`
+
+## Gắn với Python
+
+- **`app/repositories/control_plane/mixins/`** + `webhook_delivery_service` — tìm `load_sql("user_webhooks/`.
 
 ## Lưu ý an toàn
-- Secret chỉ trả về khi dùng query có chủ đích (`with_secret`).
-- Giữ ràng buộc `user_id` trong mọi thao tác để tránh truy cập chéo tenant.
+
+- Chỉ query `with_secret` khi thật sự cần secret (rotate/debug có kiểm soát).
+- Mọi thao tác phải có `user_id` để chống cross-tenant.

@@ -1,50 +1,38 @@
-# CNTx AI Training Pipeline
+# AI training pipeline — `ops/ai/training/`
 
-This pipeline keeps online knowledge updates separate from model training.
+Tách **cập nhật tri thức online** khỏi **huấn luyện model** (LoRA). Backend ghi ví dụ / export / đánh giá; **train trên GPU** chạy máy riêng, không chạy trong process API production.
 
-## Flow
+## Luồng (chuẩn)
 
-1. Chat answers are captured as pending examples in PostgreSQL when they pass safety filters.
-2. An operator reviews pending examples and marks only correct answers as approved.
-3. Approved examples are exported as OpenAI-chat JSONL.
-4. The exported dataset is evaluated for basic safety, leaks, duplicates, and format errors.
-5. A LoRA training job package is generated for an external AI/GPU machine.
-6. The trained adapter is registered as a candidate model version before any promotion.
+1. Chat an toàn → ví dụ pending trong Postgres.
+2. Ops review → approve chất lượng.
+3. Export JSONL (OpenAI chat format).
+4. Evaluate (safety, leak, duplicate, format).
+5. `build_lora_training_job.py` → gói job.
+6. Chạy `llamafactory-cli train ...` trên máy train.
+7. `register_ai_model_version.py` → đăng ký bản candidate trước khi promote.
 
-## Commands
+## Lệnh mẫu (cwd: **root monorepo** `linux-root-backend-hubot-v1/`)
 
-List pending examples:
+> Đường dẫn Python: `backend_ai/backend/scripts/...`
 
 ```bash
 python backend_ai/backend/scripts/review_ai_training_examples.py --ids 1 --status approved --quality-score 0.9 --reviewer-id ops
-```
-
-Export approved examples:
-
-```bash
 python backend_ai/backend/scripts/export_ai_training_dataset.py --min-quality 0.8
-```
-
-Evaluate an export:
-
-```bash
-python backend_ai/backend/scripts/evaluate_ai_training_dataset.py --dataset ops/ai/training_exports/example.jsonl --record
-```
-
-Build a LoRA job package:
-
-```bash
+python backend_ai/backend/scripts/evaluate_ai_training_dataset.py \
+  --dataset backend_ai/backend/ops/ai/training_exports/example.jsonl --record
 python backend_ai/backend/scripts/build_lora_training_job.py \
-  --dataset ops/ai/training_exports/example.jsonl \
+  --dataset backend_ai/backend/ops/ai/training_exports/example.jsonl \
   --model-key cntx-qwen-lora-001 \
   --base-model Qwen/Qwen2.5-7B-Instruct \
   --register
 ```
 
-Run the generated `llamafactory-cli train ...` command on a dedicated training machine.
+## Quy tắc
 
-## Runtime Rule
+- **Không** train model trong tiến trình control-plane Linux.
+- Export chứa PII → xử lý theo policy nội bộ; không commit dataset vào git.
 
-Do not train models inside the Linux control-plane process. The backend records data,
-exports datasets, tracks candidate adapters, and continues using PostgreSQL RAG for
-hourly knowledge refresh.
+## Đào tạo
+
+- Đọc thêm [scripts/README.md](../../scripts/README.md) (nhóm AI) và [ai_knowledge/README.md](../../ai_knowledge/README.md).

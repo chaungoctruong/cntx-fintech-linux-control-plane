@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 from functools import lru_cache
+import secrets
 import time
 import uuid
 from datetime import datetime, timezone
@@ -19,7 +20,6 @@ from app.bot_catalog.mt5_repository_loader import (
     is_disabled_mt5_bot_catalog_entry,
 )
 from app.events.runner_event_ingest import RunnerEventIngestService
-from app.infra.redis_streams import RedisStreamPublisher
 from app.models.control_plane import ACTIVE_DEPLOYMENT_STATUSES, CommandType
 from app.monitoring.control_plane_metrics import ControlPlaneMetricsService
 from app.monitoring.control_plane_reconciler import ControlPlaneReconcilerService
@@ -41,14 +41,13 @@ from app.orchestration.deployment_manager import DeploymentManagerService, _inje
 from app.orchestration.runner_payload_identity import normalize_runner_payload_identity
 from app.orchestration.scheduler import preview_slots_for_account
 from app.repositories.control_plane_repository import ControlPlaneRepository
-from app.runner.protocol import build_runner_command_from_row
 from app.risk.account_risk_policy_service import AccountRiskPolicyService
 from app.risk.quota_policy import (
     describe_quota,
     validate_can_connect_new_account,
     validate_can_start_new_deployment,
 )
-from app.risk.orchestration_policy import OrchestrationPolicyError
+from app.risk.orchestration_policy import OrchestrationPolicyError, validate_runtime_command_request
 from app.security import CryptoBox
 from app.services.runner_gsalgo_state import GsAlgoBackendStateService
 from app.services.store_service import get_process_store
@@ -88,6 +87,187 @@ def _bot_control_cooldown_sec() -> int:
 
 def _norm_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+_BOT_EXECUTION_CONTRACT_TEXT_KEYS = (
+    "bot_type",
+    "execution_owner",
+    "windows_role",
+    "tradingview_webhook_owner",
+)
+_BOT_EXECUTION_CONTRACT_BOOL_KEYS = ("requires_executor_slot",)
+
+
+def _contract_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return _norm_text(value).lower() in {"1", "true", "yes", "on"}
+
+
+def _iter_bot_contract_sources(*sources: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        out.append(source)
+        for nested_key in ("execution_contract", "manifest_contract", "bot_contract"):
+            nested = source.get(nested_key)
+            if isinstance(nested, dict):
+                out.append(nested)
+        metadata = source.get("metadata") or source.get("metadata_json")
+        if isinstance(metadata, dict):
+            out.extend(_iter_bot_contract_sources(metadata))
+    return out
+
+
+def _bot_execution_contract(*sources: Any) -> dict[str, Any]:
+    contract: dict[str, Any] = {}
+    for source in _iter_bot_contract_sources(*sources):
+        for key in _BOT_EXECUTION_CONTRACT_TEXT_KEYS:
+            value = _norm_text(source.get(key))
+            if value and key not in contract:
+                contract[key] = value
+        for key in _BOT_EXECUTION_CONTRACT_BOOL_KEYS:
+            if key in source and key not in contract:
+                contract[key] = _contract_bool(source.get(key))
+    return contract
+
+
+def _merge_bot_execution_contract(target: dict[str, Any], contract: dict[str, Any]) -> dict[str, Any]:
+    for key, value in contract.items():
+        if value is not None:
+            target[key] = value
+    return target
+
+
+def _is_non_empty_catalog_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def _merge_missing_catalog_values(base: Any, incoming: Any) -> Any:
+    if isinstance(base, dict) and isinstance(incoming, dict):
+        merged = dict(base)
+        for key, value in incoming.items():
+            if key not in merged or not _is_non_empty_catalog_value(merged.get(key)):
+                if _is_non_empty_catalog_value(value):
+                    merged[key] = copy.deepcopy(value)
+            elif isinstance(merged.get(key), dict) and isinstance(value, dict):
+                merged[key] = _merge_missing_catalog_values(merged[key], value)
+        return merged
+    if _is_non_empty_catalog_value(base):
+        return copy.deepcopy(base)
+    return copy.deepcopy(incoming)
+
+
+def _catalog_metadata_inner(row: dict[str, Any]) -> dict[str, Any]:
+    metadata_json = row.get("metadata_json") if isinstance(row.get("metadata_json"), dict) else {}
+    inner = metadata_json.get("metadata") if isinstance(metadata_json.get("metadata"), dict) else {}
+    if inner:
+        return dict(inner)
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    return dict(metadata)
+
+
+def _catalog_entry_is_linux_authoritative(row: dict[str, Any] | None) -> bool:
+    if not row:
+        return False
+    source_path = _norm_text(row.get("source_path"))
+    metadata = _catalog_metadata_inner(row)
+    origin = _norm_text(metadata.get("catalog_origin") or row.get("catalog_origin")).lower()
+    if origin == "runner" or source_path.startswith("runner://"):
+        return False
+    return bool(source_path)
+
+
+def _merge_runner_availability(existing: list[Any], availability: dict[str, Any]) -> list[dict[str, Any]]:
+    runner_id = _norm_text(availability.get("runner_id"))
+    out: list[dict[str, Any]] = []
+    replaced = False
+    for item in existing if isinstance(existing, list) else []:
+        if not isinstance(item, dict):
+            continue
+        current = dict(item)
+        if runner_id and _norm_text(current.get("runner_id")) == runner_id:
+            current.update({key: value for key, value in availability.items() if _is_non_empty_catalog_value(value)})
+            replaced = True
+        out.append(current)
+    if runner_id and not replaced:
+        out.append({key: value for key, value in availability.items() if _is_non_empty_catalog_value(value)})
+    return out
+
+
+def _preserve_authoritative_catalog_definition(
+    *,
+    existing: dict[str, Any],
+    runner_definition: dict[str, Any],
+    runner_id: str,
+    source: str,
+) -> dict[str, Any]:
+    metadata = _catalog_metadata_inner(existing)
+    availability = {
+        "runner_id": runner_id,
+        "status": "available",
+        "version": runner_definition.get("version"),
+        "source": source,
+        "source_path": runner_definition.get("source_path"),
+    }
+    metadata["runner_availability"] = _merge_runner_availability(
+        metadata.get("runner_availability") if isinstance(metadata.get("runner_availability"), list) else [],
+        availability,
+    )
+    metadata.setdefault("catalog_origin", "linux_manifest")
+    metadata["last_runner_catalog_source"] = source
+    metadata["last_runner_catalog_package_dir"] = (
+        (runner_definition.get("resource_hints") or {}).get("package_dir")
+        if isinstance(runner_definition.get("resource_hints"), dict)
+        else None
+    )
+
+    resource_hints = _merge_missing_catalog_values(
+        dict(existing.get("resource_hints") or {}),
+        dict(runner_definition.get("resource_hints") or {}),
+    )
+    runtime_env = _merge_missing_catalog_values(
+        dict(existing.get("runtime_env") or {}),
+        dict(runner_definition.get("runtime_env") or {}),
+    )
+    risk_profile = _merge_missing_catalog_values(
+        dict(existing.get("risk_profile") or {}),
+        dict(runner_definition.get("risk_profile") or {}),
+    )
+
+    preserved = {
+        "bot_id": existing.get("bot_code") or runner_definition.get("bot_id"),
+        "bot_code": existing.get("bot_code") or runner_definition.get("bot_code"),
+        "bot_name": existing.get("bot_name") or runner_definition.get("bot_name"),
+        "display_name": existing.get("display_name") or runner_definition.get("display_name"),
+        "language": existing.get("language") or runner_definition.get("language"),
+        "version": existing.get("version") or runner_definition.get("version"),
+        "runtime_entry": existing.get("runtime_entry") or runner_definition.get("runtime_entry"),
+        "profile_class": existing.get("profile_class") or runner_definition.get("profile_class"),
+        "strategy_tags": list(existing.get("strategy_tags") or runner_definition.get("strategy_tags") or []),
+        "required_params": list(existing.get("required_params") or runner_definition.get("required_params") or []),
+        "risk_profile": risk_profile,
+        "resource_hints": resource_hints,
+        "indicator_requirements": list(existing.get("indicator_requirements") or runner_definition.get("indicator_requirements") or []),
+        "supports_demo": bool(existing.get("supports_demo", runner_definition.get("supports_demo", True))),
+        "supports_live": bool(existing.get("supports_live", runner_definition.get("supports_live", True))),
+        "default_config_path": existing.get("default_config_path") or runner_definition.get("default_config_path"),
+        "runtime_env": runtime_env,
+        "checksum": existing.get("checksum") or runner_definition.get("checksum"),
+        "source_path": existing.get("source_path") or runner_definition.get("source_path"),
+        "metadata": metadata,
+    }
+    preserved.update(_bot_execution_contract(preserved, resource_hints, runtime_env, risk_profile, metadata))
+    return preserved
 
 
 def _merge_deployment_config_update(current_config: Any, requested_config: Any) -> dict[str, Any]:
@@ -308,10 +488,23 @@ def _is_backend_ctrader_reserved_bot(bot: Optional[dict[str, Any]]) -> bool:
     if not bot:
         return False
     source_path = _norm_text(bot.get("source_path")).replace("\\", "/").lower()
-    if not source_path:
-        return False
     parts = [part for part in source_path.split("/") if part]
-    return "bot-trading" in parts
+    if "backend-ctrader" in parts or "backend_ctrader" in parts:
+        return True
+
+    # `bot-trading/` is now the normal Linux bot package registry. Do not hide
+    # MT5 catalog packages such as gsalgovip just because they live there.
+    for container_key in ("resource_hints", "runtime_env", "metadata_json"):
+        container = bot.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        bot_type = _norm_text(container.get("bot_type")).lower()
+        lane = _norm_text(container.get("lane") or container.get("runtime")).lower()
+        if bot_type in {"backend_ctrader", "backend_ctrader_signal", "ctrader_backend"}:
+            return True
+        if lane in {"backend_ctrader", "ctrader_backend"}:
+            return True
+    return False
 
 
 def _as_string_list(value: Any) -> list[str]:
@@ -468,6 +661,10 @@ def _runner_bot_definition(*, runner_id: str, source: str, raw: dict[str, Any]) 
     language = _norm_text(raw.get("runtime_language") or raw.get("language") or "python")
     raw_runtime_env = raw.get("runtime_env") if isinstance(raw.get("runtime_env"), dict) else {}
     raw_resource_hints = raw.get("resource_hints") if isinstance(raw.get("resource_hints"), dict) else {}
+    raw_risk_contract = raw.get("risk_contract") if isinstance(raw.get("risk_contract"), dict) else {}
+    raw_legacy_entrypoints = raw.get("legacy_entrypoints") if isinstance(raw.get("legacy_entrypoints"), dict) else {}
+    raw_metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    execution_contract = _bot_execution_contract(raw, raw_runtime_env, raw_resource_hints, raw_metadata)
     runtime_entry = _norm_text(
         raw.get("entrypoint")
         or raw.get("runtime_entry")
@@ -483,28 +680,79 @@ def _runner_bot_definition(*, runner_id: str, source: str, raw: dict[str, Any]) 
     checksum_seed = "|".join([runner_id, bot_code, version, runtime_entry, config_path or "", package_dir])
     checksum = _norm_text(raw.get("checksum")) or hashlib.sha1(checksum_seed.encode("utf-8")).hexdigest()
     source_path = f"runner://{runner_id}/{package_dir or bot_code}"
-    runtime_env = {
-        "runtime": "windows_mt5",
-        "lane": "mt5_runner",
-        "broker_type": "mt5",
-        "source": source,
-        "runner_id": runner_id,
-        "package_dir": package_dir,
-    }
+    runtime_env = dict(raw_runtime_env)
+    runtime_env.update(
+        {
+            "runtime": "windows_mt5",
+            "lane": "mt5_runner",
+            "broker_type": "mt5",
+            "source": source,
+            "runner_id": runner_id,
+            "package_dir": package_dir,
+        }
+    )
     if runtime_entry:
         runtime_env["entrypoint"] = runtime_entry
+    if raw_legacy_entrypoints:
+        runtime_env["legacy_entrypoints"] = dict(raw_legacy_entrypoints)
     for schema_key in ("config_schema", "deployment_config_schema", "trading"):
         schema_payload = raw.get(schema_key)
         if isinstance(schema_payload, dict):
             runtime_env[schema_key] = dict(schema_payload)
-    resource_hints = {
-        "profile_class": profile_class,
-        "runtime": "windows_mt5",
-        "lane": "mt5_runner",
-        "runner_id": runner_id,
-        "package_dir": package_dir,
-    }
-    return {
+        elif schema_payload is not None:
+            runtime_env[f"{schema_key}_path"] = _norm_text(schema_payload)
+    if raw.get("platform_contract") is not None:
+        runtime_env["platform_contract"] = raw.get("platform_contract")
+    _merge_bot_execution_contract(runtime_env, execution_contract)
+
+    resource_hints = dict(raw_resource_hints)
+    resource_hints.setdefault("profile_class", profile_class)
+    resource_hints.setdefault("runtime", "windows_mt5")
+    resource_hints.setdefault("lane", "mt5_runner")
+    resource_hints["runner_id"] = runner_id
+    resource_hints["package_dir"] = package_dir
+    _merge_bot_execution_contract(resource_hints, execution_contract)
+
+    risk_profile = dict(raw.get("risk_profile") or {})
+    if not risk_profile and raw_risk_contract:
+        risk_profile = {
+            "class": "elevated" if profile_class == "heavy" else "standard",
+            "strategy_tags": strategy_tags,
+            "risk_contract": dict(raw_risk_contract),
+        }
+        for key in (
+            "requires_sl",
+            "requires_tp",
+            "max_orders",
+            "max_basket",
+            "max_order_per_minute",
+            "max_modify_per_minute",
+            "default_volume_min",
+            "default_volume_max",
+            "trading_disabled_by_default",
+            "dry_run_by_default",
+        ):
+            if key in raw_risk_contract:
+                risk_profile[key] = raw_risk_contract.get(key)
+
+    metadata = dict(raw_metadata)
+    metadata.update(
+        {
+            "catalog_origin": "runner",
+            "catalog_source": source,
+            "runner_id": runner_id,
+            "runner_availability": [{"runner_id": runner_id, "status": "available"}],
+            "package_dir": package_dir,
+        }
+    )
+    if raw_risk_contract:
+        metadata["risk_contract"] = dict(raw_risk_contract)
+    if raw_legacy_entrypoints:
+        metadata["legacy_entrypoints"] = dict(raw_legacy_entrypoints)
+    if execution_contract:
+        metadata["execution_contract"] = dict(execution_contract)
+
+    definition = {
         "bot_id": bot_code,
         "bot_code": bot_code,
         "bot_name": bot_name,
@@ -515,7 +763,7 @@ def _runner_bot_definition(*, runner_id: str, source: str, raw: dict[str, Any]) 
         "profile_class": profile_class,
         "strategy_tags": strategy_tags,
         "required_params": list(raw.get("required_params") or []),
-        "risk_profile": dict(raw.get("risk_profile") or {"class": "standard", "strategy_tags": strategy_tags}),
+        "risk_profile": risk_profile or {"class": "standard", "strategy_tags": strategy_tags},
         "resource_hints": resource_hints,
         "indicator_requirements": list(raw.get("indicator_requirements") or []),
         "supports_demo": bool(raw.get("supports_demo", True)),
@@ -524,14 +772,10 @@ def _runner_bot_definition(*, runner_id: str, source: str, raw: dict[str, Any]) 
         "runtime_env": runtime_env,
         "checksum": checksum,
         "source_path": source_path,
-        "metadata": {
-            "catalog_origin": "runner",
-            "catalog_source": source,
-            "runner_id": runner_id,
-            "runner_availability": [{"runner_id": runner_id, "status": "available"}],
-            "package_dir": package_dir,
-        },
+        "metadata": metadata,
     }
+    definition.update(execution_contract)
+    return definition
 
 
 def _mini_bot_item(bot: dict[str, Any]) -> dict[str, Any]:
@@ -866,53 +1110,62 @@ class MT5ControlPlaneService:
 
     async def request_account_verification(self, *, telegram_id: str, username: Optional[str], account_id: int) -> dict[str, Any]:
         user = self.ensure_user(telegram_id=telegram_id, username=username)
-        account = self._repo.get_account(account_id=account_id, user_id=int(user["id"]))
+        user_id = int(user["id"])
+        account = self._repo.get_account(account_id=account_id, user_id=user_id)
         if not account:
             raise ValueError("account_not_found")
+
+        job = await self._verification_manager.request_verification(user_id=user_id, account=dict(account))
+        if not job:
+            raise ValueError("verification_job_not_found")
+
+        job_id = job.get("id")
+        job_status = str(job.get("status") or "").strip().lower()
+        account_row = self._repo.get_account(account_id=int(account_id), user_id=user_id) or dict(account)
+
         self._store.add_audit(
             telegram_id=telegram_id,
-            action="account.verify.skipped",
+            action="account.verify.requested",
             payload={
-                "account_id": account_id,
-                "verification_job_id": None,
-                "verification_state": "VERIFIED",
-                "verification_ui_state": "VERIFIED",
-                "next_action": "START_BOT",
-                "reason": "runtime_login_on_start",
+                "account_id": int(account_id),
+                "verification_job_id": job_id,
+                "runner_id": job.get("runner_id"),
+                "slot_id": job.get("slot_id"),
+                "trace_id": job.get("trace_id"),
             },
-            result="skipped_runtime_login",
+            result=job_status or "dispatched",
         )
-        self._invalidate_dashboard_cache(user_id=int(user["id"]))
-        account_response = dict(account or {})
-        account_response.setdefault("raw_status", account_response.get("status"))
-        account_response["status"] = "connected"
-        account_response["has_credentials"] = True
-        account_response["connect_status"] = "PENDING_RUNTIME_LOGIN"
-        account_response["connection_state"] = "PENDING_RUNTIME_LOGIN"
-        account_response["verification_state"] = "VERIFIED"
-        account_response["verification_ui_state"] = "VERIFIED"
-        account_response["runtime_login_required"] = True
-        account_response["next_action"] = "START_BOT"
+        self._invalidate_dashboard_cache(user_id=user_id)
+
+        verification_state = str(job.get("verification_state") or "").strip().upper()
+        verification_ui_state = str(job.get("verification_ui_state") or "").strip().upper()
+        if not verification_state:
+            verification_state = "VERIFYING" if job_status in {"pending", "dispatched"} else "UNKNOWN"
+        if not verification_ui_state:
+            verification_ui_state = "VERIFYING_MT5" if job_status == "dispatched" else "SUBMITTED"
+
+        next_action = "POLL_VERIFICATION" if job_status in {"pending", "dispatched"} else "START_BOT"
+
         return {
-            "id": None,
+            "id": job_id,
             "account_id": int(account_id),
-            "verification_job_id": None,
-            "job_id": None,
-            "status": "connected",
-            "job_status": "verified",
-            "verification_state": "VERIFIED",
-            "verification_ui_state": "VERIFIED",
-            "connect_status": "PENDING_RUNTIME_LOGIN",
-            "connection_state": "PENDING_RUNTIME_LOGIN",
-            "next_action": "START_BOT",
-            "runner_id": None,
-            "slot_id": None,
-            "trace_id": None,
-            "redis_stream_id": None,
-            "job": None,
-            "account": account_response,
+            "verification_job_id": job_id,
+            "job_id": job_id,
+            "status": job_status or "dispatched",
+            "job_status": job_status,
+            "verification_state": verification_state,
+            "verification_ui_state": verification_ui_state,
+            "connect_status": account_row.get("connect_status") or "PENDING_RUNTIME_LOGIN",
+            "connection_state": account_row.get("connection_state") or "PENDING_RUNTIME_LOGIN",
+            "next_action": next_action,
+            "runner_id": job.get("runner_id"),
+            "slot_id": job.get("slot_id"),
+            "trace_id": job.get("trace_id"),
+            "redis_stream_id": job.get("redis_stream_id"),
+            "job": job,
+            "account": account_row,
             "runtime_login_required": True,
-            "credential_check_policy": "login_before_start",
+            "credential_check_policy": "runner_verify_queue",
             "mt5_recovery_policy": "recover_or_launch",
         }
 
@@ -1308,6 +1561,11 @@ class MT5ControlPlaneService:
                 "restart_required": False,
             }
 
+        if active_for_account:
+            if active_status in {"start_requested", "starting", "stop_requested"}:
+                raise OrchestrationPolicyError("start_transition_in_progress")
+            raise OrchestrationPolicyError("account_has_active_deployment")
+
         # Go-live guard: 1 Telegram user may occupy only 1 active/transition bot
         # at a time across all MT5 accounts. This is separate from plan quota and
         # includes paper mode because it still uses control-plane/runner state.
@@ -1604,6 +1862,592 @@ class MT5ControlPlaneService:
         )
         return result
 
+    def _tradingview_webhook_auth_ok(self, *, body_secret: str, query_secret: str, header_secret: str) -> None:
+        expected = str(getattr(settings, "TRADINGVIEW_WEBHOOK_SECRET", "") or "").strip()
+        if not expected:
+            return
+        provided = str(header_secret or query_secret or body_secret or "").strip()
+        if not provided or not secrets.compare_digest(expected, provided):
+            raise ValueError("tradingview_webhook_secret_invalid")
+
+    @staticmethod
+    def _tradingview_alert_id(body: dict[str, Any]) -> str:
+        for key in ("alert_id", "order_intent_id", "id", "tv_alert_id"):
+            raw = body.get(key)
+            if raw is not None and str(raw).strip():
+                return str(raw).strip()
+        signal = str(body.get("signal_id") or body.get("bot_code") or "signal").strip()
+        action = str(body.get("action") or body.get("signal") or body.get("side") or "alert").strip()
+        symbol = str(body.get("symbol") or body.get("ticker") or "").strip()
+        seed = f"{signal}:{action}:{symbol}:{time.time_ns()}:{uuid.uuid4().hex[:8]}"
+        digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
+        return f"tv-auto:{signal or 'signal'}:{action or 'alert'}:{digest}"
+
+    @staticmethod
+    def _deployment_trading_config(deployment: dict[str, Any]) -> dict[str, Any]:
+        cfg = deployment.get("config_json") or {}
+        if isinstance(cfg, str):
+            try:
+                cfg = json.loads(cfg)
+            except Exception:
+                cfg = {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        trading = cfg.get("trading")
+        return dict(trading) if isinstance(trading, dict) else {}
+
+    @staticmethod
+    def _json_object(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = {}
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    @classmethod
+    def _tradingview_symbol_map(cls, *sources: Any) -> dict[str, str]:
+        merged: dict[str, str] = {}
+        for source in sources:
+            cfg = cls._json_object(source)
+            candidates: list[Any] = [cfg.get("symbol_map")]
+            symbols = cfg.get("symbols")
+            if isinstance(symbols, dict):
+                candidates.append(symbols.get("symbol_map"))
+            trading = cfg.get("trading")
+            if isinstance(trading, dict):
+                candidates.append(trading.get("symbol_map"))
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                for raw_src, raw_dst in candidate.items():
+                    src = str(raw_src or "").strip()
+                    dst = str(raw_dst or "").strip()
+                    if src and dst:
+                        merged[src] = dst
+                        merged[src.upper()] = dst
+                        merged[src.lower()] = dst
+        return merged
+
+    @classmethod
+    def _map_tradingview_symbol(cls, symbol: str, *sources: Any) -> str:
+        symbol_s = str(symbol or "").strip()
+        if not symbol_s:
+            return ""
+        symbol_map = cls._tradingview_symbol_map(*sources)
+        return str(
+            symbol_map.get(symbol_s)
+            or symbol_map.get(symbol_s.upper())
+            or symbol_map.get(symbol_s.lower())
+            or symbol_s
+        ).strip()
+
+    @staticmethod
+    def _stable_order_magic(*, account_id: int, deployment_id: int, bot_code: str) -> int:
+        seed = f"{int(account_id)}:{int(deployment_id)}:{str(bot_code or '').strip()}".encode("utf-8")
+        digest = hashlib.sha256(seed).digest()
+        return int.from_bytes(digest[:4], "big") % 2_000_000_000
+
+    @staticmethod
+    def _classify_tradingview_action(action_raw: Any) -> tuple[str, dict[str, Any]]:
+        raw = str(action_raw or "").strip().upper().replace(" ", "_")
+        if raw in {"BUY", "LONG"}:
+            return "PLACE_ORDER", {"side": "buy"}
+        if raw in {"SELL", "SHORT"}:
+            return "PLACE_ORDER", {"side": "sell"}
+        if raw == "OPEN":
+            return "PLACE_ORDER", {}
+        if raw in {"CLOSE", "CLOSE_BUY", "CLOSE_SELL", "CLOSE_LONG", "CLOSE_SHORT", "EXIT"}:
+            return "CLOSE_ORDER", {"close_kind": raw}
+        return "", {}
+
+    def _resolve_deployment_for_tradingview(
+        self,
+        *,
+        deployment_id: Optional[int],
+        account_id: Optional[int],
+        bot_code: Optional[str],
+    ) -> dict[str, Any]:
+        if deployment_id is not None and int(deployment_id) > 0:
+            dep = self._repo.get_deployment(deployment_id=int(deployment_id), user_id=None)
+            if not dep:
+                raise ValueError("deployment_not_found")
+            return dep
+        if account_id is None or int(account_id) <= 0:
+            raise ValueError("tradingview_deployment_or_account_required")
+        dep = self._repo.get_active_deployment_for_account(account_id=int(account_id))
+        if not dep:
+            raise ValueError("deployment_not_found")
+        bot_needle = str(bot_code or "gsalgovip").strip()
+        if str(dep.get("bot_code") or "").strip() != bot_needle:
+            raise ValueError("deployment_bot_mismatch")
+        return dep
+
+    async def dispatch_tradingview_alert(
+        self,
+        *,
+        body: dict[str, Any],
+        query_secret: str = "",
+        header_secret: str = "",
+    ) -> dict[str, Any]:
+        """Public TradingView ingress: map alert -> PLACE_ORDER / CLOSE_ORDER with trace dedupe.
+
+        Expected JSON fields (minimal):
+        - alert_id | order_intent_id | id: stable id for idempotency
+        - action: BUY|SELL|OPEN|CLOSE|CLOSE_BUY|CLOSE_SELL|...
+        - deployment_id (preferred) OR account_id (+ optional bot_code, default gsalgovip)
+        - symbol: required for PLACE_ORDER
+        - volume: optional (defaults to deployment trading.lot_size)
+        - CLOSE_ORDER: Windows requires ticket and/or position (body fields ticket, position, or position_id).
+          symbol and magic are optional supplements only, not a substitute for ticket/position.
+        - secret: optional if TRADINGVIEW_WEBHOOK_SECRET is set (prefer header X-TradingView-Secret)
+
+        Inner MT5 fields are nested under payload.request for Windows executor compatibility.
+        """
+        if not isinstance(body, dict):
+            raise ValueError("invalid_request")
+        body_secret = str(body.get("secret") or "").strip()
+        self._tradingview_webhook_auth_ok(
+            body_secret=body_secret,
+            query_secret=str(query_secret or "").strip(),
+            header_secret=str(header_secret or "").strip(),
+        )
+
+        alert_id = self._tradingview_alert_id(body)
+        action = body.get("action") or body.get("signal") or body.get("side")
+        kind, meta = self._classify_tradingview_action(action)
+        if not kind:
+            raise ValueError("tradingview_action_unsupported")
+
+        deployment_id = body.get("deployment_id")
+        account_id = body.get("account_id")
+        dep_id_i: Optional[int] = None
+        acc_id_i: Optional[int] = None
+        try:
+            if deployment_id is not None and str(deployment_id).strip():
+                dep_id_i = int(deployment_id)
+        except (TypeError, ValueError):
+            dep_id_i = None
+        try:
+            if account_id is not None and str(account_id).strip():
+                acc_id_i = int(account_id)
+        except (TypeError, ValueError):
+            acc_id_i = None
+
+        bot_code = str(body.get("bot_code") or "gsalgovip").strip()
+        dep = self._resolve_deployment_for_tradingview(
+            deployment_id=dep_id_i,
+            account_id=acc_id_i,
+            bot_code=bot_code,
+        )
+
+        if str(dep.get("status") or "").strip().lower() != "running" or not dep.get("is_active"):
+            raise OrchestrationPolicyError("deployment_not_running")
+
+        runner_filter = str(body.get("runner_id") or "").strip()
+        if runner_filter and str(dep.get("runner_id") or "").strip() != runner_filter:
+            raise ValueError("deployment_runner_mismatch")
+
+        account_id_i = int(dep["account_id"])
+        deployment_id_i = int(dep["id"])
+        trace_id = f"tv_alert:{alert_id}:{kind.lower()}"
+
+        if kind == "PLACE_ORDER":
+            side = str(meta.get("side") or body.get("side") or "").strip().lower()
+            if not side:
+                braw = str(body.get("action") or "").strip().upper()
+                if braw == "OPEN":
+                    raise ValueError("tradingview_open_requires_side")
+                raise ValueError("tradingview_side_required")
+            if side not in {"buy", "sell"}:
+                raise ValueError("tradingview_side_invalid")
+
+            symbol = str(body.get("symbol") or body.get("ticker") or "").strip()
+            if not symbol:
+                raise ValueError("tradingview_symbol_required")
+            source_symbol = symbol
+
+            trading = self._deployment_trading_config(dep)
+            symbol = self._map_tradingview_symbol(symbol, dep.get("config_json"))
+            vol_raw = body.get("volume") if body.get("volume") is not None else body.get("lot")
+            if vol_raw is not None and str(vol_raw).strip():
+                try:
+                    volume = float(vol_raw)
+                except (TypeError, ValueError):
+                    raise ValueError("tradingview_volume_invalid")
+            else:
+                try:
+                    volume = float(trading.get("lot_size") or 0.0)
+                except (TypeError, ValueError):
+                    volume = 0.0
+            if volume <= 0:
+                raise ValueError("tradingview_volume_required")
+
+            sl = trading.get("stop_loss")
+            tp = trading.get("take_profit")
+            magic = self._stable_order_magic(
+                account_id=account_id_i,
+                deployment_id=deployment_id_i,
+                bot_code=str(dep.get("bot_code") or bot_code),
+            )
+
+            req: dict[str, Any] = {
+                "symbol": symbol,
+                "side": side,
+                "volume": volume,
+                "sl": sl,
+                "tp": tp,
+                "magic": magic,
+            }
+            dev_raw = body.get("deviation")
+            if dev_raw is not None and str(dev_raw).strip():
+                try:
+                    req["deviation"] = int(dev_raw)
+                except (TypeError, ValueError):
+                    raise ValueError("tradingview_deviation_invalid")
+
+            cmd_type = CommandType.PLACE_ORDER.value
+            existing = self._repo.get_execution_command_by_trace_identity(
+                account_id=account_id_i,
+                deployment_id=deployment_id_i,
+                command_type=cmd_type,
+                trace_id=trace_id,
+            )
+            if existing:
+                return {
+                    "ok": True,
+                    "status": "duplicate",
+                    "command_id": existing.get("command_id"),
+                    "trace_id": trace_id,
+                    "deployment_id": deployment_id_i,
+                }
+
+            validate_runtime_command_request(deployment=dep, allowed_statuses={"running"})
+            payload: dict[str, Any] = {"request": req}
+            if symbol != source_symbol:
+                payload["source_symbol"] = source_symbol
+                payload["mapped_symbol"] = symbol
+            result = await self._deployment_manager.dispatch_runtime_command(
+                deployment=dep,
+                command_type=CommandType.PLACE_ORDER,
+                payload=payload,
+                trace_id=trace_id,
+            )
+            cmd = result.get("command") or {}
+            return {
+                "ok": True,
+                "status": "queued",
+                "command_id": cmd.get("command_id"),
+                "trace_id": trace_id,
+                "deployment_id": deployment_id_i,
+            }
+
+        # CLOSE_ORDER — Windows: ticket or position required; symbol/magic are supplementary only.
+        symbol_close = str(body.get("symbol") or body.get("ticker") or "").strip()
+        source_symbol_close = symbol_close
+        if symbol_close:
+            symbol_close = self._map_tradingview_symbol(symbol_close, dep.get("config_json"))
+        magic_c = self._stable_order_magic(
+            account_id=account_id_i,
+            deployment_id=deployment_id_i,
+            bot_code=str(dep.get("bot_code") or bot_code),
+        )
+        close_req: dict[str, Any] = {
+            "close_kind": meta.get("close_kind") or "CLOSE",
+            "magic": magic_c,
+        }
+
+        ticket_in = body.get("ticket")
+        if ticket_in is not None and str(ticket_in).strip():
+            try:
+                close_req["ticket"] = int(str(ticket_in).strip())
+            except (TypeError, ValueError):
+                raise ValueError("tradingview_ticket_invalid")
+
+        pos_src = body.get("position")
+        if pos_src is None or not str(pos_src).strip():
+            pos_src = body.get("position_id")
+        if pos_src is not None and str(pos_src).strip():
+            try:
+                close_req["position"] = int(str(pos_src).strip())
+            except (TypeError, ValueError):
+                close_req["position"] = str(pos_src).strip()
+
+        if "ticket" not in close_req and "position" not in close_req:
+            raise ValueError("tradingview_close_requires_ticket_or_position")
+
+        if symbol_close:
+            close_req["symbol"] = symbol_close
+        vol_close = body.get("volume") if body.get("volume") is not None else body.get("lot")
+        if vol_close is not None and str(vol_close).strip():
+            try:
+                close_req["volume"] = float(vol_close)
+            except (TypeError, ValueError):
+                raise ValueError("tradingview_volume_invalid")
+
+        cmd_type_c = CommandType.CLOSE_ORDER.value
+        existing_c = self._repo.get_execution_command_by_trace_identity(
+            account_id=account_id_i,
+            deployment_id=deployment_id_i,
+            command_type=cmd_type_c,
+            trace_id=trace_id,
+        )
+        if existing_c:
+            return {
+                "ok": True,
+                "status": "duplicate",
+                "command_id": existing_c.get("command_id"),
+                "trace_id": trace_id,
+                "deployment_id": deployment_id_i,
+            }
+
+        validate_runtime_command_request(deployment=dep, allowed_statuses={"running"})
+        close_payload: dict[str, Any] = {"request": close_req}
+        if symbol_close and symbol_close != source_symbol_close:
+            close_payload["source_symbol"] = source_symbol_close
+            close_payload["mapped_symbol"] = symbol_close
+        result_c = await self._deployment_manager.dispatch_runtime_command(
+            deployment=dep,
+            command_type=CommandType.CLOSE_ORDER,
+            payload=close_payload,
+            trace_id=trace_id,
+        )
+        cmd_c = result_c.get("command") or {}
+        return {
+            "ok": True,
+            "status": "queued",
+            "command_id": cmd_c.get("command_id"),
+            "trace_id": trace_id,
+            "deployment_id": deployment_id_i,
+        }
+
+    async def dispatch_tradingview_broadcast(
+        self,
+        *,
+        body: dict[str, Any],
+        query_secret: str = "",
+        header_secret: str = "",
+    ) -> dict[str, Any]:
+        """Fan-out 1 TradingView signal -> N subscribers in 1 Redis pipeline batch.
+
+        Required body fields:
+          - alert_id (str): stable id, used for idempotency (TradingView retries OK).
+          - signal_id (str): subscription key — looked up in tradingview_signal_subscriptions.
+          - action (str): BUY/SELL/CLOSE/...
+          - symbol (str): required for PLACE_ORDER, optional for CLOSE.
+
+        Optional:
+          - bot_code (str): optional bot guard for multi-bot signal routing.
+          - default_volume (float): fallback if subscriber has no volume_override.
+          - max_subscribers (int, default 5000): safety cap.
+          - secret: shared secret if TRADINGVIEW_WEBHOOK_SECRET is set.
+
+        Returns:
+          {
+            "alert_id": "...", "signal_id": "...", "action": "...", "kind": "PLACE_ORDER",
+            "subscribers_total": N, "dispatched": M, "deduped": D, "failed": F,
+            "broadcast_id": "...", "results": [{account_id, ok, command_id, error?}, ...]
+          }
+
+        Idempotency: trace_id = `tv_bcast:{alert_id}:{account_id}:{kind}` →
+        repeat-broadcast for same alert_id is no-op per subscriber.
+        """
+        if not isinstance(body, dict):
+            raise ValueError("invalid_request")
+        body_secret = str(body.get("secret") or "").strip()
+        self._tradingview_webhook_auth_ok(
+            body_secret=body_secret,
+            query_secret=str(query_secret or "").strip(),
+            header_secret=str(header_secret or "").strip(),
+        )
+
+        alert_id = self._tradingview_alert_id(body)
+        signal_id = str(body.get("signal_id") or "").strip()
+        if not signal_id:
+            raise ValueError("tradingview_signal_id_required")
+        requested_bot_code = str(body.get("bot_code") or body.get("bot_id") or "").strip()
+
+        action = body.get("action") or body.get("signal") or body.get("side")
+        kind, meta = self._classify_tradingview_action(action)
+        if not kind:
+            raise ValueError("tradingview_action_unsupported")
+
+        symbol = str(body.get("symbol") or body.get("ticker") or "").strip()
+        if kind == "PLACE_ORDER" and not symbol:
+            raise ValueError("tradingview_symbol_required")
+
+        side = str(meta.get("side") or body.get("side") or "").strip().lower()
+        if kind == "PLACE_ORDER":
+            if not side:
+                braw = str(body.get("action") or "").strip().upper()
+                if braw == "OPEN":
+                    raise ValueError("tradingview_open_requires_side")
+                raise ValueError("tradingview_side_required")
+            if side not in {"buy", "sell"}:
+                raise ValueError("tradingview_side_invalid")
+
+        default_volume_raw = body.get("default_volume") or body.get("volume") or body.get("lot")
+        default_volume: float | None = None
+        if default_volume_raw is not None and str(default_volume_raw).strip():
+            try:
+                default_volume = float(default_volume_raw)
+            except (TypeError, ValueError):
+                raise ValueError("tradingview_volume_invalid")
+
+        max_subs = body.get("max_subscribers")
+        try:
+            max_subs_i = int(max_subs) if max_subs is not None else 5000
+        except (TypeError, ValueError):
+            max_subs_i = 5000
+
+        subscribers = self._repo.list_subscribers_for_signal(
+            signal_id=signal_id,
+            bot_code=requested_bot_code,
+            limit=max_subs_i,
+        )
+        if not subscribers:
+            return {
+                "alert_id": alert_id,
+                "signal_id": signal_id,
+                "bot_code": requested_bot_code,
+                "action": str(action),
+                "kind": kind,
+                "subscribers_total": 0,
+                "dispatched": 0,
+                "deduped": 0,
+                "failed": 0,
+                "broadcast_id": "",
+                "results": [],
+            }
+
+        broadcast_id = f"tv:{alert_id}:{kind.lower()}"
+
+        # Build N command items.
+        items: list[dict[str, Any]] = []
+        for sub in subscribers:
+            account_id = int(sub["account_id"])
+            deployment_id = int(sub["deployment_id"])
+            runner_id = str(sub["runner_id"])
+            slot_id = str(sub["slot_id"])
+            bot_code = str(sub.get("bot_code") or "")
+
+            # Per-subscriber volume: override -> default -> deployment trading.lot_size
+            if sub.get("volume_override") is not None:
+                vol = float(sub["volume_override"])
+            elif default_volume is not None:
+                vol = default_volume
+            else:
+                trading_cfg_raw = sub.get("deployment_config_json") or {}
+                if isinstance(trading_cfg_raw, str):
+                    try:
+                        trading_cfg_raw = json.loads(trading_cfg_raw)
+                    except Exception:
+                        trading_cfg_raw = {}
+                trading = (trading_cfg_raw or {}).get("trading") or {}
+                try:
+                    vol = float(trading.get("lot_size") or 0.0)
+                except (TypeError, ValueError):
+                    vol = 0.0
+
+            if kind == "PLACE_ORDER" and vol <= 0:
+                # Per-subscriber skip; record failure rather than abort whole broadcast.
+                items.append({"_invalid_volume": True, "account_id": account_id, "subscription_id": sub.get("subscription_id")})
+                continue
+
+            magic = self._stable_order_magic(
+                account_id=account_id,
+                deployment_id=deployment_id,
+                bot_code=bot_code,
+            )
+            trace_id = f"tv_bcast:{alert_id}:{account_id}:{kind.lower()}"
+            order_symbol = self._map_tradingview_symbol(
+                symbol,
+                sub.get("subscription_metadata"),
+                sub.get("deployment_config_json"),
+            )
+
+            if kind == "PLACE_ORDER":
+                request = {
+                    "symbol": order_symbol,
+                    "side": side,
+                    "volume": vol,
+                    "magic": magic,
+                }
+                cmd_type = CommandType.PLACE_ORDER
+            else:
+                request = {
+                    "close_kind": meta.get("close_kind") or "CLOSE",
+                    "magic": magic,
+                }
+                if symbol:
+                    request["symbol"] = symbol
+                cmd_type = CommandType.CLOSE_ORDER
+
+            items.append({
+                "command_type": cmd_type,
+                "account_id": account_id,
+                "deployment_id": deployment_id,
+                "bot_id": bot_code,
+                "runner_id": runner_id,
+                "slot_id": slot_id,
+                "priority": int(sub.get("subscription_priority") or 60),
+                "trace_id": trace_id,
+                "payload": {
+                    "request": request,
+                    "broadcast_signal_id": signal_id,
+                    "broadcast_alert_id": alert_id,
+                    "broadcast_bot_code": requested_bot_code,
+                    "broadcast_source_symbol": symbol,
+                    "broadcast_mapped_symbol": order_symbol,
+                },
+                "_subscription_id": sub.get("subscription_id"),
+            })
+
+        # Fan-out batch dispatch
+        dispatchable = [{k: v for k, v in i.items() if not k.startswith("_")} for i in items if not i.get("_invalid_volume")]
+        results = await self._command_router.dispatch_batch(items=dispatchable, broadcast_id=broadcast_id)
+
+        # Merge results back with input order
+        merged: list[dict[str, Any]] = []
+        result_idx = 0
+        dispatched = deduped = failed = 0
+        for item in items:
+            account_id = item.get("account_id")
+            sub_id = item.get("_subscription_id")
+            if item.get("_invalid_volume"):
+                merged.append({"account_id": account_id, "subscription_id": sub_id, "ok": False, "error": "no_volume_resolved"})
+                failed += 1
+                continue
+            r = results[result_idx] if result_idx < len(results) else {"ok": False, "error": "no_result"}
+            result_idx += 1
+            entry = {"account_id": account_id, "subscription_id": sub_id, "ok": bool(r.get("ok"))}
+            cmd_rec = r.get("command_record") or {}
+            if cmd_rec.get("command_id"):
+                entry["command_id"] = cmd_rec["command_id"]
+            if r.get("deduped"):
+                entry["deduped"] = True
+                deduped += 1
+            elif r.get("ok"):
+                dispatched += 1
+            else:
+                entry["error"] = r.get("error") or "dispatch_failed"
+                failed += 1
+            merged.append(entry)
+
+        return {
+            "alert_id": alert_id,
+            "signal_id": signal_id,
+            "bot_code": requested_bot_code,
+            "action": str(action),
+            "kind": kind,
+            "subscribers_total": len(subscribers),
+            "dispatched": dispatched,
+            "deduped": deduped,
+            "failed": failed,
+            "broadcast_id": broadcast_id,
+            "results": merged,
+        }
+
     def list_deployments(self, *, telegram_id: str, username: Optional[str]) -> list[dict[str, Any]]:
         user = self.ensure_user(telegram_id=telegram_id, username=username)
         return self._repo.list_deployments(user_id=int(user["id"]))
@@ -1736,6 +2580,17 @@ class MT5ControlPlaneService:
                     active_bot_ids=[str(item.get("bot_id") or item.get("bot_code") or item.get("bot_name") or "") for item in definitions],
                 )
             for definition in definitions:
+                if hasattr(self._repo, "get_bot_by_name"):
+                    existing = self._repo.get_bot_by_name(
+                        bot_name=str(definition.get("bot_code") or definition.get("bot_id") or definition.get("bot_name") or "")
+                    )
+                    if _catalog_entry_is_linux_authoritative(existing):
+                        definition = _preserve_authoritative_catalog_definition(
+                            existing=existing or {},
+                            runner_definition=definition,
+                            runner_id=runner_id_s,
+                            source=source,
+                        )
                 self._repo.upsert_bot_catalog_entry(definition)
                 if hasattr(self._repo, "upsert_bot_version"):
                     self._repo.upsert_bot_version(
@@ -1914,7 +2769,6 @@ class MT5ControlPlaneService:
         runner_id: Optional[str] = None,
         request_base_url: Optional[str] = None,
     ) -> dict[str, Any]:
-        lease_sec = max(30, int(getattr(settings, "COMMAND_DELIVERY_PROCESSING_REQUEUE_TIMEOUT_SEC", 180) or 180))
         heartbeat_sec = max(3.0, float(getattr(settings, "RUNNER_HEARTBEAT_WRITE_THROTTLE_SEC", 5.0) or 5.0))
         configured_base_url = (
             str(getattr(settings, "RUNNER_CONTROL_PLANE_URL", "") or "").strip()
@@ -1935,11 +2789,12 @@ class MT5ControlPlaneService:
         else:
             base_url = configured_base_url
         runner_id_s = str(runner_id or "").strip()
-        command_types = [
-            CommandType.STOP_BOT.value,
-            CommandType.START_BOT.value,
-            CommandType.UPDATE_BOT_CONFIG.value,
-        ]
+        supported_transports = ["redis_queue"]
+        recommended_transport = str(
+            getattr(settings, "RUNNER_RECOMMENDED_TRANSPORT", "redis_queue") or "redis_queue"
+        ).strip().lower()
+        if recommended_transport not in supported_transports:
+            recommended_transport = "redis_queue"
         return {
             "server_time": datetime.now(timezone.utc).isoformat(),
             "runner_id": runner_id_s or None,
@@ -1949,15 +2804,8 @@ class MT5ControlPlaneService:
                 "auth_header": "X-Backend-Api-Key",
             },
             "transport": {
-                "recommended": "http_poll",
-                "supported": ["http_poll", "redis_queue"],
-                "http_poll": {
-                    "claim_path": "/api/v2/runner/commands/claim",
-                    "wait_timeout_sec": 10,
-                    "idle_poll_sec": 1,
-                    "claim_lease_sec": lease_sec,
-                    "command_types": command_types,
-                },
+                "recommended": recommended_transport,
+                "supported": supported_transports,
                 "redis_queue": {
                     "commands": f"mt5:runner:{runner_id_s or '<runner_id>'}:commands",
                     "commands_processing": f"mt5:runner:{runner_id_s or '<runner_id>'}:commands:processing",
@@ -1969,7 +2817,6 @@ class MT5ControlPlaneService:
                 "register": "/api/v2/runner/register",
                 "heartbeat": "/api/v2/runner/heartbeat",
                 "events": "/api/v2/runner/events",
-                "claim_command": "/api/v2/runner/commands/claim",
                 "command_delivery": "/api/v2/runner/commands/{command_id}/delivery",
                 "deployment_package": "/api/v2/runner/deployments/{deployment_id}/package",
                 "account_bundle": "/api/v2/runner/accounts/{account_id}/bundle",
@@ -1978,7 +2825,6 @@ class MT5ControlPlaneService:
             "timing": {
                 "heartbeat_interval_sec": heartbeat_sec,
                 "runner_stale_sec": max(30, int(getattr(settings, "CONTROL_PLANE_RUNNER_STALE_SEC", 180) or 180)),
-                "claim_lease_sec": lease_sec,
             },
             "contract": {
                 "start_bot": {
@@ -2001,68 +2847,6 @@ class MT5ControlPlaneService:
                     "ACCOUNT_NOT_FOUND",
                 ],
             },
-        }
-
-    async def claim_runner_command(
-        self,
-        *,
-        runner_id: str,
-        slot_id: Optional[str] = None,
-        command_types: Optional[list[str]] = None,
-    ) -> dict[str, Any]:
-        lease_sec = max(30, int(getattr(settings, "COMMAND_DELIVERY_PROCESSING_REQUEUE_TIMEOUT_SEC", 180) or 180))
-        requeued_expired_claims = self._repo.requeue_stale_http_claimed_execution_commands(
-            runner_id=runner_id,
-            older_than_sec=lease_sec,
-            command_types=command_types,
-            limit=50,
-        )
-        row = self._repo.claim_next_execution_command_for_runner(
-            runner_id=runner_id,
-            slot_id=slot_id,
-            command_types=command_types,
-        )
-        if not row:
-            return {
-                "empty": True,
-                "command": None,
-                "runner_id": str(runner_id or "").strip(),
-                "slot_id": str(slot_id or "").strip() or None,
-                "delivery_transport": "http_poll",
-                "next_poll_sec": 1,
-                "claim_lease_sec": lease_sec,
-                "requeued_expired_claims": requeued_expired_claims,
-            }
-
-        envelope = build_runner_command_from_row(row)
-        redis_cleanup: dict[str, Any] = {"removed": 0}
-        try:
-            redis_cleanup = await RedisStreamPublisher().remove_runner_command(
-                runner_id=envelope.runner_id,
-                command_id=envelope.command_id,
-            )
-        except Exception as exc:
-            redis_cleanup = {"removed": 0, "error": exc.__class__.__name__}
-            log.warning(
-                "runner_http_claim_redis_cleanup_failed command_id=%s runner_id=%s error=%s",
-                envelope.command_id,
-                envelope.runner_id,
-                exc.__class__.__name__,
-            )
-
-        return {
-            "empty": False,
-            "runner_id": envelope.runner_id,
-            "slot_id": envelope.slot_id,
-            "command_id": envelope.command_id,
-            "delivery_status": "dispatched",
-            "delivery_transport": "http_poll",
-            "claim_lease_sec": lease_sec,
-            "lease_expires_at_epoch": int(time.time()) + lease_sec,
-            "requeued_expired_claims": requeued_expired_claims,
-            "next_poll_sec": 0,
-            "redis_cleanup": redis_cleanup,
-            "command": envelope.model_dump(mode="json"),
         }
 
     async def ingest_runner_heartbeat(self, **payload: Any) -> dict[str, Any]:
@@ -2261,8 +3045,17 @@ class MT5ControlPlaneService:
             runner_id=runner_id,
             slot_id=slot_id,
         ).get("resource_hints") or {}
+        runtime_env = dict(package.get("runtime_env") or {})
+        risk_profile = dict(package.get("risk_profile") or {})
+        catalog_metadata = package.get("catalog_metadata") if isinstance(package.get("catalog_metadata"), dict) else {}
+        execution_contract = _bot_execution_contract(resource_hints, runtime_env, risk_profile, catalog_metadata)
+        _merge_bot_execution_contract(resource_hints, execution_contract)
+        _merge_bot_execution_contract(runtime_env, execution_contract)
+        risk_contract = risk_profile.get("risk_contract") if isinstance(risk_profile.get("risk_contract"), dict) else {}
+        catalog_bot_code = package.get("catalog_bot_code") or package.get("bot_code")
         bot_contract = {
-            "bot_id": package.get("catalog_bot_code") or package.get("bot_code"),
+            "bot_id": catalog_bot_code,
+            "bot_code": catalog_bot_code,
             "bot_name": package.get("catalog_bot_name") or package.get("deployment_bot_name"),
             "display_name": package.get("display_name") or package.get("deployment_bot_name"),
             "language": package.get("language") or "other",
@@ -2270,17 +3063,19 @@ class MT5ControlPlaneService:
             "profile_class": package.get("catalog_profile_class") or package.get("deployment_profile_class"),
             "runtime_entry": package.get("runtime_entry") or "",
             "required_params": package.get("required_params") or [],
-            "risk_profile": package.get("risk_profile") or {},
+            "risk_profile": risk_profile,
+            "risk_contract": risk_contract,
             "indicator_requirements": package.get("indicator_requirements") or [],
             "strategy_tags": package.get("strategy_tags") or [],
             "resource_hints": resource_hints,
             "supports_demo": bool(package.get("supports_demo", True)),
             "supports_live": bool(package.get("supports_live", True)),
             "default_config_path": package.get("default_config_path"),
-            "runtime_env": package.get("runtime_env") or {},
+            "runtime_env": runtime_env,
             "checksum": package.get("checksum") or "",
             "source_path": package.get("source_path") or "",
         }
+        bot_contract.update(execution_contract)
         deployment_config = normalize_deployment_config(
             bot=bot_contract,
             config=package.get("config_json") or {},

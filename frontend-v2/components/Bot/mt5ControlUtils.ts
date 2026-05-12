@@ -6,18 +6,8 @@ import {
   type StartMt5DeploymentResponse,
 } from "@/lib/api";
 
-const PRIVATE_GSALGO_BOT_CODE = "gsalgo_mt5_bot";
 const GSALGO_DISPLAY_NAME = "Gs Algo";
-const GSALGO_BOT_IDENTITIES = new Set([PRIVATE_GSALGO_BOT_CODE, "gsalgo"]);
-
-export type TradingUnit = "price_distance" | "points";
-
-export const TRADING_CONFIG_DEFAULTS = {
-  lotSize: "0.00",
-  stopLoss: "",
-  takeProfit: "",
-  tradingUnit: "price_distance" as TradingUnit,
-};
+export const LOT_SIZE_DEFAULT = "0.01";
 
 export function isMt5AccountReady(account: MT5AccountItem | null): boolean {
   if (!account) {
@@ -61,30 +51,6 @@ export function formatBotDisplayName(value?: string | null): string {
     return GSALGO_DISPLAY_NAME;
   }
   return raw;
-}
-
-function isPrivateGsalgoBot(
-  bot: MT5BotCatalogItem | null,
-  fallbackName?: string | null
-): boolean {
-  const values = [bot?.bot_id, bot?.bot_name, bot?.display_name, fallbackName].map((value) =>
-    normalizeBotIdentity(value).replace(/[^a-z0-9_]/g, "")
-  );
-
-  return values.some((value) => GSALGO_BOT_IDENTITIES.has(value));
-}
-
-export function botSupportsTradingConfig(
-  bot: MT5BotCatalogItem | null,
-  fallbackName?: string | null
-): boolean {
-  if (isPrivateGsalgoBot(bot, fallbackName)) {
-    return true;
-  }
-  const required = new Set(
-    (bot?.required_params || []).map((item) => normalizeBotIdentity(item))
-  );
-  return ["lot_size", "stop_loss", "take_profit"].every((key) => required.has(key));
 }
 
 export function entitlementMatchesBot(
@@ -141,6 +107,26 @@ export function parsePositiveDecimalInput(value: string): number | null {
   return parsed;
 }
 
+function getRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+export function getDeploymentLotSize(config?: Record<string, unknown> | null): string | null {
+  const payload = getRecord(config);
+  const trading = getRecord(payload.trading);
+  const raw = trading.lot_size ?? payload.lot_size;
+  if (raw == null || raw === "") {
+    return null;
+  }
+  const parsed = Number(String(raw).replace(",", "."));
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
+  }
+  return String(raw);
+}
+
 export function humanizeAccountStatus(account: MT5AccountItem | null): string {
   if (!account) {
     return "Chưa có account";
@@ -158,16 +144,67 @@ export function humanizeDeploymentStatus(
   account: MT5AccountItem | null
 ): string {
   if (!deployment && !account?.active_deployment_id) {
-    return "Đang tắt";
+    return "Đã tắt";
   }
   const status = String(deployment?.status || account?.active_deployment_status || "")
     .trim()
     .toLowerCase();
   if (status === "running" || status === "start_requested" || status === "starting")
     return "Đang bật";
-  if (status === "stop_requested" || status === "stopped") return "Đang tắt";
+  if (status === "stop_requested") return "Đang tắt";
+  if (status === "stopped") return "Đã tắt";
   if (status === "failed" || status === "blocked") return "Lỗi";
-  return status ? status : "Đang tắt";
+  return status ? status : "Đã tắt";
+}
+
+/**
+ * Map the real Windows-runner sub-state (status + health_status) into honest
+ * Vietnamese text. These come from BOT_STARTED/SIGNAL_EXECUTOR_PREPARING/READY
+ * /STOPPING events the runner emits — we do not invent stages. Return null when
+ * the deployment is not in flight so callers can fall back to the generic label.
+ */
+export function humanizeDeploymentProgress(
+  deployment: MT5DeploymentItem | null
+): string | null {
+  if (!deployment) return null;
+  const status = String(deployment.status || "").trim().toLowerCase();
+  const health = String(deployment.health_status || "").trim().toLowerCase();
+
+  if (status === "queued") {
+    if (health.startsWith("waiting_previous_deployment_stop") || health === "waiting_previous_runtime_stop") {
+      return "Đang chờ bot trước đó dừng hẳn...";
+    }
+    return "Đang xếp hàng chờ slot rảnh...";
+  }
+
+  if (status === "start_requested") {
+    if (health === "starting") return "Runner đã nhận lệnh bật, đang dựng MT5...";
+    return "Đang gửi lệnh xuống runner...";
+  }
+
+  if (status === "starting") {
+    if (health === "executor_preparing") return "Đang khởi MT5 và đăng nhập broker...";
+    if (health === "executor_ready") return "EA đã sẵn sàng, chờ MT5 nhận tín hiệu...";
+    if (health === "starting") return "Runner đã nhận lệnh bật, đang dựng MT5...";
+    return "Đang khởi bot...";
+  }
+
+  if (status === "stop_requested") {
+    if (health === "executor_stopping") return "EA đang đóng vị thế và dừng listener...";
+    if (health === "config_update_restart_requested") return "Đang dừng để áp cấu hình mới...";
+    if (health === "replacement_stop_requested") return "Đang dừng phiên cũ để bật phiên mới...";
+    if (health === "stop_requested") return "Runner đã nhận lệnh tắt, đang đóng MT5...";
+    return "Đang tắt bot...";
+  }
+
+  if (status === "running") {
+    if (health === "running") return "Bot đang chạy";
+    if (health === "degraded") return "Bot đang chạy (slot đang xuống cấp)";
+    if (health === "executor_ready") return "Bot đã sẵn sàng nhận tín hiệu";
+    return "Bot đang chạy";
+  }
+
+  return null;
 }
 
 export function getAccountStatusPillClassName(account: MT5AccountItem | null): string {

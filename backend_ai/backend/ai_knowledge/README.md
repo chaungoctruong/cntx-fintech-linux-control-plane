@@ -1,54 +1,53 @@
-# AI Knowledge Base - Hướng Dẫn Đào Tạo
+# `ai_knowledge/` — Tài liệu nghiệp vụ cho AI & đào tạo người
 
-## Mục tiêu thư mục
-- Đây là kho tri thức nghiệp vụ và vận hành để AI/backend trả lời đúng ngữ cảnh CNTx labs.
-- Dùng để đào tạo nhân viên mới: hiểu boundary hệ thống, quy trình vận hành và cách xử lý tình huống hỗ trợ user.
-- Giảm trả lời sai sự thật (hallucination), giảm rủi ro compliance trong lĩnh vực trading.
+Markdown **không** được FastAPI import như module nghiệp vụ; dùng làm **nguồn tri thức** (ingest RAG), onboarding nhân viên, và chuẩn hóa câu trả lời support. **Không** thay cho log/DB khi xử sự cố production.
 
-## Nhiệm vụ chính
-- Cung cấp “source of truth” cho câu hỏi sản phẩm, runtime, MT5, risk, trading basics và sales.
-- Chuẩn hóa thông điệp trả lời: ngắn gọn, rõ ràng, chuyên nghiệp, không cam kết lợi nhuận.
-- Hỗ trợ troubleshooting theo checklist, ưu tiên bằng chứng (status, event, heartbeat, logs).
+## Mục tiêu
 
-## Hành vi bắt buộc khi sử dụng tri thức này
-- Không đoán trạng thái bot/account nếu chưa có dữ liệu runtime.
-- Không đưa số liệu kỹ thuật (swap/margin/spread) nếu thiếu specification broker.
-- Không khuyên all-in, martingale nguy hiểm, hoặc cam kết “chắc thắng”.
-- Không để lộ thông tin nhạy cảm (token, key, password, secret, raw logs nhạy cảm).
-- Khi gặp lỗi: hỏi đúng thông tin cần thiết (account/deployment/thời điểm/log id), không yêu cầu thao tác rủi ro.
+- Giảm trả lời sai ngữ cảnh (hallucination) cho AI và nhân viên mới.
+- Chuẩn hóa ranh giới: **Linux = control-plane**, **Windows = execution-plane (MT5)**.
+- Checklist troubleshooting: ưu tiên bằng chứng (`request_id`, event, heartbeat, Postgres).
 
-## Logic vận hành cần nắm
-- Linux backend là control plane; Windows runner là execution plane.
-- Bot logic không nằm trong Linux backend.
-- Trạng thái deployment cần đọc theo lifecycle:
-  - `start_requested -> starting -> running -> stop_requested -> stopped/failed`
-- Trạng thái command cần đọc theo lifecycle:
-  - `queued -> dispatched -> acknowledged/failed`
-- Phân tích “bot có đang chạy không” phải dựa trên:
-  - deployment status + desired_state + health_status + last_heartbeat_at
-  - command gần nhất nếu đang kẹt start/stop
-  - runner/slot status nếu có binding
+## Cấu trúc file (inventory thực tế)
 
-## Cấu trúc thư mục (mapping)
-- `cntx_labs_overview.md`: tổng quan sản phẩm và boundary hệ thống.
-- `ai_answer_policy.md`: chính sách trả lời AI, guardrails, anti-hallucination.
-- `runtime/`: lifecycle deployment, sticky slot, backend Linux, runner Windows, common errors.
-- `trading/`: kiến thức trading cơ bản (lot, margin, swap, symbol), funded account rules.
-- `broker/`: thông tin broker/MT5 liên quan onboarding và hỗ trợ.
-- `sales/`: playbook trao đổi với khách hàng theo đúng định hướng sản phẩm.
-- `risk_management.md`, `lot_margin_spread_swap.md`, `bot_runtime.md`, `mt5_connect_flow.md`, `common_mt5_errors.md`: tài liệu bổ trợ đa chủ đề.
+| Đường dẫn | Nội dung |
+|-----------|----------|
+| **`cntx_labs_overview.md`** | Tổ quan sản phẩm, boundary hệ thống. |
+| **`ai_answer_policy.md`** | Policy trả lời AI, guardrails. |
+| **`bot_runtime.md`** | Runtime bot (khái niệm chung). |
+| **`mt5_connect_flow.md`** | Luồng kết nối MT5 từ góc user/support. |
+| **`common_mt5_errors.md`** | Lỗi MT5 thường gặp. |
+| **`lot_margin_spread_swap.md`**, **`risk_management.md`** | Trading cơ bản / rủi ro. |
+| **`runtime/linux_backend.md`** | Vai trò backend Linux. |
+| **`runtime/windows_runner.md`** | Runner Windows, Redis queue, HTTP callback ngắn (**không** HTTP poll lệnh). |
+| **`runtime/deployment_lifecycle.md`** | Trạng thái deployment. |
+| **`runtime/sticky_slot.md`** | Sticky slot policy. |
+| **`runtime/common_errors.md`** | Lỗi runtime chung. |
+| **`broker/mt5_brokers.md`** | Broker / MT5 onboarding. |
+| **`trading/*.md`** | Giải thích symbol, margin, funded rules, … |
+| **`sales/sales_playbook.md`** | Sales playbook. |
 
-## Mục tiêu đào tạo nhân viên mới
-- Tuần 1: hiểu kiến trúc control-plane/execution-plane và flow user.
-- Tuần 2: đọc và xử lý checklist runtime errors + MT5 connect issues.
-- Tuần 3: thực hành trả lời theo policy, có trích dẫn source file liên quan.
-- Tuần 4: shadow support ca trực, báo cáo tình huống “thiếu data cần xác minh”.
+*(Nếu thêm file `.md` mới, cập nhật bảng trên để đồng bộ đào tạo.)*
 
-## Quy tắc cập nhật nội dung
-- Mọi thay đổi phải ưu tiên tính đúng sự thật và tính nhất quán với runtime hiện tại.
-- Nếu có thay đổi lifecycle, cập nhật tài liệu runtime trước.
-- Khuyến nghị mỗi file tri thức giữ format:
-  - Mục tiêu
-  - Source of truth
-  - Checklist thực thi
-  - Sai lầm thường gặp
+## Hành vi bắt buộc khi dùng làm “sự thật”
+
+- Không suy đoán trạng thái bot nếu thiếu DB/event.
+- Không cam kết lợi nhuận; không khuyên martingale / all-in.
+- Không lộ secret (token, password, raw log nhạy cảm).
+
+## Command / delivery (để nhân viên không nhầm)
+
+- Trạng thái lệnh trong DB: `queued → dispatched → acknowledged/failed` (xem code + SQL `commands/`).
+- **Transport lệnh tới runner:** Redis list `mt5:runner:{RUNNER_ID}:commands` — không lấy lệnh qua HTTP long-poll.
+
+## Cập nhật nội dung
+
+- Đổi lifecycle hoặc contract runner → sửa **`runtime/*.md`** trước khi lan truyền nội dung cũ.
+- Giữ mỗi file: mục tiêu → source of truth → checklist → sai lầm thường gặp.
+
+## Đào tạo
+
+1. Tuần 1: `cntx_labs_overview.md` + `runtime/linux_backend.md` + `runtime/windows_runner.md`.
+2. Tuần 2: `deployment_lifecycle.md` + `common_errors.md`.
+3. Tuần 3: `ai_answer_policy.md` + shadow support có trích dẫn file.
+4. Tuần 4: cập nhật chính tài liệu khi đổi sản phẩm.

@@ -46,6 +46,51 @@ def _field_was_set(model: BaseModel, field_name: str) -> bool:
     return field_name in getattr(model, "model_fields_set", set())
 
 
+def _normalize_profile_classes(value: Any) -> list[ProfileClass]:
+    if value in (None, ""):
+        return [ProfileClass.LIGHT, ProfileClass.NORMAL, ProfileClass.HEAVY]
+    items = value if isinstance(value, list) else [value]
+    normalized: list[ProfileClass] = []
+    for item in items:
+        raw = str(getattr(item, "value", item) or "").strip().lower()
+        if raw == ProfileClass.LIGHT.value:
+            normalized.append(ProfileClass.LIGHT)
+        elif raw in {ProfileClass.NORMAL.value, "standard", "default"}:
+            normalized.append(ProfileClass.NORMAL)
+        elif raw == ProfileClass.HEAVY.value:
+            normalized.append(ProfileClass.HEAVY)
+    return normalized or [ProfileClass.LIGHT, ProfileClass.NORMAL, ProfileClass.HEAVY]
+
+
+def _normalize_runner_status(value: Any) -> Any:
+    raw = str(getattr(value, "value", value) or "").strip().lower()
+    if raw in {"healthy", "ready", "active", "listening"}:
+        return RunnerStatus.ONLINE
+    return raw or RunnerStatus.ONLINE
+
+
+def _normalize_runner_slot_status(value: Any) -> Any:
+    raw = str(getattr(value, "value", value) or "").strip().lower()
+    if raw in {"empty", "ready", "stopped", "idle", "available"}:
+        return SlotStatus.READY
+    if raw in {"active", "allocated", "verifying", "preparing", "executor_preparing", "executor_ready", "listening", "stopping", "running", "busy"}:
+        return SlotStatus.ALLOCATED
+    return raw or SlotStatus.READY
+
+
+def _normalize_runner_slots(value: Any) -> Any:
+    if value in (None, ""):
+        return []
+    if isinstance(value, dict):
+        items = []
+        for slot_id, slot_payload in value.items():
+            slot = dict(slot_payload or {}) if isinstance(slot_payload, dict) else {}
+            slot.setdefault("slot_id", str(slot_id))
+            items.append(slot)
+        return items
+    return value
+
+
 class AccountConnectRequest(BaseModel):
     broker: str = Field(min_length=1)
     server: str = Field(min_length=1)
@@ -73,19 +118,6 @@ class CommandDeliveryUpdateRequest(BaseModel):
     delivery_status: str = Field(min_length=1)
     error_text: Optional[str] = None
     payload: dict[str, Any] = Field(default_factory=dict)
-
-
-class RunnerCommandClaimRequest(BaseModel):
-    runner_id: str = Field(min_length=1)
-    slot_id: Optional[str] = None
-    command_types: list[CommandType] = Field(
-        default_factory=lambda: [
-            CommandType.STOP_BOT,
-            CommandType.START_BOT,
-            CommandType.UPDATE_BOT_CONFIG,
-        ]
-    )
-    wait_timeout_sec: int = Field(default=0, ge=0, le=30)
 
 
 class BotSelectRequest(BaseModel):
@@ -173,6 +205,16 @@ class RunnerSlotRegistration(BaseModel):
     allowed_profile_classes: list[ProfileClass] = Field(default_factory=lambda: [ProfileClass.LIGHT, ProfileClass.NORMAL, ProfileClass.HEAVY])
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("status", mode="before")
+    @classmethod
+    def normalize_status(cls, value: Any) -> Any:
+        return _normalize_runner_slot_status(value)
+
+    @field_validator("allowed_profile_classes", mode="before")
+    @classmethod
+    def normalize_allowed_profile_classes(cls, value: Any) -> list[ProfileClass]:
+        return _normalize_profile_classes(value)
+
 
 class RunnerRegisterRequest(BaseModel):
     runner_id: str = Field(min_length=1)
@@ -187,6 +229,21 @@ class RunnerRegisterRequest(BaseModel):
     bot_catalog: dict[str, Any] = Field(default_factory=dict)
     max_slots: int = Field(default=1, ge=1, le=512)
     slots: list[RunnerSlotRegistration] = Field(default_factory=list)
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def normalize_status(cls, value: Any) -> Any:
+        return _normalize_runner_status(value)
+
+    @field_validator("supported_profiles", mode="before")
+    @classmethod
+    def normalize_supported_profiles(cls, value: Any) -> list[ProfileClass]:
+        return _normalize_profile_classes(value)
+
+    @field_validator("slots", mode="before")
+    @classmethod
+    def normalize_slots(cls, value: Any) -> Any:
+        return _normalize_runner_slots(value)
 
 
 class RunnerHeartbeatRequest(BaseModel):
@@ -245,6 +302,12 @@ class RunnerEventRequest(BaseModel):
         raw = str(getattr(value, "value", value) or "").strip()
         normalized = raw.replace("-", "_").upper()
         return normalized if normalized in EventType._value2member_map_ else value
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def normalize_severity(cls, value: Any) -> Any:
+        raw = str(getattr(value, "value", value) or "").strip().lower()
+        return raw or Severity.INFO.value
 
 
 class GsAlgoBotStateContext(BaseModel):

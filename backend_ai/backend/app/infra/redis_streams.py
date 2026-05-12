@@ -151,6 +151,102 @@ class RedisStreamPublisher:
         result = await self.publish_command_result(payload)
         return str(result.get("stream_id") or "")
 
+    async def publish_command_batch(
+        self,
+        payloads: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Pipeline-publish many runner commands in a single Redis round-trip.
+
+        Designed for fan-out scenarios (vd: 1 TradingView signal → 100 user
+        accounts on 30+ runners). Each command still goes through the same
+        atomic Lua script as `publish_command_result`, so:
+          * Per-command dedupe by `command_id` (idempotent)
+          * Per-account queue + per-runner queue both populated
+          * Stream marker stays consistent with single-publish path
+
+        Batch ratio ~50ms for 100 commands vs ~100×50ms = 5s sequential.
+
+        Returns one result dict per input payload, in order. Each is either
+        `{"stream_id": "...", "duplicate": bool}` (success) or
+        `{"stream_id": "", "duplicate": False, "error": "..."}` (per-item fail).
+        Whole-batch failures (Redis unreachable) raise RuntimeError.
+        """
+        if not payloads:
+            return []
+        redis = await get_redis_write(decode_responses=True)
+        if redis is None:
+            raise RuntimeError("redis_unavailable")
+        ttl = str(_command_publish_dedupe_ttl_sec())
+
+        pipe = redis.pipeline(transaction=False)
+        prepared: list[bool] = []  # parallel list — True if eval queued
+        for payload in payloads:
+            try:
+                command_id = str(payload.get("command_id") or "").strip()
+                if not command_id:
+                    raise ValueError("command_id_required")
+                account_id = str(payload.get("account_id") or "").strip()
+                runner_id = str(payload.get("runner_id") or "").strip()
+                queue_key = f"mt5:account:{account_id}:commands"
+                runner_queue_key = (
+                    f"mt5:runner:{runner_id}:commands" if runner_id else "__mt5_runner_queue_missing__"
+                )
+                marker_key = f"{COMMAND_PUBLISH_DEDUPE_KEY_PREFIX}{command_id}"
+                payload_json = json.dumps(payload.get("payload") or {}, ensure_ascii=False, separators=(",", ":"))
+                runner_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                pipe.eval(
+                    _COMMAND_PUBLISH_LUA,
+                    4,
+                    COMMAND_STREAM_KEY,
+                    queue_key,
+                    marker_key,
+                    runner_queue_key,
+                    command_id,
+                    str(payload.get("command_type") or ""),
+                    account_id,
+                    str(payload.get("deployment_id") or ""),
+                    str(payload.get("bot_id") or ""),
+                    runner_id,
+                    str(payload.get("slot_id") or ""),
+                    str(payload.get("priority") or 0),
+                    payload_json,
+                    str(payload.get("trace_id") or ""),
+                    runner_payload,
+                    runner_queue_key,
+                    "1" if runner_id else "0",
+                    ttl,
+                )
+                prepared.append(True)
+            except Exception:
+                prepared.append(False)
+
+        try:
+            raw_results = await pipe.execute()
+        except Exception as exc:
+            # Whole pipeline failed — caller handles fail-closed retry logic.
+            raise RuntimeError(f"redis_pipeline_failed:{exc.__class__.__name__}") from exc
+
+        # Map raw results back to input order, accounting for skipped (prepared=False) entries.
+        out: list[dict[str, Any]] = []
+        result_idx = 0
+        for ok in prepared:
+            if not ok:
+                out.append({"stream_id": "", "duplicate": False, "error": "prepare_failed"})
+                continue
+            raw = raw_results[result_idx] if result_idx < len(raw_results) else None
+            result_idx += 1
+            if isinstance(raw, Exception):
+                out.append({"stream_id": "", "duplicate": False, "error": raw.__class__.__name__})
+                continue
+            if isinstance(raw, (list, tuple)) and raw:
+                stream_id = str(raw[0] or "")
+                duplicate = str(raw[1] if len(raw) > 1 else "0") == "1"
+            else:
+                stream_id = str(raw or "")
+                duplicate = False
+            out.append({"stream_id": stream_id, "duplicate": duplicate})
+        return out
+
     async def requeue_runner_command_from_processing(
         self,
         *,
@@ -160,9 +256,9 @@ class RedisStreamPublisher:
     ) -> dict[str, Any]:
         """Move one stale runner command from processing back to the live queue.
 
-        Windows runners claim list items with BRPOPLPUSH/LMOVE into
+        Windows runners dequeue with BRPOPLPUSH/LMOVE into
         `mt5:runner:{runner_id}:commands:processing`. PostgreSQL remains the
-        source of truth for deciding when a claimed command is stale; Redis is
+        source of truth for deciding when an in-flight command is stale; Redis is
         only scanned for the physical payload that must be requeued.
         """
         redis = await get_redis_write(decode_responses=True)

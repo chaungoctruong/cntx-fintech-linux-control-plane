@@ -620,7 +620,10 @@ def _slot_start_runtime_block_reason(
         inventory,
         keys=("ipc_ready", "python_ipc_ready", "mt5_ipc_ready"),
     )
-    if requires_ipc_ready is True and ipc_ready is False:
+    # Some Windows runners can cold-start MT5 from an empty slot. In that mode
+    # the slot is intentionally not IPC-ready yet, but the runner marks it as
+    # start_eligible/available and will create the runtime after START_BOT.
+    if requires_ipc_ready is True and ipc_ready is False and not runner_reported_start_ready:
         return "slot_not_ipc_ready"
     if requires_ipc_ready is True and ipc_ready is True:
         ipc_health_at = _first_value_from_dicts(

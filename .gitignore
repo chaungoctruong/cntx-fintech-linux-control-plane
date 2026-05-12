@@ -8,8 +8,10 @@
 
 # Logs
 *.log
-logs/
-**/logs/
+logs/*
+**/logs/*
+!logs/.gitkeep
+!logs/README.md
 hubbot.log
 worker_logs/
 debug-*.log
@@ -52,9 +54,8 @@ postgres_data/
 ops/artifacts/
 secrets/
 .cursor/
+.claude/
 backend-ctrader/
-bot-trading/
-bot-token/
 reports/
 
 # OS files
@@ -93,3 +94,4 @@ Thumbs.db
 **/__pycache__/
 **/.next/
 **/node_modules/
+.vercel

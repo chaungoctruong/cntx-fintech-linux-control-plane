@@ -1,26 +1,35 @@
-# Config Ownership
+# `config/` — Cấu hình handoff (Nginx mẫu)
 
-This directory holds the handoff-facing config artifacts for the active Linux control-plane workstream.
+Thư mục này chứa **một file cấu hình Nginx mẫu** dùng khi bàn giao hoặc ghép vào edge thật.
 
-## Canonical Nginx Files
+## File trong thư mục
 
-- `config/nginx-spider.conf`
-  - canonical single-node control-plane nginx sample for release manifests and handoff
-- `ops/ha/nginx/control-plane-edge.conf`
-  - canonical HA edge/include sample for the shared control-plane endpoint
+| File | Việc làm |
+|------|----------|
+| **`nginx-spider.conf`** | Mẫu reverse proxy / static cho control-plane một node (chỉnh `server_name`, upstream, TLS theo môi trường). |
 
-## Legacy / Local File Kept For Reference
+## File ở cấp monorepo (liên quan)
 
-- `../nginx.conf`
-  - local or legacy host-level example kept for operator context
-  - not the canonical release artifact
-  - do not treat it as the source of truth when preparing a clean handoff
+| File | Việc làm |
+|------|----------|
+| **`../nginx.conf`** | Baseline sample ở root repo — có thể là bản local/legacy; không tự động đồng bộ với `nginx-spider.conf`. |
 
-## Environment Baselines
+## Mẫu HA / edge khác
 
-- `../.env.linux.example`
-  - local `docker-compose.yml` compatibility baseline only
-- `../backend_ai/backend/.env.control-plane.example`
-  - active control-plane baseline for PM2/systemd style deployment
-- `../backend_ai/backend/.env.connect.example`
-  - frozen legacy broker/API adapter reference only
+Nếu team cần **mẫu HA** (multi-node, include split), đặt trong repo deploy riêng hoặc `docs/` theo manifest — **hiện không có** thư mục `ops/ha/` trong monorepo này.
+
+## File env runtime (tham chiếu)
+
+| File | Khi nào |
+|------|---------|
+| **`../.env`** | Docker Compose trên Linux — thường là file env chính. |
+| **`../backend_ai/backend/.env`** | Chạy backend trực tiếp trên host (không qua Compose). |
+| **`../frontend-v2/.env`** | Build Mini App (`NEXT_PUBLIC_*` nhúng lúc build). |
+
+Không commit secret. Không dán token/password vào README hay ticket công khai.
+
+## Quy tắc khi sửa cấu hình
+
+- Sửa đúng file mà dịch vụ thật đang `include` / mount.
+- Không chỉnh Nginx khi chỉ đổi credential DB/Redis — đổi env/service tương ứng.
+- Trước khi reload production: `nginx -t` (hoặc `docker compose config --quiet` cho compose).

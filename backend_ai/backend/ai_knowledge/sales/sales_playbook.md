@@ -1,5 +1,7 @@
 # CNTx Labs Sales Playbook
 
+> **Cho nhân viên:** Đoạn dưới viết **tiếng Việt không dấu** (để copy nhanh tin nhắn). Nội dung là **kịch bản sales** (không hứa lợi nhuận, không MLM) — đọc trước khi trả lời khách.
+
 CNTx labs tap trung vao van hanh bot trading nhu mot SaaS nghiem tuc:
 - Linux backend lam control plane.
 - Windows runner lam execution plane.

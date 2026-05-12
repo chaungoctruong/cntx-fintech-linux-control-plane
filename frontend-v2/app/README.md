@@ -5,11 +5,15 @@
 - Định nghĩa layout gốc, trang chủ và các nhánh trang theo sản phẩm.
 - Tách rõ phần điều hướng UI khỏi logic gọi API/điều phối dữ liệu.
 
-## Nhiệm vụ chính
+## Nhiệm vụ chính (inventory — khớp tree hiện tại)
+
 - `layout.tsx`: khung gốc, metadata, providers mức ứng dụng.
-- `page.tsx`: trang chính của frontend.
-- `bot/`, `wallet/`, `rewards/`, `rankbot/`: các phân vùng route theo tính năng.
+- `page.tsx`: trang chủ Mini App.
 - `globals.css`: style nền tảng toàn app.
+- `wallet/page.tsx`, `rewards/page.tsx`, `rankbot/page.tsx`: các tab/route theo tính năng.
+- `bot/page.tsx`: route bot chính.
+- `bot/control/page.tsx`: màn điều khiển MT5 trong Mini App.
+- `bot/ctrader/callback/page.tsx`: callback lane cTrader (legacy) nếu được dùng trong flow hiện tại.
 
 ## Hành vi kiến trúc bắt buộc
 - Route chỉ nên điều phối hiển thị và ghép component.

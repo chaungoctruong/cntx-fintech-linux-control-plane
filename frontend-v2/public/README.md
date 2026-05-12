@@ -5,10 +5,12 @@
 - Cung cấp logo, font, icon và asset không cần bundle động.
 - Giữ cấu trúc tài nguyên ổn định để tránh lỗi đường dẫn ở production.
 
-## Nhiệm vụ chính
+## Nhiệm vụ chính (đúng với tree hiện tại)
+
 - `cntx-labs-logo.svg`: logo dùng chung giao diện.
-- `fonts/`: font tĩnh phục vụ rendering nhất quán.
-- `.gitkeep`: giữ cấu trúc thư mục khi chưa có đủ asset.
+- `.gitkeep`: giữ thư mục trong git khi chưa thêm asset khác.
+
+Font hoặc asset lớn nếu có sau này: thêm vào đây và cập nhật lại README + đường dẫn trong CSS.
 
 ## Hành vi kiến trúc bắt buộc
 - Asset tĩnh cần đặt tên rõ nghĩa, tránh trùng và khó truy vết.

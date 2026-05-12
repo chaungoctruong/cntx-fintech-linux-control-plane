@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import asyncio
-import time
+import logging
+from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from pydantic import ValidationError
 
 from app.api.v2.control_plane_deps import service_dep, translate_control_plane_error
 from app.core.internal_auth import require_backend_api_key
@@ -11,7 +12,6 @@ from app.schemas.control_plane import (
     AccountVerificationResultRequest,
     CommandDeliveryUpdateRequest,
     GsAlgoBotStateRequest,
-    RunnerCommandClaimRequest,
     RunnerDrainRequest,
     RunnerEventRequest,
     RunnerHeartbeatRequest,
@@ -23,6 +23,7 @@ from app.services.control_plane_service import MT5ControlPlaneService
 from ops_telegram_alerts import schedule_error_alert
 
 router = APIRouter(tags=["mt5-runners"])
+log = logging.getLogger(__name__)
 
 
 _RUNNER_EVENT_TOP_LEVEL_PAYLOAD_KEYS = (
@@ -59,6 +60,32 @@ def _runner_event_payload_for_service(payload: RunnerEventRequest) -> dict:
     return data
 
 
+def _runner_event_validation_summary(raw_payload: Any) -> dict[str, Any]:
+    if not isinstance(raw_payload, dict):
+        return {"payload_type": type(raw_payload).__name__}
+    safe_keys = {
+        "event_id",
+        "event_type",
+        "runner_id",
+        "slot_id",
+        "account_id",
+        "deployment_id",
+        "bot_id",
+        "severity",
+        "trace_id",
+        "command_id",
+        "created_at",
+        "payload",
+    }
+    return {
+        "keys": sorted(str(key) for key in raw_payload.keys()),
+        "safe_values": {key: raw_payload.get(key) for key in safe_keys if key in raw_payload and key != "payload"},
+        "payload_keys": sorted(str(key) for key in (raw_payload.get("payload") or {}).keys())
+        if isinstance(raw_payload.get("payload"), dict)
+        else [],
+    }
+
+
 @router.post("/runner/register")
 async def register_runner(
     payload: RunnerRegisterRequest,
@@ -85,12 +112,20 @@ async def runner_heartbeat(
 
 @router.post("/runner/events")
 async def runner_events(
-    payload: RunnerEventRequest,
+    raw_payload: Any = Body(...),
     _: dict = Depends(require_backend_api_key),
     service: MT5ControlPlaneService = Depends(service_dep),
 ) -> dict:
     try:
+        payload = RunnerEventRequest.model_validate(raw_payload)
         return await service.ingest_runner_event(**_runner_event_payload_for_service(payload))
+    except ValidationError as exc:
+        log.warning(
+            "runner_event_validation_failed errors=%s summary=%s",
+            exc.errors(),
+            _runner_event_validation_summary(raw_payload),
+        )
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
     except Exception as exc:
         raise translate_control_plane_error(exc) from exc
 
@@ -202,28 +237,6 @@ async def runner_bootstrap(
 ) -> dict:
     request_base_url = f"{request.url.scheme}://{request.url.netloc}".rstrip("/")
     return service.runner_bootstrap(runner_id=runner_id or None, request_base_url=request_base_url)
-
-
-@router.post("/runner/commands/claim")
-async def claim_runner_command(
-    payload: RunnerCommandClaimRequest,
-    _: dict = Depends(require_backend_api_key),
-    service: MT5ControlPlaneService = Depends(service_dep),
-) -> dict:
-    command_types = [str(getattr(item, "value", item) or "").strip().upper() for item in payload.command_types]
-    deadline = time.monotonic() + max(0, int(payload.wait_timeout_sec or 0))
-    while True:
-        try:
-            result = await service.claim_runner_command(
-                runner_id=payload.runner_id,
-                slot_id=payload.slot_id,
-                command_types=command_types,
-            )
-        except Exception as exc:
-            raise translate_control_plane_error(exc) from exc
-        if not result.get("empty") or time.monotonic() >= deadline:
-            return result
-        await asyncio.sleep(min(1.0, max(0.1, deadline - time.monotonic())))
 
 
 @router.get("/runner/commands/{command_id}")

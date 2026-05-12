@@ -80,7 +80,7 @@ class Settings(BaseSettings):
     BACKEND_HOST: str = "127.0.0.1"
     BACKEND_PORT: int = 8001
     BACKEND_URL: str = ""
-    RUNNER_CONTROL_PLANE_URL: str = ""
+    RUNNER_CONTROL_PLANE_URL: str = ""  # Base URL runners use for short HTTP calls (bootstrap/register/heartbeat/events).
     APP_SECRET_KEY: str = "CHANGE_ME"
     APP_SECRET_OLD_KEYS: str = ""
     BACKEND_API_KEY: str = ""
@@ -130,7 +130,7 @@ class Settings(BaseSettings):
     ADMIN_TELEGRAM_IDS: str = ""
     MINIAPP_FULL_ACCESS_TELEGRAM_IDS: str = ""
     # Keep disabled until product is ready to expose the legal consent flow.
-    # When enabled, connect/start/token claim require the current terms version.
+    # When enabled, connect/start/token flows require the current terms version.
     MINIAPP_TERMS_ENFORCEMENT_ENABLED: bool = False
  
     GEMINI_API_KEY: str = ""
@@ -250,12 +250,23 @@ class Settings(BaseSettings):
     DEBUG_TRACE_FILE_ENABLED: bool = False
     DEBUG_TRACE_FILE_PATH: str = ""
     DEBUG_TRACE_FILE_MAX_BYTES: int = 2000000
+    REQUEST_LOG_ENABLED: bool = True
+    STRUCTURED_LOG_FILE_ENABLED: bool = True
+    CLIENT_TELEMETRY_ENABLED: bool = True
+    CLIENT_EVENT_LOG_PATH: str = ""
+    SLOW_REQUEST_MS_THRESHOLD: float = 1500.0
+    # Distributed login lease (spec §6.5). Default fully OFF — flip per the
+    # canary timeline. ENABLED toggles tracking; ENFORCED upgrades conflicts
+    # from telemetry-only WARN to a 409 LOGIN_BUSY response.
+    LOGIN_LEASE_ENABLED: bool = False
+    LOGIN_LEASE_ENFORCED: bool = False
+    LOGIN_LEASE_TTL_SEC: int = 60
     DRY_RUN: int = 1
     # Grace window after backend restart/deploy to avoid stale false negatives while streams/pings warm up.
     RUNTIME_RESTART_GRACE_SEC: int = 300
 
     DB_MODE: str = "postgres"
-    POSTGRES_USER: str = "truong_admin"
+    POSTGRES_USER: str = "spider_ai_app_test"
     POSTGRES_PASSWORD: str = ""
     POSTGRES_HOST: str = "127.0.0.1"
     POSTGRES_PORT: int = 5432
@@ -285,6 +296,7 @@ class Settings(BaseSettings):
     CONTROL_PLANE_STOP_RECONCILE_SEC: int = 30
     ACCOUNT_RUNTIME_START_GUARD_STALE_SEC: int = 180
     RUNNER_HEARTBEAT_WRITE_THROTTLE_SEC: float = 5.0
+    RUNNER_RECOMMENDED_TRANSPORT: str = "redis_queue"  # Bootstrap hint only; command transport is Redis queue.
     RUNNER_SLOT_PROJECTION_EVENT_LOOKBACK_SEC: int = 21600
     RUNNER_CATALOG_SYNC_TTL_SEC: int = 600
     MINIAPP_DASHBOARD_CACHE_TTL_SEC: float = 5.0
@@ -325,6 +337,9 @@ class Settings(BaseSettings):
     ZINGSERVER_MAX_CREATE_COST_VND: int = 2000000
     WEBHOOK_DELIVERY_ENABLED: bool = True
     WEBHOOK_DELIVERY_TICK_SEC: int = 5
+    # TradingView alert ingress: optional shared secret (header X-TradingView-Secret, query `secret`, or JSON field `secret`).
+    # Empty = no auth (dev only); set in production.
+    TRADINGVIEW_WEBHOOK_SECRET: str = ""
 
     model_config = SettingsConfigDict(
         env_file=str(_ENV_FILE),

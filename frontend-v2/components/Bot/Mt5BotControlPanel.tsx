@@ -1,22 +1,23 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Bot, Loader2, PauseCircle, Percent, PlayCircle, RefreshCcw, ServerCog, SlidersHorizontal, Trash2 } from "lucide-react";
+import { AlertTriangle, Bot, Loader2, PauseCircle, Pencil, PlayCircle, RefreshCcw, ServerCog, Trash2 } from "lucide-react";
 
 import {
   type MT5AccountItem,
 } from "@/lib/api";
 import { MINIAPP_RISK_WARNING_SHORT } from "@/components/Bot/MiniappTermsModal";
 import {
-  TRADING_CONFIG_DEFAULTS,
+  LOT_SIZE_DEFAULT,
   formatTokenExpiry,
+  getDeploymentLotSize,
   getAccountStatusPillClassName,
   getDeploymentStatusPillClassName,
   humanizeAccountStatus,
+  humanizeDeploymentProgress,
   humanizeDeploymentStatus,
   isMt5AccountReady,
   isTransitionalDeploymentStatus,
-  type TradingUnit,
 } from "@/components/Bot/mt5ControlUtils";
 import { useMt5BotControl } from "@/components/Bot/useMt5BotControl";
 import { useMt5BotActions } from "@/components/Bot/useMt5BotActions";
@@ -40,6 +41,11 @@ const selectClassName =
 const statusPillClassName =
   "shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.14em]";
 const CONTROL_PLANE_REFRESH_MS = 15000;
+// While a deployment is in transitional state (start_requested / starting /
+// stop_requested / queued) poll faster so the UI catches the moment Windows
+// runner flips to running/stopped instead of waiting up to 15s. 3s matches
+// the runner heartbeat cadence without becoming spammy at scale.
+const CONTROL_PLANE_TRANSITION_REFRESH_MS = 3000;
 type Mt5BotControlPanelProps = {
   selectedBroker: string;
   preferredBotName?: string;
@@ -60,13 +66,17 @@ export default function Mt5BotControlPanel({
   const [selectedAccountId, setSelectedAccountId] = useState<number | null>(null);
   const [selectedBotName, setSelectedBotName] = useState("");
   const [botTokenInput, setBotTokenInput] = useState("");
-  const [tradingLotSize, setTradingLotSize] = useState(TRADING_CONFIG_DEFAULTS.lotSize);
-  const [tradingStopLoss, setTradingStopLoss] = useState(TRADING_CONFIG_DEFAULTS.stopLoss);
-  const [tradingTakeProfit, setTradingTakeProfit] = useState(TRADING_CONFIG_DEFAULTS.takeProfit);
-  const [tradingUnit, setTradingUnit] = useState<TradingUnit>(TRADING_CONFIG_DEFAULTS.tradingUnit);
+  const [lotSizeInput, setLotSizeInput] = useState(LOT_SIZE_DEFAULT);
+  const [lotEditorOpen, setLotEditorOpen] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
   const pushNotice = useCallback((tone: NoticeTone, message: string) => {
     setNotice({ tone, message });
+  }, []);
+  const pushControlError = useCallback((message: string) => {
+    pushNotice("error", message);
+  }, [pushNotice]);
+  const clearNotice = useCallback(() => {
+    setNotice(null);
   }, []);
   const {
     accounts,
@@ -83,7 +93,7 @@ export default function Mt5BotControlPanel({
   } = useMt5BotControl({
     selectedBroker,
     selectedAccountId,
-    onError: (message) => pushNotice("error", message),
+    onError: pushControlError,
   });
   const {
     startingBot,
@@ -100,7 +110,7 @@ export default function Mt5BotControlPanel({
     loadState,
     mt5FullAccess,
     onNotice: pushNotice,
-    onClearNotice: () => setNotice(null),
+    onClearNotice: clearNotice,
     setBotTokenEntitlements,
   });
   const {
@@ -118,10 +128,8 @@ export default function Mt5BotControlPanel({
     backgroundPollingPaused,
     selectedBotDisplayName,
     selectedBotProfile,
-    showTradingConfig,
     activeBotEntitlement,
     botAccessReady,
-    tradingConfigDisabled,
     actionHint,
   } = useMt5BotDerivedState({
     selectedBroker,
@@ -140,6 +148,7 @@ export default function Mt5BotControlPanel({
     unlockingBotToken,
   });
   const deleteConfirmationActive = Boolean(selectedAccount && deleteConfirmAccountId === selectedAccount.id);
+  const lotControlDisabled = controlsLocked || selectedAccountHasActiveBot;
 
   const handleRefreshState = useCallback(async () => {
     setNotice(null);
@@ -162,11 +171,7 @@ export default function Mt5BotControlPanel({
       selectedAccountHasActiveBot,
       telegramUserHasOtherActiveBot,
       botAccessReady,
-      showTradingConfig,
-      tradingLotSize,
-      tradingStopLoss,
-      tradingTakeProfit,
-      tradingUnit,
+      lotSizeInput,
       latestDeployment,
       activeBotEntitlementId: activeBotEntitlement?.entitlement_id
         ? String(activeBotEntitlement.entitlement_id)
@@ -179,17 +184,13 @@ export default function Mt5BotControlPanel({
     botAccessReady,
     handleStartBot,
     latestDeployment,
+    lotSizeInput,
     mt5FullAccess,
     onRequireTerms,
     selectedAccount,
     selectedAccountHasActiveBot,
     selectedBot,
-    showTradingConfig,
     telegramUserHasOtherActiveBot,
-    tradingLotSize,
-    tradingStopLoss,
-    tradingTakeProfit,
-    tradingUnit,
   ]);
 
   const onStopBot = useCallback(async () => {
@@ -212,6 +213,8 @@ export default function Mt5BotControlPanel({
   useEffect(() => {
     setSelectedAccountId(null);
     setSelectedBotName("");
+    setLotSizeInput(LOT_SIZE_DEFAULT);
+    setLotEditorOpen(false);
     setNotice(null);
     void loadState({ silentErrors: true, includeBots: true });
   }, [loadState, selectedBroker]);
@@ -255,20 +258,43 @@ export default function Mt5BotControlPanel({
   useEffect(() => {
     setBotTokenInput("");
     setDeleteConfirmAccountId(null);
+    setLotEditorOpen(false);
   }, [selectedAccount?.id, selectedBot?.bot_name, setDeleteConfirmAccountId]);
+
+  useEffect(() => {
+    if (lotEditorOpen) {
+      return;
+    }
+    setLotSizeInput(getDeploymentLotSize(latestDeployment?.config_json) ?? LOT_SIZE_DEFAULT);
+  }, [latestDeployment?.config_json, latestDeployment?.id, lotEditorOpen, selectedAccount?.id, selectedBot?.bot_name]);
 
   useEffect(() => {
     if (backgroundPollingPaused) {
       return;
     }
+    const inTransition =
+      startingBot ||
+      stoppingBot ||
+      isTransitionalDeploymentStatus(latestDeployment?.status) ||
+      String(latestDeployment?.status || "").trim().toLowerCase() === "queued";
+    const refreshMs = inTransition
+      ? CONTROL_PLANE_TRANSITION_REFRESH_MS
+      : CONTROL_PLANE_REFRESH_MS;
     const intervalId = window.setInterval(() => {
       void loadState({ silentErrors: true, spinner: false, includeBots: false });
-    }, CONTROL_PLANE_REFRESH_MS);
+    }, refreshMs);
 
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [backgroundPollingPaused, loadState, selectedBroker]);
+  }, [
+    backgroundPollingPaused,
+    latestDeployment?.status,
+    loadState,
+    selectedBroker,
+    startingBot,
+    stoppingBot,
+  ]);
 
   return (
     <section className="rounded-3xl border border-cyan-300/15 bg-transparent p-4">
@@ -491,86 +517,46 @@ export default function Mt5BotControlPanel({
               </div>
             </div>
 
-            {showTradingConfig && (
-              <div className="rounded-2xl border border-cyan-300/15 bg-transparent p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex min-w-0 items-center gap-2 text-cyan-100">
-                    <SlidersHorizontal className="h-4 w-4 shrink-0" strokeWidth={1.9} />
-                    <p className="truncate text-[11px] font-semibold uppercase tracking-[0.16em]">
-                      Cấu hình giao dịch
-                    </p>
-                  </div>
-                  <div className="grid shrink-0 grid-cols-2 rounded-2xl border border-white/10 bg-transparent p-1">
-                    {(["price_distance", "points"] as TradingUnit[]).map((unit) => (
-                      <button
-                        key={unit}
-                        type="button"
-                        disabled={tradingConfigDisabled}
-                        onClick={() => setTradingUnit(unit)}
-                        className={`min-h-[34px] rounded-xl px-2 text-[11px] font-semibold transition disabled:cursor-not-allowed disabled:opacity-60 ${
-                          tradingUnit === unit
-                            ? "bg-cyan-300/15 text-cyan-50"
-                            : "text-cyber-muted hover:bg-black/[0.06] hover:text-white"
-                        }`}
-                      >
-                        {unit === "price_distance" ? "Giá" : "Point"}
-                      </button>
-                    ))}
-                  </div>
+            <div className="rounded-2xl border border-cyan-300/15 bg-transparent px-4 py-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-100">
+                    Lot
+                  </p>
+                  <p className="mt-1 truncate text-sm font-semibold text-white">
+                    {lotSizeInput}
+                  </p>
                 </div>
-
-                <div className="mt-3 grid gap-2 sm:grid-cols-3">
-                  <label className="space-y-2">
-                    <span className="flex items-center gap-1 text-xs font-semibold uppercase tracking-[0.14em] text-cyber-muted">
-                      <Percent className="h-4 w-4 text-cyan-100" strokeWidth={1.9} />
-                      Lot
-                    </span>
-                    <input
-                      type="number"
-                      min="0.01"
-                      step="0.01"
-                      inputMode="decimal"
-                      value={tradingLotSize}
-                      disabled={tradingConfigDisabled}
-                      onChange={(event) => setTradingLotSize(event.target.value)}
-                      className="w-full rounded-2xl border border-white/10 bg-transparent px-4 py-3 text-sm font-semibold text-white outline-none transition placeholder:text-cyber-muted/70 focus:border-cyan-300/40 focus:bg-black/[0.06] disabled:cursor-not-allowed disabled:opacity-60"
-                    />
-                  </label>
-                  <label className="space-y-2">
-                    <span className="text-xs font-semibold uppercase tracking-[0.14em] text-cyber-muted">
-                      Stop loss
-                    </span>
-                    <input
-                      type="number"
-                      min="0.01"
-                      step="0.01"
-                      inputMode="decimal"
-                      value={tradingStopLoss}
-                      placeholder={tradingUnit === "price_distance" ? "Ví dụ: 5 giá" : "Ví dụ: 5 point"}
-                      disabled={tradingConfigDisabled}
-                      onChange={(event) => setTradingStopLoss(event.target.value)}
-                      className="w-full rounded-2xl border border-white/10 bg-transparent px-4 py-3 text-sm font-semibold text-white outline-none transition placeholder:text-cyber-muted/70 focus:border-cyan-300/40 focus:bg-black/[0.06] disabled:cursor-not-allowed disabled:opacity-60"
-                    />
-                  </label>
-                  <label className="space-y-2">
-                    <span className="text-xs font-semibold uppercase tracking-[0.14em] text-cyber-muted">
-                      Take profit
-                    </span>
-                    <input
-                      type="number"
-                      min="0.01"
-                      step="0.01"
-                      inputMode="decimal"
-                      value={tradingTakeProfit}
-                      placeholder={tradingUnit === "price_distance" ? "Ví dụ: 5 giá" : "Ví dụ: 5 point"}
-                      disabled={tradingConfigDisabled}
-                      onChange={(event) => setTradingTakeProfit(event.target.value)}
-                      className="w-full rounded-2xl border border-white/10 bg-transparent px-4 py-3 text-sm font-semibold text-white outline-none transition placeholder:text-cyber-muted/70 focus:border-cyan-300/40 focus:bg-black/[0.06] disabled:cursor-not-allowed disabled:opacity-60"
-                    />
-                  </label>
-                </div>
+                <button
+                  type="button"
+                  aria-label={lotEditorOpen ? "Đóng chỉnh lot" : "Chỉnh lot"}
+                  title={lotEditorOpen ? "Đóng chỉnh lot" : "Chỉnh lot"}
+                  onClick={() => setLotEditorOpen((open) => !open)}
+                  disabled={lotControlDisabled}
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-cyan-300/25 bg-cyan-300/10 text-cyan-50 transition hover:border-cyan-300/40 hover:bg-cyan-300/15 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <Pencil className="h-4 w-4" strokeWidth={1.9} />
+                </button>
               </div>
-            )}
+
+              {lotEditorOpen && (
+                <label className="mt-3 block space-y-2">
+                  <span className="text-xs font-semibold uppercase tracking-[0.14em] text-cyber-muted">
+                    Số lot
+                  </span>
+                  <input
+                    type="number"
+                    min="0.01"
+                    step="0.01"
+                    inputMode="decimal"
+                    value={lotSizeInput}
+                    disabled={lotControlDisabled}
+                    onChange={(event) => setLotSizeInput(event.target.value)}
+                    className="w-full rounded-2xl border border-white/10 bg-transparent px-4 py-3 text-sm font-semibold text-white outline-none transition placeholder:text-cyber-muted/70 focus:border-cyan-300/40 focus:bg-black/[0.06] disabled:cursor-not-allowed disabled:opacity-60"
+                  />
+                </label>
+              )}
+            </div>
 
             {termsEnabled && (
               <div className="rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-50">
@@ -632,11 +618,30 @@ export default function Mt5BotControlPanel({
               </button>
             </div>
 
-            {actionHint && (
-              <div className="rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-100">
-                {actionHint}
-              </div>
-            )}
+            {(() => {
+              // Show the real Windows-runner sub-state during transitions so user
+              // sees genuine progress (executor_preparing, executor_ready, etc.)
+              // instead of a silent spinner. Falls back to actionHint when idle.
+              const progressText = (startingBot || stoppingBot || isTransitionalDeploymentStatus(latestDeployment?.status))
+                ? humanizeDeploymentProgress(latestDeployment ?? selectedDeployment)
+                : null;
+              if (progressText) {
+                return (
+                  <div className="flex items-center gap-2 rounded-2xl border border-cyan-300/20 bg-cyan-300/10 px-4 py-3 text-sm leading-6 text-cyan-100">
+                    <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.9} />
+                    <span>{progressText}</span>
+                  </div>
+                );
+              }
+              if (actionHint) {
+                return (
+                  <div className="rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-100">
+                    {actionHint}
+                  </div>
+                );
+              }
+              return null;
+            })()}
           </>
         )}
 

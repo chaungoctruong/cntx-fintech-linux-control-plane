@@ -17,6 +17,7 @@ SELECT
     runtime_env,
     checksum,
     source_path,
+    metadata_json,
     enabled,
     status
 FROM bot_catalog

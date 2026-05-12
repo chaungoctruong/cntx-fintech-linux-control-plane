@@ -1,3 +1,6 @@
+# Frozen pip tree snapshot / enterprise AI stack export for reference or specialized installs.
+# Canonical minimal runtime pins live in requirements.txt — do not assume this file matches Docker default.
+# Historical / verify before use: diff against `pip freeze` on your target environment before adopting.
 aio-pika==9.5.6
 aiormq==6.8.1
 annotated-types==0.7.0

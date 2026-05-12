@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+
+data/*
+!data/.gitkeep
+logs/*
+!logs/.gitkeep
+
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log

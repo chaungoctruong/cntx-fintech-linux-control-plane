@@ -520,7 +520,8 @@ class ControlPlaneAccountsMixin:
                     bc.default_config_path,
                     bc.runtime_env,
                     bc.checksum,
-                    bc.source_path
+                    bc.source_path,
+                    bc.metadata_json AS catalog_metadata
                 FROM bot_deployments d
                 JOIN broker_accounts a ON a.id = d.account_id
                 LEFT JOIN account_credentials_encrypted c ON c.account_id = a.id
@@ -548,4 +549,3 @@ class ControlPlaneAccountsMixin:
             ]
 
         return self._store._with_retry_read(_do)
-

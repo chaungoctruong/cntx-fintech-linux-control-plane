@@ -42,6 +42,14 @@ export function getFriendlyRuntimeReason(
     return "Không thể kết nối ổn định tới hạ tầng bot lúc này. Vui lòng thử lại sau ít phút.";
   }
 
+  if (
+    code.includes("invalid slot transition") ||
+    code.includes("worker_missing") ||
+    code.includes("worker missing")
+  ) {
+    return "Máy chạy MT5 vừa khởi động bot nhưng slot chưa giữ được phiên chạy. Vui lòng thử lại sau ít phút.";
+  }
+
   switch (code) {
     case "account_not_connected":
       return "Account này chưa sẵn sàng nên chưa thể xử lý thao tác bot.";
@@ -63,6 +71,7 @@ export function getFriendlyRuntimeReason(
       return "Hạ tầng chạy bot đang tạm bận hoặc gặp sự cố. Vui lòng thử lại sau ít phút.";
     case "mt5_runtime_maintenance":
     case "windows_runtime_unhealthy":
+    case "replacement_start_failed":
     case "runner_offline":
     case "runner_queue_backlog":
       return "Máy chạy MT5 đang khởi động lại phiên bot. Vui lòng thử lại sau ít phút.";
@@ -100,6 +109,8 @@ export function getFriendlyMt5ActionError(action: Mt5BotAction, error: unknown):
   }
 
   switch (code) {
+    case "telegram_init_data_missing":
+      return "Vui lòng mở trong Telegram Mini App để tiếp tục.";
     case "rate_limited":
       return "Bạn thao tác hơi nhanh. Vui lòng chờ vài giây rồi làm mới trạng thái.";
     case "account_not_found":
@@ -215,6 +226,12 @@ export function getDeploymentFailureMessage(
     if (deploymentStatus === "failed" || deploymentStatus === "blocked") {
       return (
         friendlyReason ?? "Bot chưa thể khởi động ổn định. Vui lòng thử lại sau ít phút."
+      );
+    }
+    if (deploymentStatus === "stopped" && deployment) {
+      return (
+        friendlyReason ??
+        "Bot vừa bật nhưng runtime dừng ngay sau đó. Vui lòng thử lại sau ít phút."
       );
     }
     if (healthStatus === "rejected" || healthStatus === "broken") {

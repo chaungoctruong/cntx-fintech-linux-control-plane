@@ -763,7 +763,22 @@ def _slot_inventory_projection_status(entry: dict[str, Any]) -> str | None:
         raw = _norm(entry.get(key)).lower()
         if not raw:
             continue
-        if raw in {"ready", "empty", "stopped"}:
+        if raw in {
+            "ready",
+            "empty",
+            "stopped",
+            "idle",
+            "warm",
+            "warm_idle",
+            "warm-idle",
+            "ipc_ready",
+            "ipc-ready",
+            "slot_ipc_ready",
+            "terminal_ready",
+            "terminal-ready",
+            "bridge_ready",
+            "bridge-ready",
+        }:
             return "ready"
         if raw in {"allocated", "active", "running", "verifying", "preparing", "stopping"}:
             return "allocated"
@@ -797,8 +812,9 @@ def _decorate_account_verification_projection(
         decorated["connect_status"] = "PENDING_RUNTIME_LOGIN"
         decorated["connection_state"] = "PENDING_RUNTIME_LOGIN"
         decorated["runtime_login_required"] = True
-        decorated["verification_state"] = "VERIFIED"
-        decorated["verification_ui_state"] = "VERIFIED"
+        # Credentials are on control-plane; MT5 proof is still pending (runner verify or START_BOT).
+        decorated["verification_state"] = "VERIFYING"
+        decorated["verification_ui_state"] = "SUBMITTED"
         account_status = "connected"
     start_ready = bool(
         decorated["verification_state"] == "VERIFIED"

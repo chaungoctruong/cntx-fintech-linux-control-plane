@@ -1,19 +1,26 @@
-# Local/dev compose only. Production deployment uses PM2/HA samples under
-# `ecosystem.config.js` and `ops/ha/`; do not treat this file as a production
+# Local/dev compose only. Production-style host deploy uses PM2 (`ecosystem.config.js`)
+# and runbooks in `docs/`; do not treat this file as a production
 # Postgres/Redis/security baseline.
+#
+# Env file selection (gitignored .env*):
+#   prod (default): docker compose up -d            → reads .env
+#   dev:            ENV_FILE=.env.dev docker compose up -d
+#                   or use the helper: ops/compose-dev.sh up -d
+# Both LOCAL_* substitution vars and container env_file resolve from the same
+# file, so swapping ENV_FILE swaps everything atomically.
 services:
   hubbot:
     build:
       context: .
       dockerfile: hubbot/Dockerfile
-    # Local compose compatibility only. `.env.linux.example` is safe dev
-    # defaults; optional `.env.linux` can override it on a workstation.
+    restart: unless-stopped
     env_file:
-      - .env.linux.example
-      - path: .env.linux
-        required: false
+      - ${ENV_FILE:-.env}
     volumes:
       - ./hubbot:/app/hubbot
+      - ./logs:/app/logs
+    ports:
+      - "8081:8081"
     depends_on:
       - db
       - redis
@@ -22,12 +29,9 @@ services:
     build:
       context: .
       dockerfile: backend_ai/Dockerfile
-    # Local compose compatibility only. `.env.linux.example` is safe dev
-    # defaults; optional `.env.linux` can override it on a workstation.
+    restart: unless-stopped
     env_file:
-      - .env.linux.example
-      - path: .env.linux
-        required: false
+      - ${ENV_FILE:-.env}
     ports:
       - "8001:8001"
     # Static export Next.js build local — backend mount /_next từ thư mục này.
@@ -35,10 +39,19 @@ services:
     #   -e NEXT_PUBLIC_BACKEND_URL=<https-tunnel> node:20-bookworm-slim
     #   bash -c "npm install && npm run build"
     volumes:
-      - ./frontend-v2/out:/app/frontend-v2/out:ro
+      - ./frontend-v2:/app/frontend-v2:ro
+      - ./logs:/app/logs
     depends_on:
-      - db
-      - redis
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8001/ready >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   db:
     image: postgres:16-alpine
@@ -49,15 +62,36 @@ services:
       POSTGRES_PASSWORD: ${LOCAL_POSTGRES_PASSWORD:-spider_dev_only_change_me}
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\" >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    # Local/dev Redis only. Production Redis must use the hardened package in
-    # `ops/redis/` with auth/TLS/persistence policy.
-    command: redis-server --appendonly yes
+    environment:
+      REDIS_PASSWORD: ${LOCAL_REDIS_PASSWORD:?set LOCAL_REDIS_PASSWORD in your env file}
+    # Product-style single-node Redis: auth + AOF persistence. Full production
+    # should still move Redis to managed/HA storage before real-money traffic.
+    command: sh -c 'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"'
+    ports:
+      # Windows runner reaches this through SSH tunnel:
+      # ssh -p 24700 -N -L 6380:127.0.0.1:6380 root@<backend-host>
+      - "${REDIS_HOST_BIND:-127.0.0.1}:${REDIS_HOST_PORT:-6380}:6379"
+      # Direct Windows runner test endpoint. Keep this bound to the backend
+      # public IP and restrict source IP in DOCKER-USER/firewall rules.
+      - "${REDIS_PUBLIC_HOST_BIND:-127.0.0.1}:${REDIS_PUBLIC_HOST_PORT:-6379}:6379"
     volumes:
       - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping 2>/dev/null | grep -q PONG"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
 volumes:
   pgdata:

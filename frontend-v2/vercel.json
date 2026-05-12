@@ -4,8 +4,20 @@
   "outputDirectory": "out",
   "rewrites": [
     {
+      "source": "/telegram/webhook",
+      "destination": "http://103.56.161.178:8081/telegram/webhook"
+    },
+    {
+      "source": "/ready",
+      "destination": "http://103.56.161.178:8001/ready"
+    },
+    {
+      "source": "/health",
+      "destination": "http://103.56.161.178:8001/health"
+    },
+    {
       "source": "/api/v2/:path*",
-      "destination": "http://103.72.96.241/api/v2/:path*"
+      "destination": "http://103.56.161.178:8001/api/v2/:path*"
     }
   ]
 }

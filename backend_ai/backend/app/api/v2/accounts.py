@@ -21,10 +21,11 @@ def _runtime_login_ready_account(account: dict) -> dict:
     response["has_credentials"] = True
     response["connect_status"] = CONNECT_PENDING_RUNTIME_LOGIN
     response["connection_state"] = CONNECT_PENDING_RUNTIME_LOGIN
-    response["verification_state"] = "VERIFIED"
-    response["verification_ui_state"] = "VERIFIED"
+    # DB row is pending_verification until runner proves MT5 login (verify job or START_BOT).
+    response["verification_state"] = "VERIFYING"
+    response["verification_ui_state"] = "SUBMITTED"
     response["runtime_login_required"] = True
-    response["next_action"] = "START_BOT"
+    response["next_action"] = "REQUEST_VERIFY_OR_START_BOT"
     return response
 
 
@@ -52,9 +53,9 @@ async def connect_account(
         "status": "connected",
         "connect_status": CONNECT_PENDING_RUNTIME_LOGIN,
         "connection_state": CONNECT_PENDING_RUNTIME_LOGIN,
-        "verification_state": "VERIFIED",
-        "verification_ui_state": "VERIFIED",
-        "next_action": "START_BOT",
+        "verification_state": "VERIFYING",
+        "verification_ui_state": "SUBMITTED",
+        "next_action": "REQUEST_VERIFY_OR_START_BOT",
         "runtime_login_required": True,
         "account": account_response,
     }

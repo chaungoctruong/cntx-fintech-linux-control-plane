@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cntx.labs/spider/bot-trading/gsalgovip/config.schema.json",
+  "title": "GsAlgoVIP Config Schema",
+  "description": "Public, secret-free configuration contract for the GsAlgoVIP bot package. Secrets (WEBHOOK_SECRET, MT5_PASSWORD, TELEGRAM_*) MUST come from platform runtime context, never from this file.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "lot_size",
+    "stop_loss",
+    "take_profit",
+    "symbol",
+    "timeframe",
+    "risk_mode",
+    "dca_enabled"
+  ],
+  "properties": {
+    "lot_size": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 1.0,
+      "description": "Default lot size per executed signal."
+    },
+    "stop_loss": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 100000,
+      "description": "Fallback stop-loss distance in points when TradingView signal does not specify one."
+    },
+    "take_profit": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "maximum": 100000,
+      "description": "Fallback take-profit distance in points when TradingView signal does not specify one."
+    },
+    "symbol": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "description": "Primary symbol (e.g., XAUUSD). Broker-specific suffix mapping goes under symbols.symbol_map."
+    },
+    "timeframe": {
+      "type": "string",
+      "enum": ["M1", "M5", "M15", "M30", "H1", "H4", "D1"],
+      "description": "Expected TradingView timeframe. Risk guard currently enforces M1."
+    },
+    "risk_mode": {
+      "type": "string",
+      "enum": ["conservative", "normal", "aggressive"],
+      "description": "Hint for backend risk gating; the package itself does not interpret this freely."
+    },
+    "dca_enabled": {
+      "type": "boolean",
+      "description": "Must remain false unless platform risk_contract is updated to allow DCA."
+    },
+    "trading": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "trading_enabled": { "type": "boolean" },
+        "dry_run": { "type": "boolean" },
+        "poll_interval_sec": { "type": "number", "minimum": 0.2, "maximum": 30.0 }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_spread_points": { "type": "number", "minimum": 0 },
+        "max_entry_drift_points": { "type": "number", "minimum": 0 },
+        "max_slippage_points": { "type": "integer", "minimum": 0, "maximum": 200 }
+      }
+    },
+    "symbols": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1,
+          "maxItems": 1
+        },
+        "symbol_map": {
+          "type": "object",
+          "patternProperties": {
+            "^[A-Z0-9]{1,16}$": { "type": "string", "minLength": 1, "maxLength": 32 }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "telegram_enabled": { "type": "boolean" }
+      }
+    },
+    "platform": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default_webhook_port": { "type": "integer", "minimum": 1024, "maximum": 65535 },
+        "needs_inbound_webhook": { "type": "boolean" }
+      }
+    }
+  }
+}

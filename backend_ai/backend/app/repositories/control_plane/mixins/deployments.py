@@ -653,6 +653,114 @@ class ControlPlaneDeploymentsMixin:
 
         return self._store._with_retry_locked(_do)
 
+    def get_deployment_intent_state(self, *, deployment_id: int) -> Optional[dict[str, Any]]:
+        """Cheap single-row read used by the dispatch-time guard.
+
+        Returns the latest status / desired_state / intent_seq for a deployment so
+        callers can drop a stale START_BOT before publishing to Redis.
+        """
+
+        def _do(con: Any, cur: Any) -> Optional[dict[str, Any]]:
+            cur.execute(
+                """
+                SELECT id, account_id, status, desired_state, is_active, intent_seq
+                FROM bot_deployments
+                WHERE id = %s
+                """,
+                (int(deployment_id),),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+        return self._store._with_retry_read(_do)
+
+    def bump_deployment_intent_seq(self, *, deployment_id: int) -> Optional[int]:
+        """Increment intent_seq for a deployment and return the new value."""
+
+        def _do(con: Any, cur: Any) -> Optional[int]:
+            cur.execute(
+                """
+                UPDATE bot_deployments
+                SET intent_seq = intent_seq + 1,
+                    updated_at = NOW()
+                WHERE id = %s
+                RETURNING intent_seq
+                """,
+                (int(deployment_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            value = row[0] if not isinstance(row, dict) else row.get("intent_seq")
+            try:
+                return int(value)
+            except Exception:
+                return None
+
+        return self._store._with_retry_locked(_do)
+
+    def bump_account_intent_seq(self, *, account_id: int) -> list[dict[str, Any]]:
+        """Increment intent_seq across every non-terminal deployment for an account.
+
+        Returns rows with id + new intent_seq so callers can correlate per-deployment.
+        Used on user-driven OFF/cancel to invalidate any in-flight START issued before
+        the latest intent.
+        """
+
+        def _do(con: Any, cur: Any) -> list[dict[str, Any]]:
+            cur.execute(
+                """
+                UPDATE bot_deployments
+                SET intent_seq = intent_seq + 1,
+                    updated_at = NOW()
+                WHERE account_id = %s
+                  AND status NOT IN ('stopped', 'failed', 'blocked')
+                RETURNING id, intent_seq, status, desired_state
+                """,
+                (int(account_id),),
+            )
+            return [dict(row) for row in (cur.fetchall() or [])]
+
+        return self._store._with_retry_locked(_do)
+
+    def cancel_queued_replacements_for_account(
+        self,
+        *,
+        account_id: int,
+        reason: str,
+    ) -> list[dict[str, Any]]:
+        """Mark every queued replacement deployment for an account as stopped.
+
+        Triggered when the user presses OFF: the previous deployment goes to
+        stop_requested, and any queued replacement waiting for the previous to
+        finish stopping must be cancelled too — otherwise BOT_STOPPED will fire
+        a START_BOT the user no longer wants.
+        """
+        reason_s = _norm(reason) or "cancelled_by_user_stop"
+
+        def _do(con: Any, cur: Any) -> list[dict[str, Any]]:
+            cur.execute(
+                """
+                UPDATE bot_deployments
+                SET status = 'stopped',
+                    desired_state = 'stopped',
+                    is_active = FALSE,
+                    health_status = 'replacement_cancelled_by_user_stop',
+                    last_error = %s,
+                    stopped_at = COALESCE(stopped_at, NOW()),
+                    intent_seq = intent_seq + 1,
+                    updated_at = NOW()
+                WHERE account_id = %s
+                  AND status = 'queued'
+                  AND desired_state = 'running'
+                RETURNING id, account_id, runner_id, slot_id, intent_seq
+                """,
+                (reason_s, int(account_id)),
+            )
+            return [dict(row) for row in (cur.fetchall() or [])]
+
+        return self._store._with_retry_locked(_do)
+
     def update_deployment_status(
         self,
         *,
@@ -1083,6 +1191,37 @@ class ControlPlaneDeploymentsMixin:
                     WHERE id = %s
                     """,
                     (deployment_id_i,),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE bot_deployments AS d
+                    SET last_heartbeat_at = NOW(),
+                        health_status = CASE
+                            WHEN d.health_status IS NULL OR d.health_status = '' THEN 'running'
+                            WHEN LOWER(d.health_status) IN ('stale', 'offline', 'degraded', 'starting') THEN 'running'
+                            ELSE d.health_status
+                        END,
+                        updated_at = NOW()
+                    FROM bot_catalog AS c
+                    WHERE c.bot_code = d.bot_code
+                      AND d.runner_id = %s
+                      AND (%s IS NULL OR d.slot_id = %s)
+                      AND d.status = 'running'
+                      AND d.desired_state = 'running'
+                      AND COALESCE(d.is_active, FALSE) = TRUE
+                      AND LOWER(COALESCE(
+                          NULLIF(BTRIM(c.runtime_env->>'bot_type'), ''),
+                          NULLIF(BTRIM(c.resource_hints->>'bot_type'), ''),
+                          ''
+                      )) = 'backend_webhook_signal'
+                      AND LOWER(COALESCE(
+                          NULLIF(BTRIM(c.runtime_env->>'windows_role'), ''),
+                          NULLIF(BTRIM(c.resource_hints->>'windows_role'), ''),
+                          ''
+                      )) = 'mt5_executor_only'
+                    """,
+                    (runner_id_s, slot_id_s, slot_id_s),
                 )
             if account_id_i is not None:
                 cur.execute(

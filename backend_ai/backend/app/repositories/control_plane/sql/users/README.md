@@ -1,9 +1,17 @@
-# Users SQL
+# `users/` — SQL metadata user
 
-## Nhiệm vụ
-- Chứa SQL đọc/cập nhật metadata user.
-- Metadata được merge theo JSONB phục vụ feature flags và profile runtime.
+Đọc/ghi **`metadata_json`** user (feature flags, profile phụ) — merge JSONB, không thay thế bảng auth chính.
+
+## File `.sql` (inventory)
+
+- `get_user_metadata.sql`
+- `update_user_metadata.sql`
+
+## Gắn với Python
+
+- Mixin users / service user — tìm `load_sql("users/`.
 
 ## Lưu ý an toàn
-- Cập nhật metadata cần giữ cơ chế merge, tránh overwrite không chủ đích.
-- Query users phải giữ filter theo `id` rõ ràng.
+
+- Update phải **merge** JSONB đúng semantics hiện tại — tránh overwrite toàn bộ nhánh khác đang dùng.
+- Query theo `id` user rõ ràng.

@@ -132,8 +132,8 @@ class ControlPlaneRunnersSlotsMixin:
                 str(int(account_id)),
             ),
         )
-        claimed = cur.fetchone()
-        if not claimed:
+        reserved_row = cur.fetchone()
+        if not reserved_row:
             return None
 
         cur.execute(

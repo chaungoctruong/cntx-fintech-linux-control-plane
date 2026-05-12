@@ -33,10 +33,12 @@ from .api.v2.deployments import router as deployments_v2_router
 from .api.v2.runners import router as runners_v2_router
 from .api.v2.miniapp import router as miniapp_v2_router, mini_router as mini_v2_router
 from .api.v2.system import router as system_v2_router
+from .api.v2.client_events import router as client_events_v2_router
 from .api.v2.me import router as me_v2_router
 from .api.v2.public_status import router as public_status_v2_router
 from .api.v2.streams import router as streams_v2_router
 from .api.v2.admin import router as admin_v2_router
+from .api.v2.tradingview_webhook import router as tradingview_webhook_v2_router
 from .api.v2.error_catalog import (
     ControlPlaneHTTPException,
     control_plane_http_exception_handler,
@@ -62,7 +64,11 @@ from .events.command_delivery_reconciler import CommandDeliveryReconcilerService
 from .events.runner_event_consumer import RunnerEventConsumerService
 from app.core.log_filters import install_control_plane_access_log_filter
 from app.core.redis_client import close_redis, get_redis_write
+from app.core.error_log import log_agent_failure
+from app.core.log_context import get_request_id
 from app.core.log_hygiene import cleanup_debug_trace_file, log_periodic, noisy_log_cooldown_sec
+from app.core.request_logging import RequestContextMiddleware
+from app.logging_config import configure_service_logging
 
 # Optional clean shutdown hooks - fallback no-op nếu file cũ chưa có
 try:
@@ -104,9 +110,11 @@ configure_telegram_alerts(
     service_name="CNTX-BACKEND",
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+configure_service_logging(
+    "api",
+    subdir="backend",
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    mirror_logger_names=("uvicorn", "uvicorn.access"),
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -1002,18 +1010,32 @@ async def catch_exceptions_middleware(request: Request, call_next):
     try:
         return await call_next(request)
     except Exception as exc:
+        request_id = get_request_id() or ""
         schedule_error_alert(
             area="Backend API",
             summary="API backend gặp lỗi khi xử lý yêu cầu.",
             exc=exc,
             path=f"{request.method} {request.url.path}",
             impact="Người dùng có thể thấy thao tác thất bại trong Mini App.",
-            action="Kiểm tra log backend theo đường dẫn và thời điểm cảnh báo.",
+            action=f"Grep request_id={request_id or '-'} trong logs/backend/api.jsonl để xem stack + context đầy đủ.",
             alert_key=f"backend_api_unhandled:{request.method}:{request.url.path}:{type(exc).__name__}",
             cooldown_sec=180,
         )
 
-        log.exception("Unhandled exception at %s %s: %s", request.method, request.url.path, exc)
+        log_agent_failure(
+            log,
+            "request.unhandled_exception",
+            error=exc,
+            error_code="backend_unhandled_exception",
+            operation="http_request",
+            hint=(
+                f"A request raised past all handlers. Grep `request_id={request_id or '-'}` in "
+                "`logs/backend/api.jsonl` to see the full stack + any structured events emitted "
+                "before the crash. Telegram alert dispatched with the same context."
+            ),
+            http_method=request.method,
+            http_path=request.url.path,
+        )
 
         return JSONResponse(
             status_code=500,
@@ -1021,7 +1043,9 @@ async def catch_exceptions_middleware(request: Request, call_next):
                 "success": False,
                 "message": "Hệ thống đang xử lý sự cố. Đội ngũ kỹ thuật đã được thông báo.",
                 "error_type": type(exc).__name__,
+                "request_id": request_id or None,
             },
+            headers={"X-Request-ID": request_id} if request_id else None,
         )
 
 
@@ -1046,6 +1070,12 @@ async def reject_embedded_null_byte_path(request: Request, call_next):
     return await call_next(request)
 
 
+# Request context + access log middleware. Registered last so it ends up at the
+# outermost layer and assigns request_id BEFORE any other middleware runs.
+if bool(getattr(settings, "REQUEST_LOG_ENABLED", True)):
+    app.add_middleware(RequestContextMiddleware)
+
+
 # Routers
 app.include_router(public_v2_router, prefix="/api/v2")
 app.include_router(wallet_v2_router, prefix="/api/v2")
@@ -1057,10 +1087,12 @@ app.include_router(runners_v2_router, prefix="/api/v2")
 app.include_router(miniapp_v2_router, prefix="/api/v2")
 app.include_router(mini_v2_router, prefix="/api/v2")
 app.include_router(system_v2_router, prefix="/api/v2")
+app.include_router(client_events_v2_router, prefix="/api/v2")
 app.include_router(me_v2_router, prefix="/api/v2")
 app.include_router(public_status_v2_router, prefix="/api/v2")
 app.include_router(streams_v2_router, prefix="/api/v2")
 app.include_router(admin_v2_router, prefix="/api/v2")
+app.include_router(tradingview_webhook_v2_router, prefix="/api/v2")
 
 # Giữ prefix /ai cho hubbot gọi /ai/chat
 app.include_router(ai_router, prefix="/ai", tags=["AI Integration"])

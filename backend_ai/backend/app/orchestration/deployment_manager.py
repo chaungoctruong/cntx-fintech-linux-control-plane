@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
 from app.bot_catalog.mt5_repository_loader import MT5BotCatalogLoader
+from app.core.error_log import log_agent_event
 from app.core.redis_client import get_resolved_redis_write_url
 from app.events.command_router import CommandRouterService
 from app.models.control_plane import CommandType
@@ -18,6 +20,8 @@ from app.risk.orchestration_policy import (
     validate_start_request,
 )
 from app.settings import settings
+
+_intent_log = logging.getLogger("runner.command.dispatch")
 
 
 def _normalize_deployment_mode(mode: str | None) -> str:
@@ -45,6 +49,59 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
+
+
+_BOT_EXECUTION_CONTRACT_TEXT_KEYS = (
+    "bot_type",
+    "execution_owner",
+    "windows_role",
+    "tradingview_webhook_owner",
+)
+_BOT_EXECUTION_CONTRACT_BOOL_KEYS = ("requires_executor_slot",)
+
+
+def _contract_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _iter_contract_sources(*sources: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        out.append(source)
+        for nested_key in ("execution_contract", "manifest_contract", "bot_contract"):
+            nested = source.get(nested_key)
+            if isinstance(nested, dict):
+                out.append(nested)
+        metadata = source.get("metadata") or source.get("metadata_json")
+        if isinstance(metadata, dict):
+            out.extend(_iter_contract_sources(metadata))
+    return out
+
+
+def _bot_execution_contract(*sources: Any) -> dict[str, Any]:
+    contract: dict[str, Any] = {}
+    for source in _iter_contract_sources(*sources):
+        for key in _BOT_EXECUTION_CONTRACT_TEXT_KEYS:
+            value = str(source.get(key) or "").strip()
+            if value and key not in contract:
+                contract[key] = value
+        for key in _BOT_EXECUTION_CONTRACT_BOOL_KEYS:
+            if key in source and key not in contract:
+                contract[key] = _contract_bool(source.get(key))
+    return contract
+
+
+def _merge_bot_execution_contract(target: dict[str, Any], contract: dict[str, Any]) -> dict[str, Any]:
+    for key, value in contract.items():
+        if value is not None:
+            target[key] = value
+    return target
 
 
 def _runner_queue_depths(runner_ids: list[str]) -> dict[str, dict[str, int]]:
@@ -166,21 +223,43 @@ class DeploymentManagerService:
         sticky_reused: bool,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        resource_hints = dict(bot.get("resource_hints") or {})
+        runtime_env = dict(bot.get("runtime_env") or {})
+        risk_profile = dict(bot.get("risk_profile") or {})
+        execution_contract = _bot_execution_contract(
+            bot,
+            resource_hints,
+            runtime_env,
+            risk_profile,
+            bot.get("metadata"),
+        )
+        _merge_bot_execution_contract(resource_hints, execution_contract)
+        _merge_bot_execution_contract(runtime_env, execution_contract)
+
         payload = {
             "account_id": int(account["id"]),
             "mode": mode,
             "broker": account.get("broker"),
             "server": account.get("server"),
             "login": account.get("login"),
+            "bot_code": bot.get("bot_code") or bot.get("bot_id") or deployment.get("bot_code"),
             "bot_name": bot.get("bot_name") or deployment.get("bot_name"),
             "bot_version": bot.get("version") or "",
             "runtime_entry": bot.get("runtime_entry") or "",
             "profile_class": bot.get("profile_class") or deployment.get("profile_class") or "",
-            "resource_hints": bot.get("resource_hints") or {},
+            "resource_hints": resource_hints,
             "config_contract_version": TRADING_CONFIG_SCHEMA_VERSION,
             "config": deployment_config,
             "sticky_reused": sticky_reused,
         }
+        payload.update(execution_contract)
+        required_params = list(bot.get("required_params") or [])
+        if required_params:
+            payload["required_params"] = required_params
+        if runtime_env:
+            payload["runtime_env"] = runtime_env
+        if risk_profile:
+            payload["risk_profile"] = risk_profile
         if extra:
             payload.update(dict(extra))
         return payload
@@ -248,6 +327,13 @@ class DeploymentManagerService:
             runner_id=runner_id,
             slot_id=slot_id,
         ) or blocker
+        # Account-level intent bump so any prior in-flight START on this account
+        # is recognized as stale by the dispatch guard. Snapshot the replacement
+        # deployment's resulting seq + the previous deployment's seq onto the
+        # STOP payload so subsequent transitions can correlate.
+        seq_snapshot = {int(row["id"]): int(row.get("intent_seq") or 0) for row in self._repo.bump_account_intent_seq(account_id=int(account["id"]))}
+        replacement_intent_seq = seq_snapshot.get(int(queued["id"]))
+        previous_intent_seq = seq_snapshot.get(int(previous_deployment_id))
         trace_id = f"{queued.get('trace_id') or uuid.uuid4().hex}:stop_previous"
         try:
             command = await self._command_router.dispatch(
@@ -264,6 +350,8 @@ class DeploymentManagerService:
                     "replacement_deployment_id": int(queued["id"]),
                     "previous_deployment_id": previous_deployment_id,
                     "restart_policy": "stop_previous_then_start_replacement",
+                    "replacement_intent_seq": replacement_intent_seq,
+                    "intent_seq": previous_intent_seq,
                 },
                 trace_id=trace_id,
             )
@@ -352,6 +440,75 @@ class DeploymentManagerService:
             slot_id=decision.slot_id,
             sticky=True,
         )
+        # Latest-intent guard #1: the user may have pressed OFF while we were
+        # waiting for the previous deployment to stop. Re-read state and bail
+        # before we activate (which would flip desired_state back to running).
+        latest = self._repo.get_deployment_intent_state(deployment_id=int(queued["id"]))
+        latest_desired = str((latest or {}).get("desired_state") or "").strip().lower()
+        latest_status = str((latest or {}).get("status") or "").strip().lower()
+        if latest_desired != "running" or latest_status != "queued":
+            log_agent_event(
+                _intent_log,
+                logging.INFO,
+                "runner.command.dispatch.dropped",
+                hint="Skipping start_replacement: user already flipped the queued deployment off (or it isn't queued anymore).",
+                operation="start_replacement",
+                outcome="dropped",
+                dispatch_decision="dropped",
+                drop_reason="desired_state_stopped" if latest_desired != "running" else "replacement_not_queued",
+                command_type=CommandType.START_BOT.value,
+                account_id=int(queued["account_id"]),
+                deployment_id=int(queued["id"]),
+                trace_id=stop_command.get("trace_id"),
+                desired_state=latest_desired or None,
+                deployment_status=latest_status or None,
+                stop_command_id=stop_command.get("command_id"),
+            )
+            self._repo.insert_deployment_audit(
+                deployment_id=int(queued["id"]),
+                action="deployment.replacement_start_dropped",
+                payload={
+                    "deployment_id": int(queued["id"]),
+                    "account_id": int(queued["account_id"]),
+                    "stop_command_id": stop_command.get("command_id"),
+                    "drop_reason": "desired_state_stopped" if latest_desired != "running" else "replacement_not_queued",
+                    "desired_state": latest_desired or None,
+                    "deployment_status": latest_status or None,
+                },
+                result="dropped",
+                trace_id=stop_command.get("trace_id"),
+            )
+            return None
+
+        # Latest-intent guard #2: the STOP that triggered us captured a snapshot
+        # of intent_seq when the replacement was queued; if the account has been
+        # touched again since (eg. OFF then ON), drop and let the newer intent
+        # drive the flow.
+        recorded_seq = (stop_command.get("payload_json") or {}).get("replacement_intent_seq")
+        current_seq = (latest or {}).get("intent_seq")
+        if recorded_seq is not None and current_seq is not None:
+            try:
+                if int(current_seq) > int(recorded_seq):
+                    log_agent_event(
+                        _intent_log,
+                        logging.INFO,
+                        "runner.command.dispatch.dropped",
+                        hint="Skipping start_replacement: intent_seq advanced since the STOP was issued.",
+                        operation="start_replacement",
+                        outcome="dropped",
+                        dispatch_decision="dropped",
+                        drop_reason="stale_intent",
+                        command_type=CommandType.START_BOT.value,
+                        account_id=int(queued["account_id"]),
+                        deployment_id=int(queued["id"]),
+                        intent_seq=int(recorded_seq),
+                        latest_seq=int(current_seq),
+                        stop_command_id=stop_command.get("command_id"),
+                    )
+                    return None
+            except Exception:
+                pass
+
         start_trace_id = f"{stop_command.get('trace_id') or uuid.uuid4().hex}:start_replacement"
         updated = self._repo.activate_queued_deployment_start(
             deployment_id=int(queued["id"]),
@@ -376,6 +533,7 @@ class DeploymentManagerService:
                 "restart_policy": "stop_previous_then_start_replacement",
                 "previous_deployment_id": int(previous_deployment.get("id") or stop_command.get("deployment_id") or 0),
                 "replacement_stop_command_id": stop_command.get("command_id"),
+                "intent_seq": int(updated.get("intent_seq") or 0),
             },
         )
         command = await self._command_router.dispatch(
@@ -496,7 +654,16 @@ class DeploymentManagerService:
             trace_id=trace_id,
             mode=deployment_mode,
         )
+        # Capture the resulting intent_seq onto the START_BOT payload so the
+        # dispatch guard and the runner can correlate against the user's
+        # latest intent (see CommandRouterService.dispatch).
+        new_seq = self._repo.bump_deployment_intent_seq(deployment_id=int(deployment["id"]))
+        if new_seq is not None:
+            deployment["intent_seq"] = new_seq
 
+        start_extra = dict(start_payload_extra or {})
+        if "intent_seq" not in start_extra and new_seq is not None:
+            start_extra["intent_seq"] = int(new_seq)
         payload = self._start_payload(
             account=account,
             bot=bot or {},
@@ -504,7 +671,7 @@ class DeploymentManagerService:
             deployment_config=deployment_config,
             mode=deployment_mode,
             sticky_reused=bool(decision.sticky_reused),
-            extra=start_payload_extra,
+            extra=start_extra,
         )
         command = await self._command_router.dispatch(
             command_type=CommandType.START_BOT,
@@ -532,36 +699,103 @@ class DeploymentManagerService:
     async def stop_deployment(self, *, deployment: dict[str, Any], reason: str | None = None) -> dict[str, Any]:
         if not deployment:
             raise ValueError("deployment_not_found")
+        account_id = int(deployment["account_id"])
+        deployment_id = int(deployment["id"])
         if _is_stopped_like_deployment(deployment):
+            # Still honor the user OFF intent: cancel any queued replacement and
+            # fail any in-flight START for the account so a stale START_BOT can
+            # not race in after the no-op response.
+            cancelled = self._repo.cancel_queued_replacements_for_account(
+                account_id=account_id,
+                reason=str(reason or "user_stop_request"),
+            )
+            failed_account_starts = self._repo.fail_pending_start_commands_for_account(
+                account_id=account_id,
+                reason="start_command_superseded_by_user_stop_account",
+            )
+            log_agent_event(
+                _intent_log,
+                logging.INFO,
+                "deployment.stop.noop_with_intent_cleanup",
+                hint="Deployment already stopped; still invalidated queued replacements and pending starts on the account.",
+                operation="user_stop",
+                outcome="noop",
+                account_id=account_id,
+                deployment_id=deployment_id,
+                cancelled_replacement_ids=[row.get("id") for row in cancelled],
+                failed_pending_start_commands=int(failed_account_starts),
+                reason="deployment_already_stopped",
+            )
             return {
                 "deployment": deployment,
                 "command": None,
                 "noop": True,
                 "reason": "deployment_already_stopped",
+                "cancelled_replacement_ids": [row.get("id") for row in cancelled],
+                "failed_pending_start_commands": int(failed_account_starts),
             }
+        # OFF — flip desired_state and bump intent_seq before publishing the
+        # STOP so any concurrent dispatch reads the latest intent.
         updated = self._repo.update_deployment_status(
-            deployment_id=int(deployment["id"]),
+            deployment_id=deployment_id,
             status="stop_requested",
             desired_state="stopped",
             is_active=True,
             health_status="stop_requested",
         )
+        new_seq = self._repo.bump_deployment_intent_seq(deployment_id=deployment_id)
+        # Cancel any queued replacement waiting for this deployment to stop —
+        # this is the core fix for the start_replacement bug: without it, the
+        # BOT_STOPPED ack for the previous deployment fires START_BOT on the
+        # replacement even though the user just pressed OFF.
+        cancelled = self._repo.cancel_queued_replacements_for_account(
+            account_id=account_id,
+            reason=str(reason or "user_stop_request"),
+        )
         command = await self._command_router.dispatch(
             command_type=CommandType.STOP_BOT,
-            account_id=int(deployment["account_id"]),
-            deployment_id=int(deployment["id"]),
+            account_id=account_id,
+            deployment_id=deployment_id,
             bot_id=str(deployment.get("bot_code") or ""),
             runner_id=str(deployment.get("runner_id") or ""),
             slot_id=str(deployment.get("slot_id") or ""),
             priority=100,
-            payload={"reason": reason or "user_stop_request"},
+            payload={
+                "reason": reason or "user_stop_request",
+                "intent_seq": int(new_seq) if new_seq is not None else None,
+            },
             trace_id=str(deployment.get("trace_id") or uuid.uuid4().hex),
         )
+        # Account-wide pending START failure must run AFTER the new STOP is
+        # queued so the runner gets the OFF intent first and so any concurrent
+        # dispatch sees the freshly-failed rows.
         self._repo.fail_pending_start_commands_for_deployment(
-            deployment_id=int(deployment["id"]),
+            deployment_id=deployment_id,
             reason="start_command_superseded_by_user_stop",
         )
-        return {"deployment": updated, "command": command}
+        failed_account_starts = self._repo.fail_pending_start_commands_for_account(
+            account_id=account_id,
+            reason="start_command_superseded_by_user_stop_account",
+        )
+        log_agent_event(
+            _intent_log,
+            logging.INFO,
+            "deployment.stop.intent_propagated",
+            hint="User OFF propagated to queued replacements and pending START commands across the account.",
+            operation="user_stop",
+            outcome="propagated",
+            account_id=account_id,
+            deployment_id=deployment_id,
+            intent_seq=int(new_seq) if new_seq is not None else None,
+            cancelled_replacement_ids=[row.get("id") for row in cancelled],
+            failed_pending_start_commands=int(failed_account_starts),
+        )
+        return {
+            "deployment": updated,
+            "command": command,
+            "cancelled_replacement_ids": [row.get("id") for row in cancelled],
+            "failed_pending_start_commands": int(failed_account_starts),
+        }
 
     async def request_config_restart(
         self,
@@ -687,6 +921,18 @@ class DeploymentManagerService:
             last_error=cancel_reason,
             stopped=True,
         )
+        self._repo.bump_deployment_intent_seq(deployment_id=int(deployment["id"]))
+        # Cancel sibling queued replacements + fail any pending START for the
+        # account so the runner never picks up a START_BOT that the user just
+        # invalidated.
+        cancelled_replacements = self._repo.cancel_queued_replacements_for_account(
+            account_id=int(deployment["account_id"]),
+            reason=cancel_reason,
+        )
+        self._repo.fail_pending_start_commands_for_account(
+            account_id=int(deployment["account_id"]),
+            reason="start_command_superseded_by_cancel_account",
+        )
 
         runner_id = str(deployment.get("runner_id") or "").strip()
         slot_id = str(deployment.get("slot_id") or "").strip()
@@ -728,6 +974,7 @@ class DeploymentManagerService:
             "command": command_payload,
             "cancelled_from_status": current_status,
             "command_dispatched": command_payload is not None,
+            "cancelled_replacement_ids": [row.get("id") for row in cancelled_replacements],
         }
 
     async def dispatch_runtime_command(

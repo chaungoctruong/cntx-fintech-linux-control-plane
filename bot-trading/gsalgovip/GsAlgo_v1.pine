@@ -1,0 +1,1212 @@
+//@version=6
+// version88 la max của Admin, từ sau ver88 copy đổi tên thành gsALGO ver 1
+const bool DEBUG = false
+const int maxDistanceToLastBar = 4900 // Affects Running Time
+const int atrLen = 5
+const bool maxTPLastHour = false 
+
+var initRun = true
+
+indicator("GsAlgo_v1", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = maxDistanceToLastBar + 100)
+
+//
+
+mau_do = color.rgb(255, 0, 0)
+mau_do_dam = color.rgb(206, 48, 48)
+mau_xanh_la = color.rgb(0, 255, 0) 
+mau_xanh_la_dam = color.rgb(31, 136, 34)
+mau_xanh_duong = color.rgb(65, 62, 202)
+mau_xanh_duong_nhat = color.rgb(73, 167, 255) 
+mau_vang = color.rgb(255, 205, 69) 
+mau_den = color.rgb(0, 0, 0)
+mau_cam = color.rgb(255, 166, 0)
+mau_hong = color.rgb(255, 0, 234)
+mau_tim = color.rgb(162, 0, 255)
+mau_xam = color.rgb(227, 227, 227)
+mau_xam_dam = color.rgb(120, 120, 120)
+mau_reu = color.rgb(6, 131, 147)
+mau_trong_suot = color.rgb(255, 255, 255, 100)
+mau_trang = color.white
+bi = bar_index
+ti = time
+xanh_ = close > open 
+do_ = close < open
+
+h = high 
+l = low 
+o = open 
+c = close 
+
+//
+
+i_chu_de = input.string("Bộ màu cho nền đen", "Bộ màu", options = ["Bộ màu cho nền trắng", "Bộ màu cho nền đen"])
+i_an_thu_gon = input.bool(true, "Thu gọn")
+bang_tk_group = "⚙️ Bảng thống kê"
+i_bang_tk_1 = input.bool(true, "Bảng thống kê", inline = "tk")//, group = bang_tk_group)
+i_mau_bang_tk_1 = input.color(mau_xam, "", inline = "tk")//, group = bang_tk_group)
+i_mau_chu_bang_tk_1 = input.color(mau_den, "", inline = "tk")//, group = bang_tk_group)
+i_size_chu_bang_tk_1 = input.string(size.small, "", options = [size.tiny, size.small, size.normal, size.large, size.huge], inline = "tk")//, group = bang_tk_group)
+i_vitri_bang_1 = input.string(position.bottom_right, "", options = [position.top_right, position.top_center, position.top_left, position.middle_right, position.middle_center, position.middle_left, position.bottom_right, position.bottom_center, position.bottom_left], inline = "tk")//, group = bang_tk_group)
+
+//==============================================================
+
+i_ngay_tk_1 = 7//input.int(7, "Số ngày gần nhất", group = thongke_1, inline = "tk_ngay", tooltip = "< 5000 nến")
+vitri_time_tk_1 = time - (i_ngay_tk_1*24*60*60*1000) // vị trí bắt đầu dc tính toán để vẽ signal và thồng kê cho thuật toán gốc của chỉ báo, giờ thì cho thuật toán gốc tàn hình hết rồi lọc lại vẽ lại thống kê lại
+z_1 = 0
+while time[z_1] > vitri_time_tk_1
+    z_1 += 1
+moc_time_tk_1 = bi[z_1]
+//monday = dayofweek.monday
+//friday = dayofweek.friday
+//sunday = dayofweek.sunday
+
+
+//==============================================================
+
+i_congcu_daochieu = input.bool(true, "Tín hiệu đảo chiều", inline = "rsi")
+bearishColor = input.color(#f23646, "", inline = "rsi")
+neutralColor = color.gray//input.color(color.gray, "Neutral", group = "Style", inline = "col", display = display.none)
+bullishColor = input.color(#089981, "", inline = "rsi")
+
+i_R_sl = input.float(5, "R SL:", group = "Quản lý lệnh:")
+i_R_tp = input.float(10, "R TP:", group = "Quản lý lệnh:")
+
+use_SL = i_R_sl
+use_TP = i_R_tp
+
+alert_group = "⏰⏰⏰__________CÀI ĐẶT BÁO ĐỘNG___________⏰⏰⏰"
+i_alert_1 = input.bool(true, "1 nến báo 1 lần duy nhất khi NẾN ĐÓNG thõa điều kiện", group = alert_group)
+i_alert_2 = input.bool(false, "1 nến báo 1 lần duy nhất ở thời điểm sớm nhất mà nến thõa điều kiện dù NẾN CHƯA ĐÓNG", group = alert_group)
+i_alert_3 = input.bool(false, "Cảnh báo khi >= 2 lần thua liên tiếp", group = alert_group)
+i_alert_4 = input.bool(false, "Cảnh báo Chuẩn bị buy/sell", group = alert_group)
+i_alert_5 = input.bool(false, "DCA: 1 nến báo 1 lần duy nhất khi NẾN ĐÓNG thõa điều kiện", group = alert_group)
+i_alert_6 = input.bool(false, "DCA:1 nến báo 1 lần duy nhất ở thời điểm sớm nhất mà nến thõa điều kiện dù NẾN CHƯA ĐÓNG", group = alert_group)
+i_alert_7 = input.bool(false, "Cảnh báo TP/SL dạng text (không dùng cho webhook backend)", group = alert_group)
+backendSecret = input.string("e9aa7542761a9b9d117176278c5baa1fb0fb69691ab6cef9c2b70441e729fb31", "Backend webhook secret", display = display.none, group = alert_group)
+
+//
+
+color up_color = i_chu_de == "Bộ màu cho nền đen" ? color.rgb(0, 225, 255) : #55ffda
+color dn_color = i_chu_de == "Bộ màu cho nền đen" ? color.rgb(255, 255, 0) : #8c5bff
+
+//pivotLenLiq = input.int(4, "Pivot Length", group = "General Configuration", display = display.none)
+mssOffset = 5//input.int(5, "MSS Swing Length", group = "General Configuration")
+higherTimeframe = '10'//input.timeframe("10", "Higher Timeframe", group = "General Configuration")
+breakoutMethod = "Wick"//input.string("Wick", "Breakout Method", options = ["Close", "Wick"], group = "General Configuration")
+entryMethod = "Classic"//input.string("Classic", "Entry Method", options = ["Classic", "Adaptive"], group = "General Configuration", tooltip = "The entry method for the indicator to use. Try changing this setting if you are getting poor results.")
+dbgTPSLVersion = "Default"//input.string("Default", "TP / SL Layout", options = ["Default", "Alternative"], group = "General Configuration")
+dbgLabelSize = "Normal"//DEBUG ? input.string("Small", "[DBG] Label Size", ["Normal", "Small", "Tiny"], group = "General Configuration") : "Normal"
+lblSize = (dbgLabelSize == "Small" ? size.small : dbgLabelSize == "Normal" ? size.normal : size.tiny)
+
+showHL = false//input.bool(false, "Show Liquidity Zones", inline = "3", group = "General Configuration")
+showLiqGrabs = true//input.bool(true, "Liq Grabs", inline = "3", group = "General Configuration")
+showTPSL = true//input.bool(true, "TP / SL", inline = "3", group = "General Configuration")
+
+tpslMethod = "Fixed"//input.string("Fixed", "TP / SL Method", options = ["Dynamic", "Fixed"], group = "TP / SL")
+riskAmount = "Lowest"//input.string("Lowest", "Risk", options = ["Highest", "High", "Normal", "Low", "Lowest"], group = "TP / SL", tooltip = "The risk amount when Dynamic TP / SL method is selected.\n\nDifferent assets may have different volatility so changing this setting may result in change of performance of the indicator.")
+customSLATRMult = 6.5//DEBUG ? input.float(6.5, "Custom Risk Mult", group = "TP / SL") : 6.5
+tpPercent = 0.2//input.float(0.2, "Take Profit %", group = "TP / SL")
+slPercent = 0.3//input.float(0.3, "Stop Loss %", group = "TP / SL")
+
+RR = 0.9//DEBUG ? input.float(0.9, "Risk:Reward Ratio", group = "Debug") : 0.9
+
+slATRMult = riskAmount == "Highest" ? 10 : riskAmount == "High" ? 6.5 : riskAmount == "Normal" ? 5.5 : riskAmount == "Low" ? 3.5 : riskAmount == "Lowest" ? 1.15 : customSLATRMult
+
+backtestDisplayEnabled = true//input.bool(true, "Enabled", group = "Backtesting Dashboard", display = display.none)
+backtestingLocation = "Top Center"//input.string("Top Center", "Position", options = ["Top Right", "Right Center", "Top Center"], group = "Backtesting Dashboard", display = display.none)
+fillBackgrounds = true//input.bool(true, "Fill Backgrounds", group = "Backtesting Dashboard", display = display.none)
+screenerColor = #1B1F2B//input.color(#1B1F2B, 'Background', inline = "1", group = 'Backtesting Dashboard', display = display.none)
+
+i_textColor = mau_den//input.color(mau_den, "Text", inline = "colors", group = "Visuals")
+
+highColor = mau_trong_suot //up_color//not i_an_thu_gon ? up_color : mau_trong_suot//input.color(up_color, "Buy", inline = "colors", group = "Visuals")
+lowColor = mau_trong_suot //dn_color//not i_an_thu_gon ? dn_color : mau_trong_suot//input.color(dn_color, "Sell", inline = "colors", group = "Visuals")
+textColor = mau_trong_suot //i_textColor//not i_an_thu_gon ? i_textColor : mau_trong_suot
+
+highColor_an = i_an_thu_gon ? mau_trong_suot : mau_trong_suot
+lowColor_an = i_an_thu_gon ? mau_trong_suot : mau_trong_suot
+textColor_an = i_an_thu_gon ? mau_trong_suot : mau_trong_suot
+
+n_tool_vithe = i_an_thu_gon ? 1 : 500
+
+//buyAlertEnabled = input.bool(true, "Buy Signal", inline = "BS", group = "Alerts")
+//sellAlertEnabled = input.bool(true, "Sell Signal", inline = "BS", group = "Alerts")
+//tpAlertEnabled = input.bool(true, "Take-Profit Signal", inline = "TS", group = "Alerts")
+//slAlertEnabled = input.bool(true, "Stop-Loss Signal ", inline = "TS", group = "Alerts")
+
+buyAlertTick = false, float en_price_buy = na, float sl_price_buy = na, float tp_price_buy = na
+tpbuyAlertTick = false
+slbuyAlertTick = false
+
+sellAlertTick = false, float en_price_sell = na, float sl_price_sell = na, float tp_price_sell = na
+tpsellAlertTick = false
+slsellAlertTick = false
+
+chuan_bi_buy_loc = false, chuan_bi_sell_loc = false
+
+dca_alert = false
+float dca_price = na
+
+var n_tp = 0
+var n_sl = 0
+var n_sl_lientiep = 0
+
+//==============================================================
+// Khoanh vùng thời gian dc vẽ signal, dc alert, dc thong ke
+//==============================================================
+
+tz = "Asia/Ho_Chi_Minh"
+
+isNewWeek = ta.change(weekofyear(time, tz)) != 0
+
+dow = dayofweek(time, tz)
+
+isMonToFri = syminfo.ticker == 'XAUUSD' ? dow >= dayofweek.monday and dow <= dayofweek.friday : true // từ thứ 2 đến thứ 6 là vàng, các mã khác đánh hết
+
+
+// count n losetrade
+
+int new_lose_trades = 0
+bool new_lose_trades_long = false
+bool new_lose_trades_short = false
+
+var bool baned_long_var = false
+var bool baned_short_var = false
+
+type Sweep
+    int startTime
+    int endTime
+    string side
+    float price
+
+type TurtleSoup
+    string state
+    int startTime
+
+    int lastHour = na
+    float lastHourHigh = na
+    float lastHourLow = na
+    Sweep brokenSweep = na
+    float slTarget
+    float tpTarget
+    string entryType
+    int entryTime
+    int exitTime
+    float entryPrice
+    float exitPrice
+    int dayEndedBeforeExit
+
+
+var lineX = array.new<line>()
+var boxlineX = array.new<box>()
+var boxX = array.new<box>()
+var labelX = array.new<label>()
+var labelXXX = array.new<label>()
+
+var ar_line = array.new_line()
+var ar_label = array.new_label()
+
+
+var TurtleSoup[] tsList = array.new<TurtleSoup>(0)
+var TurtleSoup lastTS = na
+
+atr = ta.atr(atrLen)
+
+diffPercent (float val1, float val2) =>
+    (math.abs(val1 - val2) / val2) * 100.0
+
+getPosition (positionText) =>
+    if positionText == "Top Right"
+        position.top_right
+    else if positionText == "Top Center"
+        position.top_center
+    else if positionText == "Right Center"
+        position.middle_right
+    else if positionText == "Left Center"
+        position.middle_left
+    else if positionText == "Bottom Center"
+        position.bottom_center
+    else if positionText == "Middle Center"
+        position.middle_center
+
+tfInMin = timeframe.in_seconds() / 60
+
+//#region Liqs
+if timeframe.in_seconds(higherTimeframe) <= timeframe.in_seconds()
+    runtime.error("Higher timeframe must be higher than current timeframe.")
+int htfMins = timeframe.in_seconds(higherTimeframe) / 60
+int barLength = htfMins / tfInMin
+float high12 = ta.highest(barLength)
+float low12 = ta.lowest(barLength)
+float highMSS = ta.highest(mssOffset)
+float lowMSS = ta.lowest(mssOffset)
+int lastHourTime = time[barLength]
+//#endregion
+
+//#region Turtle Soup
+var highBreaks = 0
+var lowBreaks = 0
+
+if bar_index > last_bar_index - maxDistanceToLastBar
+    if true
+        // Find Session Start
+        createNewTS = true
+        if not na(lastTS)
+            if na(lastTS.exitPrice)
+                createNewTS := false // Don't enter if a trade is already entered
+                
+        if createNewTS
+            newTS = TurtleSoup.new("Waiting For Liquidity Break", time)
+            newTS.lastHourHigh := high12
+            newTS.lastHourLow := low12
+            newTS.lastHour := lastHourTime
+            tsList.unshift(newTS)
+            lastTS := newTS
+            log.info("New Turtle Soup")
+
+        if not na(lastTS)
+            // Find Liquidity Breaks
+            if lastTS.state == "Waiting For Liquidity Break"
+                log.info("Wait For Liq Grab")
+                if time > lastTS.startTime
+                    if (breakoutMethod == "Close" ? close : low) < lastTS.lastHourLow
+                        log.info("Sellside Liq Grab")
+                        if entryMethod == "Classic" or highBreaks > lowBreaks
+                            lastTS.brokenSweep := Sweep.new(lastTS.lastHour, time, "Sellside", lastTS.lastHourLow)
+                            lastTS.entryType := "Long"
+                        else if highBreaks <= lowBreaks
+                            //lastTS.brokenSweep := Sweep.new(lastTS.lastHour, time, "Buyside", lastTS.lastHourHigh)
+                            lastTS.brokenSweep := Sweep.new(lastTS.lastHour, time, "Sellside", lastTS.lastHourLow)
+                            lastTS.entryType := "Short"
+
+                        lastTS.state := "Waiting For Execution"
+                    
+                    else if (breakoutMethod == "Close" ? close : high) > lastTS.lastHourHigh
+                        log.info("Buyside Liq Grab")
+                        if entryMethod == "Classic" or highBreaks <= lowBreaks
+                            lastTS.brokenSweep := Sweep.new(lastTS.lastHour, time, "Buyside", lastTS.lastHourHigh)
+                            lastTS.entryType := "Short"
+                        else if highBreaks > lowBreaks
+                            //lastTS.brokenSweep := Sweep.new(lastTS.lastHour, time, "Sellside", lastTS.lastHourLow)
+                            lastTS.brokenSweep := Sweep.new(lastTS.lastHour, time, "Buyside", lastTS.lastHourHigh)
+                            lastTS.entryType := "Long"
+                        lastTS.state := "Waiting For Execution"
+            // Execute
+            if lastTS.state == "Waiting For Execution"
+                if time > lastTS.brokenSweep.endTime
+                    log.info("MSS Execution")
+                    if lastTS.entryType == "Short"
+                        if (breakoutMethod == "Close" ? close : low) < lowMSS[1]// and not baned_short_var[1]
+                            sellAlertTick := true
+                            lastTS.state := "Entry Taken"
+                            lastTS.entryTime := time
+                            lastTS.entryPrice := (breakoutMethod == "Close" ? close : lowMSS[1])
+                            en_price_sell := (breakoutMethod == "Close" ? close : lowMSS[1])
+                            if tpslMethod == "Fixed"
+                                lastTS.slTarget := lastTS.entryPrice  + use_SL//* (1 + slPercent / 100.0)
+                                lastTS.tpTarget := lastTS.entryPrice - use_TP//* (1 - tpPercent / 100.0)
+                                sl_price_sell := lastTS.entryPrice  + use_SL//* (1 + slPercent / 100.0)
+                                tp_price_sell := lastTS.entryPrice - use_TP//* (1 - tpPercent / 100.0)
+                            else
+                                lastTS.slTarget := highMSS + atr * slATRMult
+                                lastTS.tpTarget := lastTS.entryPrice - (math.abs(lastTS.entryPrice - lastTS.slTarget) * RR)
+                    else // Long
+                        if (breakoutMethod == "Close" ? close : high) > highMSS[1]// and not baned_long_var[1]
+                            buyAlertTick := true
+                            lastTS.state := "Entry Taken"
+                            lastTS.entryTime := time
+                            lastTS.entryPrice := (breakoutMethod == "Close" ? close : highMSS[1])
+                            en_price_buy := (breakoutMethod == "Close" ? close : highMSS[1])
+                            if tpslMethod == "Fixed"
+                                lastTS.slTarget := lastTS.entryPrice - use_SL//* (1 - slPercent / 100.0)
+                                lastTS.tpTarget := lastTS.entryPrice + use_TP//* (1 + tpPercent / 100.0)
+                                sl_price_buy := lastTS.entryPrice - use_SL//* (1 - slPercent / 100.0)
+                                tp_price_buy := lastTS.entryPrice + use_TP//* (1 + tpPercent / 100.0)
+                            else
+                                lastTS.slTarget := lowMSS - atr * slATRMult
+                                lastTS.tpTarget := lastTS.entryPrice + (math.abs(lastTS.entryPrice - lastTS.slTarget) * RR)
+    
+    // Entry Taken
+    if not na(lastTS)
+        if lastTS.state == "Entry Taken"
+            log.info("Entry Taken")
+            if tpslMethod == "Fixed"
+                // Take Profit
+                if lastTS.entryType == "Long" and high - lastTS.entryPrice >= use_TP and time > lastTS.entryTime//((high / lastTS.entryPrice) - 1) * 100 >= tpPercent
+                    if not baned_long_var[1]
+                        tpbuyAlertTick := true
+                        //alert("🔔 Chạm TP Buy" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
+                    lastTS.exitPrice := lastTS.entryPrice + use_TP //* (1 + tpPercent / 100.0)
+                    lastTS.exitTime := time
+                    lastTS.state := "Take Profit"
+                    highBreaks += 1
+                if lastTS.entryType == "Short" and lastTS.entryPrice - low >= use_TP and time > lastTS.entryTime//((low / lastTS.entryPrice) - 1) * 100 <= -tpPercent
+                    if not baned_short_var[1]
+                        tpsellAlertTick := true
+                        //alert("🔔 Chạm TP Sell" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
+                    lastTS.exitPrice := lastTS.entryPrice - use_TP//* (1 - tpPercent / 100.0)
+                    lastTS.exitTime := time
+                    lastTS.state := "Take Profit"
+                    lowBreaks += 1
+                
+                // Stop Loss
+                if lastTS.entryType == "Long" and lastTS.entryPrice - low >= use_SL and time > lastTS.entryTime//((low / lastTS.entryPrice) - 1) * 100 <= -slPercent
+                    if not baned_long_var[1]
+                        slbuyAlertTick := true
+                        //alert("🔔 Chạm SL Buy" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
+                    lastTS.exitPrice := lastTS.entryPrice - use_SL//* (1 - slPercent / 100.0)
+                    lastTS.exitTime := time
+                    lastTS.state := "Stop Loss"
+                    highBreaks -= 1
+                if lastTS.entryType == "Short" and high - lastTS.entryPrice >= use_SL and time > lastTS.entryTime//((high / lastTS.entryPrice) - 1) * 100 >= slPercent
+                    if not baned_short_var[1]
+                        slsellAlertTick := true
+                        //alert("🔔 Chạm SL Sell" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
+                    lastTS.exitPrice := lastTS.entryPrice + use_SL//* (1 + slPercent / 100.0)
+                    lastTS.exitTime := time
+                    lastTS.state := "Stop Loss"
+                    lowBreaks -= 1
+
+//#endregion
+
+//#region Render Turtle Soups
+
+renderTopSL = false
+renderBottomSL = false
+renderTopTP = false
+renderBottomTP = false
+
+if not na(lastTS)
+    if lastTS.state == "Stop Loss" and time > lastTS.entryTime
+        if lastTS.entryType == "Long"
+            renderBottomSL := true
+        else
+            renderTopSL := true
+        lastTS.state := "Done"
+    if lastTS.state == "Take Profit" and time > lastTS.entryTime
+        if lastTS.entryType == "Long"
+            renderTopTP := true
+        else
+            renderBottomTP := true
+        lastTS.state := "Done"
+
+//plotchar(renderTopSL, "", char = "❌", location = location.abovebar, color = color.red, textcolor = textColor, text = "SL", size = size.tiny)
+//plotchar(renderBottomSL, "", char = "❌", location = location.belowbar, color = color.red, textcolor = textColor, text = "SL", size = size.tiny)
+//plotchar(renderTopTP, "", char = "✅", location = location.abovebar, color = color.blue, textcolor = textColor, text = "TP", size = size.tiny)
+//plotchar(renderBottomTP, "", char = "✅", location = location.belowbar, color = color.blue, textcolor = textColor, text = "TP", size = size.tiny)
+
+//#endregion
+
+//#region Alerts
+if barstate.islastconfirmedhistory
+    initRun := false
+
+////alertcondition(buyAlertTick and not initRun, "Buy Signal", "")
+//alertcondition(sellAlertTick and not initRun, "Sell Signal", "")
+//alertcondition(tpAlertTick and not initRun, "Take-Profit Signal", "")
+//alertcondition(slAlertTick and not initRun, "Stop-Loss Signal", "")
+
+//if not initRun
+//    if buyAlertTick and buyAlertEnabled
+//        alert("Buy Signal")
+//    if sellAlertTick and sellAlertEnabled
+//        alert("Sell Signal")
+    
+//    if tpAlertTick and tpAlertEnabled
+//        alert("Take-Profit Signal")
+//    if slAlertTick and slAlertEnabled
+//        alert("Stop-Loss Signal")
+
+//txt_alert_3 = 
+// nen_xanh ? "🔔 " + syminfo.tickerid + "\n" + "🟢 BUY" + "\n" + "▶️ EN: " + str.tostring(close, format.mintick) + "\n" + "❌ SL: " + str.tostring(low, format.mintick) + "\n" + "✅ TP: " + str.tostring(high, format.mintick) + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7") : 
+// nen_do ? "🔔 " + syminfo.tickerid + "\n" + "🔴 SELL" + "\n" + "▶️ EN: " + str.tostring(close, format.mintick) + "\n" + "❌ SL: " + str.tostring(high, format.mintick) + "\n" + "✅ TP: " + str.tostring(low, format.mintick) + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7") : na
+ 
+
+
+//if not initRun and buyAlertTick
+//    var table t3 = table.new(position = position.bottom_right, columns = 2, rows = 4,
+//     bgcolor = mau_trong_suot,
+//     frame_color = color.rgb(0, 0, 0), frame_width = 1, border_color = color.rgb(0, 0, 0), border_width = 1, force_overlay = true)
+
+//    table.cell(t3, 0, 0, "", bgcolor = mau_trang, text_size = size.small)
+//    table.cell(t3, 0, 1, "en = " + str.tostring(lastTS.entryPrice, format.mintick), bgcolor = mau_trang, text_size = size.small)
+//    table.cell(t3, 0, 2, "sl = " + str.tostring(lastTS.entryPrice - use_SL, format.mintick), bgcolor = mau_trang, text_size = size.small)
+//    table.cell(t3, 0, 3, "tp = " + str.tostring(lastTS.entryPrice + use_TP, format.mintick), bgcolor = mau_trang, text_size = size.small)
+
+//    table.cell(t3, 1, 0, "", bgcolor = mau_trang, text_size = size.small)
+
+//#endregion
+
+if barstate.isconfirmed
+    if lineX.size() > 0
+        for i = 0 to lineX.size() - 1
+            line.delete(lineX.get(i))
+
+    if boxX.size() > 0
+        for i = 0 to boxX.size() - 1
+            box.delete(boxX.get(i))
+    
+    if labelX.size() > 0
+        for i = 0 to labelX.size() - 1
+            label.delete(labelX.get(i))
+
+    if boxlineX.size() > 0
+        for i = 0 to boxlineX.size() - 1
+            box.delete(boxlineX.get(i))
+    
+    if labelXXX.size() > 0
+        for i = 0 to labelXXX.size() - 1
+            label.delete(labelXXX.get(i))
+
+    lineX.clear()
+    boxX.clear()
+    labelX.clear()
+    boxlineX.clear()
+    labelXXX.clear()
+
+
+    if tsList.size() > 0
+        for i = 0 to math.min(n_tool_vithe, tsList.size() - 1)
+            curTS = tsList.get(i)
+
+            // Target Liquidity
+            //if not na(curTS.brokenSweep) and showHL
+            //    offset = atr / 3.0
+            //    if curTS.brokenSweep.price == curTS.lastHourHigh
+            //        boxX.push(box.new(curTS.brokenSweep.startTime, curTS.lastHourHigh + offset, curTS.brokenSweep.endTime, curTS.lastHourHigh - offset, text = "TARGET LIQUIDITY (" + str.tostring(higherTimeframe) + ")", text_color = textColor, xloc = xloc.bar_time, border_width = 0, bgcolor = color.new(highColor, 50), text_size = size.small))
+                    //lineX.push(line.new(curTS.brokenSweep.startTime, curTS.lastHourHigh, curTS.brokenSweep.endTime, curTS.lastHourHigh, xloc = xloc.bar_time, color = lowColor, style = line.style_dashed))
+            //    else
+            //        boxX.push(box.new(curTS.brokenSweep.startTime, curTS.lastHourLow + offset, curTS.brokenSweep.endTime, curTS.lastHourLow - offset, text = "TARGET LIQUIDITY (" + str.tostring(higherTimeframe) + ")", text_color = textColor, xloc = xloc.bar_time, border_width = 0, bgcolor = color.new(lowColor, 50), text_size = size.small))
+                    //lineX.push(line.new(curTS.brokenSweep.startTime, curTS.lastHourLow, curTS.brokenSweep.endTime, curTS.lastHourLow, xloc = xloc.bar_time, color = highColor, style = line.style_dashed))
+
+            // Liq Grab
+            if not na(curTS.brokenSweep) and showLiqGrabs
+                if curTS.brokenSweep.price == curTS.lastHourHigh
+                    labelX.push(label.new(curTS.brokenSweep.endTime, high, yloc = yloc.abovebar, xloc = xloc.bar_time, style = label.style_triangledown, size = size.tiny, color = mau_trong_suot))
+                    if (time[0] == curTS.brokenSweep.endTime) and not baned_short_var[1]
+                        chuan_bi_sell_loc := true
+                    else if (time[0] == curTS.brokenSweep.endTime) and baned_short_var[1]
+                        chuan_bi_buy_loc := true
+                        //alert("🔔 Chuẩn bị Sell" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar_close)
+                else
+                    labelX.push(label.new(curTS.brokenSweep.endTime, low, yloc = yloc.belowbar, xloc = xloc.bar_time, style = label.style_triangleup, size = size.tiny, color = mau_trong_suot))
+                    if (time[0] == curTS.brokenSweep.endTime) and not baned_long_var[1]
+                        chuan_bi_buy_loc := true
+                    else if (time[0] == curTS.brokenSweep.endTime) and baned_long_var[1]
+                        chuan_bi_sell_loc := true
+                        //alert("🔔 Chuẩn bị Buy" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar_close)
+
+
+
+            //if not na(curTS.entryTime)
+                // Entry Label
+                //if curTS.entryType == "Long"
+                //    labelX.push(label.new(curTS.entryTime, curTS.entryPrice, "EN - " + str.tostring(curTS.entryPrice), xloc = xloc.bar_time, yloc = yloc.belowbar, style = label.style_label_up, size = lblSize, textcolor = textColor, color = highColor))//, textcolor = textColor, color = highColor))
+                //else
+                 //   labelX.push(label.new(curTS.entryTime, curTS.entryPrice, "EN - " + str.tostring(curTS.entryPrice), xloc = xloc.bar_time, yloc = yloc.abovebar, style = label.style_label_down, size = lblSize, textcolor = textColor, color = lowColor))//, textcolor = textColor, color = lowColor))
+
+            // TP / SL
+            if not na(curTS.entryTime) and 1 == 2
+                if showTPSL
+                    if dbgTPSLVersion == "Alternative"
+                        offset = atr / 3.0
+                        endTime = nz(curTS.exitTime, time("", -15))
+                        boxX.push(box.new(curTS.entryTime, curTS.tpTarget + offset, endTime, curTS.tpTarget - offset, text = "TAKE PROFIT (" + str.tostring(curTS.tpTarget, format.mintick) + ")", text_color = textColor, xloc = xloc.bar_time, border_width = 0, bgcolor = color.new(highColor, 50), text_size = size.small))
+                        boxX.push(box.new(curTS.entryTime, curTS.slTarget + offset, endTime, curTS.slTarget - offset, text = "STOP LOSS (" + str.tostring(curTS.slTarget, format.mintick) + ")", text_color = textColor, xloc = xloc.bar_time, border_width = 0, bgcolor = color.new(lowColor, 50) , text_size = size.small))
+                    else if dbgTPSLVersion == "Default" 
+                        endTime = nz(curTS.exitTime, time("", -15))
+                        //lineX.push(line.new(curTS.entryTime, curTS.entryPrice, curTS.entryTime, curTS.tpTarget, xloc = xloc.bar_time, color = highColor, style = line.style_dashed))
+                        //lineX.push(line.new(curTS.entryTime, curTS.tpTarget, endTime, curTS.tpTarget, xloc = xloc.bar_time, color = highColor, style = line.style_solid))
+                        //labelX.push(label.new((endTime + curTS.entryTime) / 2, curTS.tpTarget, "TP", xloc = xloc.bar_time, yloc = yloc.price, textcolor = highColor, color = color.new(highColor, 100), style = label.style_label_down, size = lblSize))
+                        //
+                        //lineX.push(line.new(curTS.entryTime, curTS.entryPrice, curTS.entryTime, curTS.slTarget, xloc = xloc.bar_time, color = lowColor, style = line.style_dashed))
+                        lineX.push(line.new(curTS.entryTime, curTS.slTarget, endTime, curTS.slTarget, xloc = xloc.bar_time, color = lowColor, style = line.style_solid))
+                        labelX.push(label.new(endTime, curTS.slTarget,
+                         "SL - " + str.tostring(curTS.slTarget),
+                         //curTS.slTarget > curTS.tpTarget ? "\n" + "SL - " + str.tostring(curTS.slTarget) + "\n" + "EN - " + str.tostring(curTS.entryPrice) : "EN - " + str.tostring(curTS.entryPrice) + "\n" + "SL - " + str.tostring(curTS.slTarget) + "\n", 
+                         xloc = xloc.bar_time, yloc = yloc.price, textcolor = lowColor, color = color.new(lowColor, 100), 
+                         style = label.style_label_left, size = lblSize))//curTS.slTarget > curTS.tpTarget ? label.style_label_upper_left : label.style_label_lower_left
+                        boxlineX.push(box.new(curTS.entryTime, curTS.tpTarget, endTime, curTS.entryPrice, text = "", text_color = na, xloc = xloc.bar_time, border_width = 0, border_color = color.new(highColor, 100), bgcolor = mau_trong_suot, text_size = size.small))
+                        boxlineX.push(box.new(curTS.entryTime, curTS.entryPrice, endTime, curTS.slTarget, text = "", text_color = na, xloc = xloc.bar_time, border_width = 0, border_color = color.new(lowColor, 100), bgcolor = mau_trong_suot, text_size = size.small))
+                        lineX.push(line.new(curTS.entryTime, curTS.entryPrice, endTime, curTS.entryPrice, xloc = xloc.bar_time, color = highColor, style = line.style_solid))
+                        labelXXX.push(label.new(endTime, curTS.entryPrice, "EN - " + str.tostring(curTS.entryPrice), xloc = xloc.bar_time, yloc = yloc.price, textcolor = highColor, color = color.new(highColor, 100), style = label.style_label_left, size = lblSize)) // thêm nồn vẽ nhãn này là nát cái code éo biết tại sao
+                        lineX.push(line.new(curTS.entryTime, curTS.tpTarget, endTime, curTS.tpTarget, xloc = xloc.bar_time, color = highColor, style = line.style_solid))
+                        labelX.push(label.new(endTime, curTS.tpTarget, "TP - " + str.tostring(curTS.tpTarget), xloc = xloc.bar_time, yloc = yloc.price, textcolor = highColor, color = color.new(highColor, 100), style = label.style_label_left, size = lblSize))
+
+
+            if not na(curTS.dayEndedBeforeExit) and 1 == 2
+                labelX.push(label.new(curTS.dayEndedBeforeExit, close, "Exit", xloc = xloc.bar_time, yloc = yloc.belowbar, textcolor = textColor, color = color.yellow, style = label.style_circle, size = size.tiny))
+
+
+
+if buyAlertTick and i_an_thu_gon
+    array.unshift(ar_label, label.new(bi, low - (high - low) / 2, color = baned_long_var[1] ? mau_trong_suot : highColor_an, style = label.style_label_up, text = "Buy", textcolor = baned_long_var[1] ? mau_trong_suot : textColor_an, size = size.normal))
+else if sellAlertTick and i_an_thu_gon
+    array.unshift(ar_label, label.new(bi, high + (high - low) / 2, color = baned_short_var[1] ? mau_trong_suot : lowColor_an, style = label.style_label_down, text = "Sell", textcolor = baned_short_var[1] ? mau_trong_suot : textColor_an, size = size.normal))
+
+if array.size(ar_label) > n_tool_vithe and i_an_thu_gon
+    label.delete(array.get(ar_label, 1))
+    array.remove(ar_label, 1)
+
+
+//////////////////////
+
+//plotshape(buyAlertTick, "buy", style = shape.labelup, location = location.belowbar, color = not i_an_thu_gon and not baned_long_var[1] ? highColor : mau_trong_suot, size = size.small, text = "Buy", textcolor = not i_an_thu_gon and not baned_long_var[1] ? textColor : mau_trong_suot)
+//plotshape(sellAlertTick, "sell", style = shape.labeldown, location = location.abovebar, color = not i_an_thu_gon and not baned_short_var[1] ? lowColor : mau_trong_suot, size = size.small, text = "Sell", textcolor = not i_an_thu_gon and not baned_short_var[1] ? textColor : mau_trong_suot)
+
+
+//////////////////
+////////////////
+//////////////
+////////////
+
+//#endregion
+
+
+if tsList.size() > 0
+    for i = 0 to tsList.size() - 1
+        if i == 0
+            curTS = tsList.get(i)
+            if not na(curTS.entryPrice) and not na(curTS.exitTime) and curTS.exitTime > vitri_time_tk_1
+                //isSuccess = false
+                if not na(curTS.exitPrice)
+                    //if (curTS.entryType == "Long" and curTS.exitPrice > curTS.entryPrice) or (curTS.entryType == "Short" and curTS.exitPrice < curTS.entryPrice)
+                        //isSuccess := true
+                        //if (curTS.entryType == "Long" and curTS.exitPrice > curTS.entryPrice) and curTS.exitTime == time[0] and not baned_long_var[1]
+                            //alert("🔔 Chạm TP Buy" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
+                        //else if (curTS.entryType == "Short" and curTS.exitPrice < curTS.entryPrice) and curTS.exitTime == time[0] and not baned_short_var[1]
+                            //alert("🔔 Chạm TP Sell" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
+                        //break
+                    //else
+                        //isSuccess := false
+                    if (curTS.entryType == "Long" and curTS.exitPrice <= curTS.entryPrice) and curTS.exitTime == time[0]
+                        new_lose_trades_long := true
+                        //if not baned_long_var[1]
+                            //alert("🔔 Chạm SL Buy" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
+                    else if (curTS.entryType == "Short" and curTS.exitPrice >= curTS.entryPrice) and curTS.exitTime == time[0]
+                        new_lose_trades_short := true
+                        //if not baned_short_var[1]
+                            //alert("🔔 Chạm SL Sell" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
+
+
+if new_lose_trades_long
+    baned_long_var := true
+else if baned_long_var[1] and sellAlertTick
+    baned_long_var := false
+
+if new_lose_trades_short
+    baned_short_var := true
+else if baned_short_var[1] and buyAlertTick
+    baned_short_var := false
+
+buy_loc = buyAlertTick and not baned_long_var[1]
+sell_loc = sellAlertTick and not baned_short_var[1]
+
+buy_in_baned_zone = baned_short_var[1] and sellAlertTick
+en_buy_in_baned_zone = buy_in_baned_zone ? close : na
+sl_buy_in_baned_zone = buy_in_baned_zone ? en_buy_in_baned_zone - use_SL : na
+tp_buy_in_baned_zone = buy_in_baned_zone ? en_buy_in_baned_zone + use_TP: na
+
+sell_in_baned_zone = baned_long_var[1] and buyAlertTick
+en_sell_in_baned_zone = sell_in_baned_zone ? close : na
+sl_sell_in_baned_zone = sell_in_baned_zone ? en_sell_in_baned_zone + use_SL: na
+tp_sell_in_baned_zone = sell_in_baned_zone ? en_sell_in_baned_zone - use_TP: na
+
+
+var float en_buy_in_baned_zone_var = na
+var float sl_buy_in_baned_zone_var = na
+var float tp_buy_in_baned_zone_var = na
+
+var float en_sell_in_baned_zone_var = na
+var float sl_sell_in_baned_zone_var = na
+var float tp_sell_in_baned_zone_var = na
+
+if not na(en_buy_in_baned_zone)
+    en_buy_in_baned_zone_var := en_buy_in_baned_zone
+    sl_buy_in_baned_zone_var := sl_buy_in_baned_zone
+    tp_buy_in_baned_zone_var := tp_buy_in_baned_zone
+else if not na(tp_buy_in_baned_zone_var[1]) and h > tp_buy_in_baned_zone_var[1]
+    en_buy_in_baned_zone_var := na
+    sl_buy_in_baned_zone_var := na
+    tp_buy_in_baned_zone_var := na
+else if not na(sl_buy_in_baned_zone_var[1]) and l < sl_buy_in_baned_zone_var[1]
+    en_buy_in_baned_zone_var := na
+    sl_buy_in_baned_zone_var := na
+    tp_buy_in_baned_zone_var := na
+
+if not na(en_sell_in_baned_zone)
+    en_sell_in_baned_zone_var := en_sell_in_baned_zone
+    sl_sell_in_baned_zone_var := sl_sell_in_baned_zone
+    tp_sell_in_baned_zone_var := tp_sell_in_baned_zone
+else if not na(tp_sell_in_baned_zone_var[1]) and l < tp_sell_in_baned_zone_var[1]
+    en_sell_in_baned_zone_var := na
+    sl_sell_in_baned_zone_var := na
+    tp_sell_in_baned_zone_var := na
+else if not na(sl_sell_in_baned_zone_var[1]) and h > sl_sell_in_baned_zone_var[1]
+    en_sell_in_baned_zone_var := na
+    sl_sell_in_baned_zone_var := na
+    tp_sell_in_baned_zone_var := na
+
+sl_buy_in_baned_zone_tick = not na(sl_buy_in_baned_zone_var[1]) and l < sl_buy_in_baned_zone_var[1]
+tp_buy_in_baned_zone_tick = not na(tp_buy_in_baned_zone_var[1]) and h > tp_buy_in_baned_zone_var[1]
+sl_sell_in_baned_zone_tick = not na(sl_sell_in_baned_zone_var[1]) and h > sl_sell_in_baned_zone_var[1]
+tp_sell_in_baned_zone_tich = not na(tp_sell_in_baned_zone_var[1]) and l < tp_sell_in_baned_zone_var[1]
+
+
+plotchar((slsellAlertTick or sl_sell_in_baned_zone_tick) and isMonToFri, "", char = "❌", location = location.abovebar, color = color.red, textcolor = textColor, text = "SL", size = size.tiny)
+plotchar((slbuyAlertTick or sl_buy_in_baned_zone_tick) and isMonToFri, "", char = "❌", location = location.belowbar, color = color.red, textcolor = textColor, text = "SL", size = size.tiny)
+plotchar((tpbuyAlertTick or tp_buy_in_baned_zone_tick) and isMonToFri, "", char = "✅", location = location.abovebar, color = color.blue, textcolor = textColor, text = "TP", size = size.tiny)
+plotchar((tpsellAlertTick or tp_sell_in_baned_zone_tich) and isMonToFri, "", char = "✅", location = location.belowbar, color = color.blue, textcolor = textColor, text = "TP", size = size.tiny)
+
+plotshape(chuan_bi_buy_loc and isMonToFri, "chuan_bi_buy_loc", style =shape.triangleup, location = location.belowbar, color = color.new(up_color, 60), size = size.small, text = "", textcolor = i_textColor)
+plotshape(chuan_bi_sell_loc and isMonToFri, "chuan_bi_sell_loc", style = shape.triangledown, location = location.abovebar, color = color.new(dn_color, 60), size = size.small, text = "", textcolor = i_textColor)
+
+plotshape((buy_loc or buy_in_baned_zone) and isMonToFri, "buy_loc", style = shape.labelup, location = location.belowbar, color = up_color, size = size.small, text = "Buy", textcolor = i_textColor)
+plotshape((sell_loc or sell_in_baned_zone) and isMonToFri, "sell_loc", style = shape.labeldown, location = location.abovebar, color = dn_color, size = size.small, text = "Sell", textcolor = i_textColor)
+
+//plotshape(new_lose_trades_long, "buy", style = shape.labelup, location = location.bottom, color = i_an_thu_gon ? mau_trong_suot : mau_xanh_duong_nhat, size = size.tiny, text = "stopL", textcolor = i_an_thu_gon ? mau_trong_suot : textColor)
+//plotshape(new_lose_trades_short, "sell", style = shape.labeldown, location = location.top, color = i_an_thu_gon ? mau_trong_suot : mau_xanh_duong_nhat, size = size.tiny, text = "stopS", textcolor = i_an_thu_gon ? mau_trong_suot : textColor)
+
+//plotshape(baned_long_var, "buy", style = shape.labelup, location = location.bottom, color = i_an_thu_gon ? mau_trong_suot : mau_xanh_duong_nhat, size = size.tiny, text = "stopL", textcolor = i_an_thu_gon ? mau_trong_suot : textColor)
+//plotshape(baned_short_var, "sell", style = shape.labeldown, location = location.top, color = i_an_thu_gon ? mau_trong_suot : mau_xanh_duong_nhat, size = size.tiny, text = "stopS", textcolor = i_an_thu_gon ? mau_trong_suot : textColor)
+
+plotshape(isNewWeek, "Tuần mới", style =shape.labelup, location = location.bottom, color = color.new(mau_xanh_duong_nhat, 50), size = size.small, text = "Tuần mới", textcolor = i_textColor)
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+const bool DEBUG_2 = false
+const int maxDistanceToLastBar_2 = 5000
+const int labelCooldown_2 = 8
+const int KDELimit_2 = 300
+
+//"RSI (Kernel Optimized) | Flux Charts conver v6", overlay = true, max_labels_count = 500)
+
+rsiLengthInput = 14//input.int(14, minval = 1, title="RSI Length", group="RSI Settings")
+rsiSourceInput = close//input.source(close, "Source", group="RSI Settings")
+
+highPivotLen = 21//input.int(21,  "High Pivot Length", minval = 1, group = "Pivots", display = display.none)
+lowPivotLen = 21//input.int(21, "Low Pivot Length", minval = 1, group = "Pivots", display = display.none)
+realPivotLabels = DEBUG_2 ? false : false//input.bool(false, "[DBG] Real Pivot Labels", group = "Pivots") : false
+kdePivotLabels = DEBUG_2 ? false : false//input.bool(false, "[DBG] KDE Pivot Labels", group = "Pivots") : false
+
+activationThresholdStr = "Medium"//input.string("Medium", "Activation Threshold", options = ["High", "Medium", "Low"], group = "KDE", tooltip = "Determines the amount of arrows shown. Higher options will result in more arrows being rendered.")
+string KDEKernel = "Gaussian"//input.string("Gaussian", "Kernel", options=['Uniform', 'Gaussian', 'Sigmoid'], group = "KDE", tooltip = "The kernel function for KDE calculation. Gaussian is a commonly used kernel and is based on normal distribution.")
+float KDEBandwidth = 2.71828//input.float(2.71828, "Bandwidth", group = "KDE", tooltip = "This setting sets the smoothness of the KDE function output.")
+int KDEStep = 100//input.int(100, "Nº Bins", minval = 1, group = "KDE", tooltip = "The number of elements the KDE Probability array will have. Higher settings will result in greater precision.")
+activationThreshold = DEBUG_2 ? 0.25 : 0.25//input.float(0.25, "[DBG] Activation Threshold", group = "KDE") : 0.25
+if not DEBUG_2
+    activationThreshold := (activationThresholdStr == "High" ? 0.4 : activationThresholdStr == "Medium" ? 0.25 : 0.15)
+probMode = DEBUG_2 ? "Sum" : "Sum"//input.string("Sum", '[DBG] Probability Mode', options = ["Sum", "Nearest"], group = "KDE") : "Sum"
+minPadding = DEBUG_2 ? false : false//input.bool(false, '[DBG] KDE Min Padding', group = "KDE") : false
+
+tableEnabled = true//input.bool(true, "Dashboard", group = "Dashboard", display = display.none)
+tableLocation = "Top Right"//input.string("Top Right", "Position", options = ["Top Right", "Top Center", "Right Center", "Middle Center", "Left Center", "Bottom Center"], group = "Dashboard", display = display.none)
+screenerColor_2 = #1B1F2B//input.color(#1B1F2B, 'Background',  group = 'Dashboard', display = display.none)
+frameColor = color.rgb(255, 255, 255)//input.color(color.rgb(255, 255, 255), 'Frame', group = 'Dashboard', display = display.none)
+borderColor = color.rgb(255, 255, 255)//input.color(color.rgb(255, 255, 255), 'Border', group = 'Dashboard', display = display.none)
+textColor_2DB = color.white//input.color(color.white, 'Text', group = 'Dashboard', display = display.none)
+fillBackgrounds_2 = true//input.bool(true, "Fill Backgrounds", group = "Dashboard", display = display.none)
+
+textColor_2 = color.white//input.color(color.white, 'Text', group = 'Style', inline = "col", display = display.none)
+RSILabelsEnabled = true//input.bool(true, "RSI Labels", group = "Style")
+KDELabelsEnabled = true//input.bool(true, "KDE Labels", group = "Style")
+
+rsi = ta.rsi(rsiSourceInput, rsiLengthInput)
+
+//#region KDE
+gaussian (float distance, float bandwidth = 1.0) => 1.0 / math.sqrt(2.0 * math.pi) * math.pow(math.e, -0.5 * math.pow(distance / bandwidth, 2.0))
+uniform (float distance, float bandwidth = 1.0) => (math.abs(distance) > bandwidth) ? 0.0 : 0.5
+sigmoid (float distance, float bandwidth = 1.0) => 2.0 / math.pi * (1.0 / (math.pow(math.e, (distance / bandwidth)) + math.pow(math.e, -(distance / bandwidth))))
+
+kde (array<float> arr, string kernel, float bandwidth, int steps) =>
+    arrSize = arr.size()
+    arrRange = arr.range()
+    arrMin = arr.min() - (minPadding ? (arrRange / 2.0) : 0)
+    stepCount = arrRange / steps
+    
+    densityRange = array.new<float>(steps * 2)
+    for i = 0 to (steps * 2) - 1
+        densityRange.set(i, arrMin + i * stepCount)
+    
+    xArr = array.new<float>()
+    yArr = array.new<float>()
+    for i = 0 to densityRange.size() - 1
+        float temp = 0
+        for j = 0 to arr.size() - 1
+            switch KDEKernel
+                "Gaussian" => temp += gaussian(densityRange.get(i) - arr.get(j), 1.0 / bandwidth)
+                "Uniform" => temp += uniform(densityRange.get(i) - arr.get(j), 1.0 / bandwidth)
+                "Sigmoid" => temp += sigmoid(densityRange.get(i) - arr.get(j), 1.0 / bandwidth)
+        
+        xArr.push(densityRange.get(i))
+        yArr.push(1.0 / arrSize * temp)
+    [xArr, yArr]
+//#endregion
+
+//#region Pivots
+
+prefixSum (array<float> arr, int l, int r) =>
+    arr.get(r) - (l == 0 ? 0 : arr.get(l - 1))
+
+float MidKDEHigh = na
+float MidKDELow = na
+
+var array<float> KDEHighX = na
+var array<float> KDEHighY = na
+var array<float> KDEHighYSum = array.new<float>()
+
+var array<float> KDELowX = na
+var array<float> KDELowY = na
+var array<float> KDELowYSum = array.new<float>()
+
+highPivot = ta.pivothigh(highPivotLen, highPivotLen)
+lowPivot = ta.pivotlow(lowPivotLen, lowPivotLen)
+
+var highPivotRSIs = array.new<float>()
+var lowPivotRSIs = array.new<float>()
+
+if not na(highPivot)
+    if highPivotRSIs.size() > KDELimit_2
+        highPivotRSIs.remove(0)
+    highPivotRSIs.push(rsi[highPivotLen])
+
+    [KDEHighX1, KDEHighY1] = kde(highPivotRSIs, KDEKernel, KDEBandwidth, KDEStep)
+    KDEHighX := KDEHighX1
+    KDEHighY := KDEHighY1
+    
+    KDEHighYSum.clear()
+    temp = 0.0
+    for i = 0 to KDEHighY.size() - 1
+        temp += KDEHighY.get(i)
+        KDEHighYSum.push(temp)
+
+    MidKDEHigh := array.get(KDEHighX, array.indexof(KDEHighY, array.max(KDEHighY)))
+
+if not na(lowPivot)
+    if lowPivotRSIs.size() > KDELimit_2
+        lowPivotRSIs.remove(0)
+    lowPivotRSIs.push(rsi[lowPivotLen])
+
+    [KDELowX1, KDELowY1] = kde(lowPivotRSIs, KDEKernel, KDEBandwidth, KDEStep)
+    KDELowX := KDELowX1
+    KDELowY := KDELowY1
+
+    KDELowYSum.clear()
+    temp = 0.0
+    for i = 0 to KDELowY.size() - 1
+        temp += KDELowY.get(i)
+        KDELowYSum.push(temp)
+
+    MidKDELow := array.get(KDELowX, array.indexof(KDELowY, array.max(KDELowY)))
+//#endregion
+
+//#region KDE Optimization
+f_lin_interpolate(float x0, float x1, float y0, float y1, float x) =>
+    y0 + (x - x0) * (y1 - y0) / (x1 - x0)
+
+float lowProb = na
+float maxLowProb = na
+float highProb = na
+float maxHighProb = na
+
+if last_bar_index - maxDistanceToLastBar_2 < bar_index
+    if highPivotRSIs.size() > 0
+        highXIndexL = array.binary_search_leftmost(KDEHighX, rsi)
+        highXIndexR = math.min(array.binary_search_rightmost(KDEHighX, rsi), KDEHighX.size() - 1)
+        nearestIndex = (math.abs(rsi - KDEHighX.get(highXIndexL)) < math.abs(rsi - KDEHighX.get(highXIndexR))) ? highXIndexL : highXIndexR
+        if probMode == "Nearest"
+            highProb := KDEHighY.get(nearestIndex)
+            maxHighProb := array.max(KDEHighY)
+        else if probMode == "Sum"
+            highProb := prefixSum(KDEHighYSum, 0, nearestIndex)
+    
+    if lowPivotRSIs.size() > 0
+        lowXIndexL = array.binary_search_leftmost(KDELowX, rsi)
+        lowXIndexR = math.min(array.binary_search_rightmost(KDELowX, rsi), KDELowX.size() - 1)
+        nearestIndex = (math.abs(rsi - KDELowX.get(lowXIndexL)) < math.abs(rsi - KDELowX.get(lowXIndexR))) ? lowXIndexL : lowXIndexR
+        if probMode == "Nearest"
+            lowProb := KDELowY.get(nearestIndex)
+            maxLowProb := array.max(KDELowY)
+        else if probMode == "Sum"
+            lowProb := prefixSum(KDELowYSum, nearestIndex, KDELowYSum.size() - 1)
+
+        if DEBUG_2 and barstate.islastconfirmedhistory
+            for i = 0 to KDELowX.size() - 1
+                curX = KDELowX.get(i)
+                curY = KDELowY.get(i)
+                log.info(str.tostring(curX) + " = " + str.tostring(curY))
+            log.info("High Y Sum " + str.tostring(KDEHighY.sum()))
+
+diffToHighKDE = math.abs(rsi - MidKDEHigh)
+diffToLowKDE = math.abs(rsi - MidKDELow)
+//#endregion
+
+//#region Draw Pivots
+color curColor = na
+if (not na(KDELowY)) and (not na(KDEHighY))
+    if probMode == "Nearest"
+        if math.abs(lowProb - maxLowProb) < activationThreshold / 50.0
+            curColor := bullishColor
+        if math.abs(highProb - maxHighProb) < activationThreshold / 50.0
+            curColor := bearishColor
+    else if probMode == "Sum"
+        if lowProb > KDELowY.sum() * (1.0 - activationThreshold)
+            curColor := bullishColor
+        else if highProb > KDEHighY.sum() * (1.0 - activationThreshold)
+            curColor := bearishColor
+//barcolor(curColor)
+
+atr_2 = ta.atr(50)
+
+plotarrow(i_congcu_daochieu and curColor == bullishColor and barstate.isconfirmed ? 1 : na, "Bullish Arrows", color.new(bullishColor, 70), color.new(bullishColor, 70), minheight = 20, maxheight = 20)
+plotarrow(i_congcu_daochieu and curColor == bearishColor and barstate.isconfirmed ? -1 : na, "Bearish Arrows", color.new(bearishColor, 70), color.new(bearishColor, 70), minheight = 20, maxheight = 20)
+
+plotarrow((i_congcu_daochieu and na(curColor) and curColor[1] == bullishColor and barstate.isconfirmed) ? 1 : na, "Possible Bullish Pivot", bullishColor, bullishColor, minheight = 20, maxheight = 20)
+plotarrow((i_congcu_daochieu and na(curColor) and curColor[1] == bearishColor and barstate.isconfirmed) ? -1 : na, "Possible Bearish Pivot", bearishColor, bearishColor, minheight = 20, maxheight = 20)
+
+alertcondition(na(curColor) and curColor[1] == bullishColor and barstate.isconfirmed, "Possible Bullish Pivot")
+alertcondition(na(curColor) and curColor[1] == bearishColor and barstate.isconfirmed, "Possible Bearish Pivot")
+
+//#endregion
+
+
+//
+//
+//
+//
+//
+
+
+//--------------------------------------------------------------------------------------------------------------------------
+// Thuật toán cũ đã cho tàn hình hết => từ đoạn này sẽ lọc ra trong những cái tàn hình đó để vẽ lại, thống kê lại, alert lại
+//--------------------------------------------------------------------------------------------------------------------------
+
+//"Trade Object EN SL TP (LineFill)", overlay = true, max_lines_count = 500, max_labels_count = 500, max_linefill_count = 500)
+
+//==================================================
+
+//==================================================
+// INPUT
+//==================================================
+//maxTrades = input.int(5, "Số trade hiển thị", minval = 1)
+//showAll   = input.bool(false, "Hiển thị tất cả trade")
+
+colEN = up_color
+colSL = dn_color
+colTP = up_color
+colDCA = mau_tim
+
+colSLFill = dn_color
+colTPFill = up_color
+
+//==============================
+// MOCK SIGNAL – THAY BẰNG CODE CỦA MÀY
+//==============================
+sigLong  = buy_loc or buy_in_baned_zone                          // signal long
+sigShort = sell_loc or sell_in_baned_zone                        // signal short
+
+enLong = buy_loc ? en_price_buy : buy_in_baned_zone ? en_buy_in_baned_zone : na                              // entry long
+slLong = buy_loc ? sl_price_buy : buy_in_baned_zone ? sl_buy_in_baned_zone : na                              // sl long
+tpLong = buy_loc ? tp_price_buy : buy_in_baned_zone ? tp_buy_in_baned_zone : na                              // tp long
+
+enShort = sell_loc ? en_price_sell : sell_in_baned_zone ? en_sell_in_baned_zone : na                          // entry short
+slShort = sell_loc ? sl_price_sell : sell_in_baned_zone ? sl_sell_in_baned_zone : na                          // sl short
+tpShort = sell_loc ? tp_price_sell : sell_in_baned_zone ? tp_sell_in_baned_zone : na                          // tp short
+
+//==================================================
+// TYPE
+//==================================================
+type TradeObj
+    bool  isLong
+    bool  active
+    int   startBar
+
+    float en
+    float sl
+    float tp
+
+    line      lnEn
+    line      lnSl
+    line      lnTp
+    linefill  lfSL
+    linefill  lfTP
+
+    label lbSig
+    label lbEn
+    label lbSl
+    label lbTp
+
+    float dca
+    line lnDca
+    label lbDca
+    bool  active_dca
+    
+    
+    
+
+//==================================================
+// METHOD – INIT
+//==================================================
+method init(TradeObj this) =>
+    this.lnEn := line.new(this.startBar, this.en, bar_index, this.en, color = colEN, width = 2)
+    this.lnSl := line.new(this.startBar, this.sl, bar_index, this.sl, color = colSL)
+    this.lnTp := line.new(this.startBar, this.tp, bar_index, this.tp, color = colTP)
+
+    this.lfSL := linefill.new(this.lnEn, this.lnSl, color.new(colSLFill, 93))
+    this.lfTP := linefill.new(this.lnEn, this.lnTp, color.new(colTPFill, 93))
+
+    this.lbSig := label.new(this.startBar, this.sl,
+         this.isLong ? "BUY" : "SELL",
+         style = this.isLong ? label.style_label_up : label.style_label_down,
+         textcolor = mau_trong_suot,
+         color = mau_trong_suot,
+         size = lblSize)
+
+    this.lbEn := label.new(bar_index, this.en, "EN: " + str.tostring(this.en, format.mintick),
+         style = label.style_label_left,
+         textcolor = colEN,
+         color = mau_trong_suot,
+         size = lblSize)
+
+    this.lbSl := label.new(bar_index, this.sl, "SL: " + str.tostring(this.sl, format.mintick),
+         style = label.style_label_left,
+         textcolor = colSL,
+         color = mau_trong_suot,
+         size = lblSize)
+
+    this.lbTp := label.new(bar_index, this.tp, "TP: " + str.tostring(this.tp, format.mintick),
+         style = label.style_label_left,
+         textcolor = colTP,
+         color = mau_trong_suot,
+         size = lblSize)
+
+    this.dca := (this.en + this.sl) / 2
+
+//==================================================
+// METHOD – UPDATE
+//==================================================
+method update(TradeObj this) =>
+    if this.active
+        line.set_x2(this.lnEn, bar_index)
+        line.set_x2(this.lnSl, bar_index)
+        line.set_x2(this.lnTp, bar_index)
+
+        label.set_x(this.lbEn, bar_index)
+        label.set_x(this.lbSl, bar_index)
+        label.set_x(this.lbTp, bar_index)
+
+    in_f_dca_alert = false
+    float in_f_price = na    
+    if this.active and this.active_dca == false and this.startBar != bar_index
+        if (this.isLong and low < this.dca and low > this.sl) or (not this.isLong and high > this.dca and high < this.sl)
+            this.lnDca := line.new(this.startBar, this.dca, bar_index, this.dca, color = colDCA)
+            this.lbDca := label.new((this.startBar + bar_index) / 2, this.dca,
+                             this.isLong ? "\n\nDCA - " + str.tostring(this.dca, format.mintick) : "DCA - " + str.tostring(this.dca, format.mintick) + '\n\n',
+                             style = label.style_label_center,
+                             textcolor = colDCA,
+                             color = mau_trong_suot,
+                             size = lblSize)
+            this.active_dca := true
+            in_f_dca_alert := true
+            in_f_price := this.dca
+    if this.active and this.active_dca == true
+        line.set_x2(this.lnDca, bar_index)
+        label.set_x(this.lbDca, (this.startBar + bar_index) / 2)
+    [in_f_dca_alert, in_f_price]
+            
+
+//==================================================
+// METHOD – CHECK EXIT
+//==================================================
+method checkExit(TradeObj this) =>
+    if this.active
+        hitSL = this.isLong ? low <= this.sl : high >= this.sl
+        hitTP = this.isLong ? high >= this.tp : low <= this.tp
+
+        if hitSL or hitTP
+            this.active := false
+      
+
+//==================================================
+// ARRAY
+//==================================================
+var array<TradeObj> trades = array.new<TradeObj>()
+
+//==================================================
+// CREATE TRADE
+//==================================================
+createTrade(_isLong, _en, _sl, _tp) =>
+    t = TradeObj.new(_isLong, true, bar_index, _en, _sl, _tp,
+         na, na, na, na, na, na, na, na, na, na, na, na, false)
+    t.init()
+    array.push(trades, t)
+
+f_delete_lines(ar_a) =>
+    if array.size(ar_a) > 0 
+        for i = 0 to array.size(ar_a) - 1 
+            line.delete(array.get(ar_a, i))
+        array.clear(ar_a)
+
+f_delete_labels(ar_a) =>
+    if array.size(ar_a) > 0 
+        for i = 0 to array.size(ar_a) - 1 
+            label.delete(array.get(ar_a, i))
+        array.clear(ar_a)
+
+f_delete_linefill(ar_a) =>
+    if array.size(ar_a) > 0 
+        for i = 0 to array.size(ar_a) - 1 
+            linefill.delete(array.get(ar_a, i))
+        array.clear(ar_a)
+
+
+
+//==================================================
+// SIGNAL HANDLE
+//==================================================
+if isNewWeek
+    // 1️⃣ reset biến đếm
+    n_sl := 0
+    n_tp := 0
+
+    // 2️⃣ xóa toàn bộ object vẽ
+    f_delete_lines(line.all)
+    f_delete_labels(label.all)
+    f_delete_linefill(linefill.all)
+
+    // 3️⃣ xử lý mảng trade
+    if array.size(trades) > 0
+        array.clear(trades)
+
+
+if sigLong and isMonToFri
+    createTrade(true, enLong, slLong, tpLong)
+
+if sigShort and isMonToFri
+    createTrade(false, enShort, slShort, tpShort)
+
+//==================================================
+// LIMIT OBJECT COUNT
+//==================================================
+if i_an_thu_gon and array.size(trades) > 0
+    while array.size(trades) > 1
+        old = array.shift(trades)
+        line.delete(old.lnEn)
+        line.delete(old.lnSl)
+        line.delete(old.lnTp)
+        linefill.delete(old.lfSL)
+        linefill.delete(old.lfTP)
+        label.delete(old.lbSig)
+        label.delete(old.lbEn)
+        label.delete(old.lbSl)
+        label.delete(old.lbTp)
+        line.delete(old.lnDca)
+        label.delete(old.lbDca)
+   
+//==================================================
+// MAIN LOOP
+//==================================================
+dang_buy = false
+dang_sell = false
+
+if array.size(trades) > 0
+    tr = array.get(trades, array.size(trades) - 1)
+    [in_loop_dca_alert, in_loop_dca_price] = update(tr)
+    if tr.active
+        hitSL = tr.isLong ? low <= tr.sl : high >= tr.sl
+        hitTP = tr.isLong ? high >= tr.tp : low <= tr.tp
+        if hitTP
+            n_tp += 1
+            n_sl_lientiep := 0
+        else if hitSL
+            n_sl += 1
+            n_sl_lientiep += 1
+        if tr.en > tr.sl
+            dang_buy := true
+        else if  tr.en < tr.sl
+            dang_sell := true
+    checkExit(tr)
+    dca_alert := in_loop_dca_alert
+    dca_price := in_loop_dca_price
+
+//=============================================================================
+// alert
+
+buyJson = '{"secret":"' + backendSecret + '","signal_id":"gsalgovip-xauusd","action":"BUY","symbol":"XAUUSD","bot_code":"gsalgovip"}'
+sellJson = '{"secret":"' + backendSecret + '","signal_id":"gsalgovip-xauusd","action":"SELL","symbol":"XAUUSD","bot_code":"gsalgovip"}'
+
+if i_alert_4 and chuan_bi_sell_loc and isMonToFri
+    alert("🔔 Chuẩn bị Sell" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar_close)
+else if i_alert_4 and chuan_bi_buy_loc and isMonToFri
+    alert("🔔 Chuẩn bị Buy" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar_close)
+
+if sigLong and isMonToFri and i_alert_1
+    alert(buyJson, alert.freq_once_per_bar_close)
+else if sigShort and isMonToFri and i_alert_1
+    alert(sellJson, alert.freq_once_per_bar_close)
+else if sigLong and isMonToFri and i_alert_2
+    alert(buyJson, alert.freq_once_per_bar)
+else if sigShort and isMonToFri and i_alert_2
+    alert(sellJson, alert.freq_once_per_bar)
+
+if (slbuyAlertTick or slsellAlertTick) and n_sl_lientiep >= 2 and  i_alert_3 and isMonToFri 
+    alert("🔔 Đã chạm " + str.tostring(n_sl_lientiep) + " SL", alert.freq_once_per_bar)
+
+if i_alert_7 and n_tp[1] < n_tp[0] and tpbuyAlertTick and isMonToFri
+    alert("🔔 Chạm TP Buy" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
+else if i_alert_7 and n_tp[1] < n_tp[0] and tpsellAlertTick and isMonToFri
+    alert("🔔 Chạm TP Sell" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
+else if i_alert_7 and n_sl[1] < n_sl[0] and slbuyAlertTick and isMonToFri
+    alert("🔔 Chạm SL Buy" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
+else if i_alert_7 and n_sl[1] < n_sl[0] and slsellAlertTick and isMonToFri
+    alert("🔔 Chạm SL Sell" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
+
+//if i_alert_5 and not dca_alert[1] and dca_alert and dang_buy and isMonToFri
+//    alert("🔔 DCA Buy - " + str.tostring(dca_price) + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar_close)
+//else if i_alert_5 and not dca_alert[1] and dca_alert and dang_sell and isMonToFri
+//    alert("🔔 DCA Sell - " + str.tostring(dca_price) + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar_close)
+
+if i_alert_5 and not dca_alert[1] and dca_alert and dang_buy and isMonToFri
+    alert("🟢 Buy - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ DCA: " + str.tostring(dca_price, format.mintick) + "\n" + "❌ SL:" + str.tostring(lastTS.entryPrice - use_SL, format.mintick) + "\n" + "✅ TP:" + str.tostring(lastTS.entryPrice + use_TP, format.mintick), alert.freq_once_per_bar_close)
+else if i_alert_5 and not dca_alert[1] and dca_alert and dang_sell and isMonToFri
+    alert("🔴 Sell - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ DCA: " + str.tostring(dca_price, format.mintick) + "\n" + "❌ SL:" + str.tostring(lastTS.entryPrice + use_SL, format.mintick) + "\n" + "✅ TP:" + str.tostring(lastTS.entryPrice - use_TP, format.mintick), alert.freq_once_per_bar_close)
+else if i_alert_6 and not dca_alert[1] and dca_alert and dang_buy and isMonToFri
+    alert("🟢 Buy - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ DCA: " + str.tostring(dca_price, format.mintick) + "\n" + "❌ SL:" + str.tostring(lastTS.entryPrice - use_SL, format.mintick) + "\n" + "✅ TP:" + str.tostring(lastTS.entryPrice + use_TP, format.mintick), alert.freq_once_per_bar)
+else if i_alert_6 and not dca_alert[1] and dca_alert and dang_sell and isMonToFri
+    alert("🔴 Sell - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ DCA: " + str.tostring(dca_price, format.mintick) + "\n" + "❌ SL:" + str.tostring(lastTS.entryPrice + use_SL, format.mintick) + "\n" + "✅ TP:" + str.tostring(lastTS.entryPrice - use_TP, format.mintick), alert.freq_once_per_bar)
+
+
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//#region Backtesting Dashboard
+
+if barstate.islast and i_bang_tk_1
+
+    var table t_1 = table.new(position = i_vitri_bang_1, columns = 3, rows = 15, bgcolor = mau_trong_suot,
+     frame_color = color.rgb(0, 0, 0), frame_width = 1, border_color = color.rgb(0, 0, 0), border_width = 1, force_overlay = true)
+
+    table.merge_cells(t_1, 0, 0, 2, 0)
+    table.cell(t_1, 0, 0, "BẢNG THỐNG KÊ", bgcolor = i_mau_bang_tk_1, text_size = i_size_chu_bang_tk_1, text_color = i_mau_chu_bang_tk_1, text_formatting = text.format_bold)//"BẢNG THỐNG KÊ"
+    table.cell(t_1, 0, 1, "Tổng", bgcolor = i_mau_bang_tk_1, text_size = i_size_chu_bang_tk_1, text_color = i_mau_chu_bang_tk_1, text_formatting = text.format_bold)
+    table.cell(t_1, 0, 2, "Thắng", bgcolor = i_mau_bang_tk_1, text_size = i_size_chu_bang_tk_1, text_color = i_mau_chu_bang_tk_1, text_formatting = text.format_bold)
+    table.cell(t_1, 0, 3, "Thua", bgcolor = i_mau_bang_tk_1, text_size = i_size_chu_bang_tk_1, text_color = i_mau_chu_bang_tk_1, text_formatting = text.format_bold)
+    //table.cell(t_1, 0, 4, "Vốn", bgcolor = i_mau_bang_tk_1, text_size = i_size_chu_bang_tk_1, text_color = i_mau_chu_bang_tk_1, text_formatting = text.format_bold)
+    //table.cell(t_1, 0, 5, "Khối lượng", bgcolor = i_mau_bang_tk_1, text_size = i_size_chu_bang_tk_1, text_color = i_mau_chu_bang_tk_1, text_formatting = text.format_bold)
+
+    table.merge_cells(t_1, 1, 1, 2, 1)
+    table.cell(t_1, 1, 1, str.tostring(n_tp + n_sl), bgcolor = i_mau_bang_tk_1, text_size = i_size_chu_bang_tk_1, text_color = i_mau_chu_bang_tk_1, text_formatting = text.format_bold)
+    table.cell(t_1, 1, 2, str.tostring(n_tp), bgcolor = i_mau_bang_tk_1, text_size = i_size_chu_bang_tk_1, text_color = i_mau_chu_bang_tk_1, text_formatting = text.format_bold)
+    table.cell(t_1, 1, 3, str.tostring(n_sl), bgcolor = i_mau_bang_tk_1, text_size = i_size_chu_bang_tk_1, text_color = i_mau_chu_bang_tk_1, text_formatting = text.format_bold)
+    //table.cell(t_1, 1, 4, str.tostring(math.round(array.avg(ar_biendo), 2)), bgcolor = i_mau_bang_tk_1, text_size = i_size_chu_bang_tk_1, text_color = i_mau_chu_bang_tk_1, text_formatting = text.format_bold)
+    //table.cell(t_1, 1, 5, str.tostring(math.round(bien_do_new, 2)), bgcolor = i_mau_bang_tk_1, text_size = i_size_chu_bang_tk_1, text_color = i_mau_chu_bang_tk_1, text_formatting = text.format_bold)
+
+    //table.cell(t_1, 2, 1, "", bgcolor = color.rgb(242, 255, 0), text_size = i_size_chu_bang_tk_1, text_color = i_mau_chu_bang_tk_1, text_formatting = text.format_bold)
+    table.cell(t_1, 2, 2, str.tostring(math.round(n_tp / (n_tp + n_sl) * 100, 2)) + "%", bgcolor = i_mau_bang_tk_1, text_size = i_size_chu_bang_tk_1, text_color = i_mau_chu_bang_tk_1, text_formatting = text.format_bold)
+    table.cell(t_1, 2, 3, str.tostring(math.round(n_sl / (n_tp + n_sl) * 100, 2)) + "%", bgcolor = i_mau_bang_tk_1, text_size = i_size_chu_bang_tk_1, text_color = i_mau_chu_bang_tk_1, text_formatting = text.format_bold)
+
+//#endregion

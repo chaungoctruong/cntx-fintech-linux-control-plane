@@ -1,4 +1,8 @@
 {
+  "git.autoRepositoryDetection": "subFolders",
+  "git.scanRepositories": [
+    "bot-trading/gsalgo"
+  ],
   "remote.portsAttributes": {
     "80": { "label": "Nginx (Web công cộng)" },
     "8001": { "label": "Backend (Uvicorn)" },

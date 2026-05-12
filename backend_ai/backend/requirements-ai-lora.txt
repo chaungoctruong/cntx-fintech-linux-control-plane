@@ -1,5 +1,5 @@
-# Optional LoRA training stack. Install on a dedicated AI/GPU training machine,
-# not on the Linux control-plane runtime unless explicitly approved.
+# Optional LoRA training stack — NOT used by default Docker build (see requirements.txt header).
+# Install on a dedicated AI/GPU training machine, not on the Linux control-plane runtime unless explicitly approved.
 llamafactory>=0.9.0,<1
 transformers>=4.45,<5
 datasets>=2.20,<4

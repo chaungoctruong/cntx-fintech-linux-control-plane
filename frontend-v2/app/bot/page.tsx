@@ -19,6 +19,7 @@ import Mt5BotControlPanel from "@/components/Bot/Mt5BotControlPanel";
 import PageHeader from "@/components/PageHeader";
 import { useMiniappTerms } from "@/hooks/useMiniappTerms";
 import {
+  BackendAPIError,
   connectMt5Account,
   createCTraderAuthorizeUrl,
   discoverCTraderAccounts,
@@ -31,9 +32,10 @@ import {
   fetchMt5BotCatalog,
   fetchMiniappAccess,
   getBackendErrorCode,
+  pollMt5AccountVerificationJob,
   refreshCTraderConnection,
+  requestMt5AccountVerification,
   selectDefaultCTraderAccount,
-  startMt5Deployment,
   startCTraderDeployment,
   stopCTraderDeployment,
   type CTraderBotCatalogItem,
@@ -45,7 +47,6 @@ import {
   type ConnectMt5AccountRequest,
   type MT5AccountItem,
   type MT5BotCatalogItem,
-  type StartMt5DeploymentResponse,
 } from "@/lib/api";
 import { readStoredMt5Broker, writeStoredMt5Broker } from "@/lib/mt5-preferences";
 import { getTelegramTenantUserId, waitForTelegramTenantUserId } from "@/lib/telegram";
@@ -60,9 +61,41 @@ type BrokerPreset = {
 };
 
 const DBG_MARKETS_BROKER_NAME = "DBG Markets";
-const DBG_MARKETS_FIXED_SERVER = "DBGMarkets-Live";
 const DBG_MARKETS_SERVER_PENDING_LABEL = "Server đang cập nhật";
-const SERVER_PENDING_BROKER_NAMES = ["Exness", "XM", "Vantage"] as const;
+const DEFAULT_MT5_FIXED_SERVERS = [[DBG_MARKETS_BROKER_NAME, "DBGMarkets-Live"]] as const;
+const DEFAULT_SERVER_PENDING_BROKER_NAMES = ["XM", "Vantage"] as const;
+
+function parsePublicEnvList(raw: string | undefined, fallback: readonly string[]): string[] {
+  if (raw === undefined) {
+    return [...fallback];
+  }
+  return raw
+    .split(/[,\n;]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function parsePublicEnvFixedServers(raw: string | undefined): Map<string, string> {
+  const entries = raw === undefined
+    ? DEFAULT_MT5_FIXED_SERVERS
+    : raw
+        .split(/[,\n;]/)
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .map((item) => {
+          const [broker, ...serverParts] = item.split("=");
+          return [broker?.trim() || "", serverParts.join("=").trim()] as const;
+        })
+        .filter(([broker, server]) => broker && server);
+
+  return new Map(entries.map(([broker, server]) => [normalizeBrokerName(broker), server]));
+}
+
+const SERVER_PENDING_BROKER_NAMES = parsePublicEnvList(
+  process.env.NEXT_PUBLIC_MT5_SERVER_PENDING_BROKERS,
+  DEFAULT_SERVER_PENDING_BROKER_NAMES
+);
+const MT5_FIXED_SERVERS = parsePublicEnvFixedServers(process.env.NEXT_PUBLIC_MT5_FIXED_SERVERS);
 
 const brokerPresets: BrokerPreset[] = [
   {
@@ -122,19 +155,6 @@ const MT5_VERIFICATION_PHASE_LABEL: Record<Mt5VerificationPhase, string> = {
   VERIFIED: "Đã lưu account thành công.",
   FAILED: "MT5 báo lỗi đăng nhập.",
 };
-
-function getMt5StartResponseDeploymentId(response: StartMt5DeploymentResponse): number | null {
-  if (typeof response.deployment_id === "number" && Number.isFinite(response.deployment_id)) {
-    return response.deployment_id;
-  }
-  const deployment = response.deployment;
-  if (deployment && typeof deployment === "object" && !Array.isArray(deployment)) {
-    const value = (deployment as Record<string, unknown>).id;
-    const parsed = typeof value === "number" ? value : Number(value);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-  }
-  return null;
-}
 
 type FormState = {
   broker: string;
@@ -547,7 +567,16 @@ function isServerPendingBroker(brokerName?: string | null): boolean {
 }
 
 function getFixedMt5Server(brokerName?: string | null): string | null {
-  return brokerNamesMatch(brokerName, DBG_MARKETS_BROKER_NAME) ? DBG_MARKETS_FIXED_SERVER : null;
+  const key = normalizeBrokerName(brokerName);
+  return key ? MT5_FIXED_SERVERS.get(key) ?? null : null;
+}
+
+function isReservedMt5ServerValue(server?: string | null): boolean {
+  const value = String(server || "").trim();
+  return Boolean(value) && (
+    value === DBG_MARKETS_SERVER_PENDING_LABEL ||
+    Array.from(MT5_FIXED_SERVERS.values()).some((fixedServer) => fixedServer === value)
+  );
 }
 
 function isReadyMt5Account(account: MT5AccountItem): boolean {
@@ -1189,7 +1218,7 @@ export default function BotPage() {
     }
 
     if (!selectedBrokerServerPending) {
-      if (form.server === DBG_MARKETS_SERVER_PENDING_LABEL || form.server === DBG_MARKETS_FIXED_SERVER) {
+      if (isReservedMt5ServerValue(form.server)) {
         setForm((current) => ({
           ...current,
           server: "",
@@ -1364,6 +1393,27 @@ export default function BotPage() {
 
     try {
       const connected = await connectMt5Account(payload);
+      setMt5VerificationPhase("SUBMITTED");
+
+      const verifyStarted = await requestMt5AccountVerification({ account_id: connected.account_id });
+      const verifyJobId = Number(verifyStarted.job_id ?? verifyStarted.verification_job_id ?? verifyStarted.id ?? 0);
+      if (!verifyJobId) {
+        throw new BackendAPIError("Backend không trả verification_job_id sau khi tạo job xác minh.", {
+          status: 502,
+          code: "verification_job_id_missing",
+        });
+      }
+      setMt5VerificationPhase("VERIFYING_MT5");
+      const finalVerify = await pollMt5AccountVerificationJob(verifyJobId, { intervalMs: 2000, maxAttempts: 90 });
+      const terminal = String(finalVerify.job_status ?? finalVerify.status ?? "").toLowerCase();
+      if (terminal === "failed" || terminal === "cancelled") {
+        const hint =
+          (typeof finalVerify.last_error === "string" && finalVerify.last_error) ||
+          (typeof finalVerify.user_message_key === "string" && finalVerify.user_message_key) ||
+          "Xác minh MT5 thất bại.";
+        throw new BackendAPIError(hint, { status: 409, code: "mt5_verification_failed" });
+      }
+
       setMt5VerificationPhase("ASSIGNED");
 
       let claimedEntitlementId: string | undefined;
@@ -1391,14 +1441,6 @@ export default function BotPage() {
         }
       }
 
-      setMt5VerificationPhase("VERIFYING_MT5");
-      const startResponse = await startMt5Deployment({
-        account_id: connected.account_id,
-        bot_name: selectedMt5Bot.bot_name,
-        entitlement_id: mt5FullAccess ? undefined : claimedEntitlementId,
-      });
-      const deploymentId = getMt5StartResponseDeploymentId(startResponse);
-
       setForm((current) => ({
         ...current,
         login: "",
@@ -1406,12 +1448,11 @@ export default function BotPage() {
         label: "",
       }));
       setMt5BotTokenInput("");
+      setMt5VerificationPhase("VERIFIED");
       setNotice({
         tone: "success",
-        message: deploymentId
-          ? `Đã lưu tài khoản và gửi lệnh bật bot ${selectedMt5Bot.display_name}.`
-          : `Đã lưu tài khoản và đang bật bot ${selectedMt5Bot.display_name}.`,
-        });
+        message: `Đã lưu tài khoản. Bạn có thể bật bot ${selectedMt5Bot.display_name} ở panel điều khiển.`,
+      });
       writeStoredMt5Broker(resolvedBroker);
       setMt5WorkspaceTab("control");
     } catch (error) {
@@ -1807,9 +1848,7 @@ export default function BotPage() {
                             server: getFixedMt5Server(preset.name) ??
                               (isServerPendingBroker(preset.name)
                               ? DBG_MARKETS_SERVER_PENDING_LABEL
-                              : current.server === DBG_MARKETS_SERVER_PENDING_LABEL
-                                ? ""
-                                : current.server === DBG_MARKETS_FIXED_SERVER
+                              : isReservedMt5ServerValue(current.server)
                                 ? ""
                                 : current.server),
                           }));
@@ -2018,7 +2057,7 @@ export default function BotPage() {
                                 />
                                 {selectedBrokerFixedServer && (
                                   <p className="text-xs leading-5 text-cyan-100">
-                                    Server DBG được cố định: {selectedBrokerFixedServer}.
+                                    Server được cố định: {selectedBrokerFixedServer}.
                                   </p>
                                 )}
                                 {selectedBrokerServerPending && (

@@ -13,6 +13,7 @@ function buildApiUrl(baseUrl: string, path: string): string {
 
 const TELEGRAM_INIT_DATA_WAIT_MS = 2500;
 const TELEGRAM_INIT_DATA_POLL_MS = 50;
+const API_REQUEST_TIMEOUT_MS = 12000;
 
 function getBackendBaseUrl(): string {
   if (typeof window !== "undefined" && (window as unknown as { __BACKEND_URL?: string }).__BACKEND_URL) {
@@ -85,6 +86,7 @@ export interface FetchFromAPIOptions extends RequestInit {
   /** Protected endpoints wait briefly for Telegram initData by default. */
   authMode?: "required" | "optional" | "none";
   authWaitMs?: number;
+  timeoutMs?: number;
 }
 
 export interface BackendErrorInfo {
@@ -122,6 +124,7 @@ const friendlyErrorMessages: Record<string, string> = {
     "Mỗi Telegram ID chỉ được dùng 1 bot tại một thời điểm. Hãy tắt bot hiện tại trước khi bật bot khác.",
   bot_control_cooldown_active:
     "Bạn vừa bật/tắt bot. Vui lòng chờ đủ 60 giây rồi thao tác lại.",
+  telegram_init_data_missing: "Vui lòng mở trong Telegram Mini App để tiếp tục.",
   rate_limited: "Bạn thao tác hơi nhanh. Vui lòng chờ một chút rồi thử lại.",
   bot_token_required: "Bạn cần nhập token để mở quyền cho bot này.",
   bot_token_not_found: "Token không đúng hoặc không tồn tại.",
@@ -217,6 +220,7 @@ export async function fetchFromAPI<T = unknown>(
     initData: customInitData,
     authMode = "required",
     authWaitMs = TELEGRAM_INIT_DATA_WAIT_MS,
+    timeoutMs = API_REQUEST_TIMEOUT_MS,
     headers = {},
     ...rest
   } = options;
@@ -227,6 +231,17 @@ export async function fetchFromAPI<T = unknown>(
       : authMode === "optional"
         ? getInitData()
         : "");
+  if (authMode === "required" && !initData) {
+    throw new BackendAPIError("Vui lòng mở trong Telegram Mini App để tiếp tục.", {
+      status: 0,
+      code: "telegram_init_data_missing",
+      errorInfo: {
+        public_code: "telegram_init_data_missing",
+        message_vi: "Vui lòng mở trong Telegram Mini App để tiếp tục.",
+        retryable: false,
+      },
+    });
+  }
   const url = buildApiUrl(getBaseUrl(), path);
 
   const authHeaders: Record<string, string> = {};
@@ -234,14 +249,35 @@ export async function fetchFromAPI<T = unknown>(
     authHeaders.Authorization = `tma ${initData}`;
   }
 
-  const res = await fetch(url, {
-    ...rest,
-    headers: {
-      "Content-Type": "application/json",
-      ...authHeaders,
-      ...headers,
-    },
-  });
+  const controller =
+    typeof AbortController !== "undefined" && timeoutMs > 0 ? new AbortController() : null;
+  const timeoutId = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...rest,
+      ...(controller ? { signal: controller.signal } : {}),
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeaders,
+        ...headers,
+      },
+    });
+  } catch (error) {
+    const errorName = error && typeof error === "object" ? (error as { name?: string }).name : "";
+    if (errorName === "AbortError") {
+      throw new BackendAPIError("Kết nối backend quá thời gian chờ. Vui lòng thử lại.", {
+        status: 0,
+        code: "request_timeout",
+      });
+    }
+    throw error;
+  } finally {
+    if (timeoutId != null) {
+      clearTimeout(timeoutId);
+    }
+  }
 
   if (!res.ok) {
     const text = await res.text();
@@ -366,6 +402,33 @@ export interface ConnectMt5AccountResponse {
   account_id: number;
   status: string;
   account: MT5AccountItem;
+  verification_job_id?: number | null;
+  job_id?: number | null;
+  verification_state?: string | null;
+  verification_ui_state?: string | null;
+  next_action?: string | null;
+}
+
+export interface Mt5AccountVerifyRequest {
+  account_id: number;
+}
+
+/** Response from POST /api/v2/accounts/verify or GET /api/v2/accounts/verifications/{job_id} */
+export interface Mt5AccountVerificationJobResponse {
+  id?: number | null;
+  job_id?: number | null;
+  verification_job_id?: number | null;
+  account_id?: number | null;
+  status?: string | null;
+  job_status?: string | null;
+  verification_state?: string | null;
+  verification_ui_state?: string | null;
+  user_message_key?: string | null;
+  detail?: string | null;
+  account?: MT5AccountItem;
+  job?: Record<string, unknown> | null;
+  last_error?: string | null;
+  [key: string]: unknown;
 }
 
 export interface DeleteMt5AccountResponse {
@@ -381,6 +444,7 @@ export interface StartMt5DeploymentRequest {
   bot_name: string;
   bot_config_overrides?: Record<string, unknown>;
   entitlement_id?: string;
+  lot_size?: number;
 }
 
 export interface StartMt5DeploymentResponse {
@@ -772,6 +836,44 @@ export function connectMt5Account(body: ConnectMt5AccountRequest): Promise<Conne
   });
 }
 
+export function requestMt5AccountVerification(body: Mt5AccountVerifyRequest): Promise<Mt5AccountVerificationJobResponse> {
+  return fetchFromAPI<Mt5AccountVerificationJobResponse>("/api/v2/accounts/verify", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+export function fetchMt5AccountVerificationJob(jobId: number): Promise<Mt5AccountVerificationJobResponse> {
+  return fetchFromAPI<Mt5AccountVerificationJobResponse>(`/api/v2/accounts/verifications/${encodeURIComponent(String(jobId))}`, {
+    timeoutMs: 15000,
+  });
+}
+
+/**
+ * Poll until job reaches a terminal status (verified / failed / cancelled).
+ */
+export async function pollMt5AccountVerificationJob(
+  jobId: number,
+  options?: { intervalMs?: number; maxAttempts?: number }
+): Promise<Mt5AccountVerificationJobResponse> {
+  const intervalMs = options?.intervalMs ?? 2000;
+  const maxAttempts = options?.maxAttempts ?? 90;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const job = await fetchMt5AccountVerificationJob(jobId);
+    const raw = String(job.job_status ?? job.status ?? "").toLowerCase();
+    if (raw === "verified" || raw === "failed" || raw === "cancelled") {
+      return job;
+    }
+    await new Promise<void>((resolve) => {
+      window.setTimeout(resolve, intervalMs);
+    });
+  }
+  throw new BackendAPIError(
+    "Xác minh MT5 quá lâu. Kiểm tra runner Windows đang chạy và thử lại, hoặc xem trạng thái trong panel điều khiển.",
+    { status: 408, code: "verification_poll_timeout" }
+  );
+}
+
 export function deleteMt5Account(accountId: number): Promise<DeleteMt5AccountResponse> {
   return fetchFromAPI<DeleteMt5AccountResponse>(`/api/v2/accounts/${accountId}`, {
     method: "DELETE",
@@ -781,7 +883,7 @@ export function deleteMt5Account(accountId: number): Promise<DeleteMt5AccountRes
 
 export function fetchMt5BotCatalog(forceSync = false): Promise<MT5BotCatalogResponse> {
   const query = forceSync ? "?force_sync=true" : "";
-  return fetchFromAPI<MiniBotCatalogItem[]>(`/api/v2/mini/bots${query}`).then((items) => ({
+  const mapItems = (items: MiniBotCatalogItem[]): MT5BotCatalogResponse => ({
     items: items.map((bot) => ({
       bot_id: bot.bot_id || bot.bot_code,
       bot_name: bot.bot_name,
@@ -802,7 +904,18 @@ export function fetchMt5BotCatalog(forceSync = false): Promise<MT5BotCatalogResp
       checksum: bot.checksum || "",
       source_path: bot.source_path || "",
     })),
-  }));
+  });
+
+  return fetchFromAPI<MiniBotCatalogItem[]>(`/api/v2/mini/bots${query}`)
+    .then(mapItems)
+    .catch((error) => {
+      if (!(error instanceof BackendAPIError) || error.status !== 401) {
+        throw error;
+      }
+      return fetchFromAPI<{ items: MiniBotCatalogItem[] }>(`/api/v2/bots${query}`, {
+        authMode: "none",
+      }).then((payload) => mapItems(payload.items || []));
+    });
 }
 
 export function fetchMt5BotTokenEntitlements(accountId: number): Promise<MT5BotTokenEntitlementsResponse> {

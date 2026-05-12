@@ -2,6 +2,26 @@
 # `bot-trading/` is a backend-side bot repository (for example backend
 # integrations such as `backend-ctrader`), not a Mini App static asset.
 # Never upload it to a frontend hosting provider or Mini App deployment.
+
+# Local secrets and runtime output.
+.env*
+!.env.example
+!.env.*.example
+*.log
+nohup.out
+
+# Local tooling, caches, dependencies, and generated builds.
+.git/
+.vercel/
+.cursor/
+.vscode/
+node_modules/
+**/node_modules/
+.next/
+out/
+frontend-v2/.next/
+frontend-v2/out/
+
 bot-trading/
 trading-bot/
 
@@ -14,4 +34,6 @@ backend_ai/
 hubbot/
 ops/
 runner/
-scripts/
+/scripts/
+!frontend-v2/scripts/
+!frontend-v2/scripts/**

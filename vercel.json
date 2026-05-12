@@ -1,0 +1,24 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "cd frontend-v2 && npm ci",
+  "buildCommand": "cd frontend-v2 && npm run build",
+  "outputDirectory": "frontend-v2/out",
+  "rewrites": [
+    {
+      "source": "/telegram/webhook",
+      "destination": "http://103.56.161.178:8081/telegram/webhook"
+    },
+    {
+      "source": "/ready",
+      "destination": "http://103.56.161.178:8001/ready"
+    },
+    {
+      "source": "/health",
+      "destination": "http://103.56.161.178:8001/health"
+    },
+    {
+      "source": "/api/v2/:path*",
+      "destination": "http://103.56.161.178:8001/api/v2/:path*"
+    }
+  ]
+}

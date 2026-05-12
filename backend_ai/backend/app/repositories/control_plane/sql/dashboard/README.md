@@ -1,9 +1,18 @@
-# Dashboard SQL
+# `dashboard/` — SQL snapshot dashboard user
 
-## Nhiệm vụ
-- Chứa các truy vấn tổng hợp nhẹ cho dashboard (accounts, deployments, pnl).
-- Tối ưu để lấy nhanh snapshot theo user.
+Truy vấn **tổng hợp nhẹ** cho Mini App dashboard: account, deployment, PnL summary — tránh logic nặng trong API.
+
+## File `.sql` (inventory)
+
+- `get_dashboard_account_summary.sql`
+- `get_dashboard_deployment_summary.sql`
+- `get_dashboard_pnl_summary.sql`
+
+## Gắn với Python
+
+- Mixin dashboard / miniapp service — tìm `load_sql("dashboard/`.
 
 ## Lưu ý an toàn
-- Giữ output schema ổn định để API/FE không bị vỡ.
-- Tránh đưa logic xử lý phức tạp vào đây; chỉ tổng hợp dữ liệu.
+
+- Giữ **tên cột output** ổn định (FE parse theo field).
+- Chỉ aggregate; không nhét business rule phức tạp vào SQL này.

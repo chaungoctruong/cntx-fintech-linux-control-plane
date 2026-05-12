@@ -1,327 +1,389 @@
-# Spider AI — Hướng dẫn chạy project A→Z
+# Spider AI — Linux control plane (CNTX MT5 SaaS)
 
-Monorepo gồm:
+**Repo này** là control-plane trên Linux cho nền tảng Spider AI: **không** chạy MT5 trực tiếp. **Lệnh điều khiển bot** (`START_BOT`, `PLACE_ORDER`, …) Linux publish xuống **Redis** (queue per `runner_id`); runner Windows dùng **`RUNNER_TRANSPORT=redis_queue`**. **HTTP** (`/api/v2/runner/*`) chỉ cho luồng ngắn: đăng ký, heartbeat, events, delivery — theo hợp đồng command/event.
 
-- **`backend_ai/backend/`** — FastAPI control-plane (Postgres + Redis), expose `/health`, `/ready`, `/api/v2/*`. Cũng serve Mini App static (Next.js export).
-- **`hubbot/`** — Telegram bot (python-telegram-bot, long-poll), gọi backend qua HTTP.
-- **`frontend-v2/`** — Next.js 14 Mini App, build static export → backend mount tại `/_next` và serve HTML qua catch-all.
-- **`runner/`** — Windows MT5 runner (không nằm trong compose, deploy riêng).
-- **`docker-compose.yml`** — local/dev: Postgres + Redis + spider-app + hubbot.
-- **`ecosystem.config.js`** — PM2 cho production-style trên Linux host (`/root/spider-ai/...`).
+**Mục lục nhanh:** [Tổng quan](#1-tổng-quan-dự-án) · [Quy tắc an toàn production](#2-quy-tắc-an-toàn-production) · [Kiến trúc](#3-tóm-tắt-kiến-trúc) · [Thư mục](#4-bản-đồ-thư-mục) · [VPS mới](#5-fresh-vps--setup-an-toàn) · [Biến môi trường](#6-biến-môi-trường-theo-nhóm) · [Lệnh an toàn](#7-lệnh-thường-dùng-chỉ-read-only--trạng-thái) · [Checklist deploy](#8-checklist-deploy) · [Windows runner](#9-tích-hợp-windows-runner) · [Compose A→Z](#10-local-dev--docker-compose-a-z) · [Troubleshooting](#11-troubleshooting) · [Scale](#12-gợi-ý-scale) · [Rollback tài liệu](#13-rollback-tài-liệu--repo)
 
-Tài liệu này tập trung **luồng A — Docker Compose** vì đây là cách nhanh nhất đưa toàn bộ chạy trên 1 máy. Luồng PM2 được nhắc cuối file.
+**Chỉ mục tài liệu đầy đủ:** [docs/DOCS_INDEX.md](docs/DOCS_INDEX.md)
+
+## Release freeze / server scaling
+
+Guardrail khi đóng băng cấu hình hoặc thêm server control-plane (không thay logic runtime):
+
+- [docs/CONFIG_MANIFEST_TEMPLATE.md](docs/CONFIG_MANIFEST_TEMPLATE.md) — manifest từng máy (placeholder, không secret)
+- [docs/SCALE_NEW_SERVER_RUNBOOK.md](docs/SCALE_NEW_SERVER_RUNBOOK.md) — clone tag, venv, env, preflight, health
+- [docs/RELEASE_FREEZE_CHECKLIST.md](docs/RELEASE_FREEZE_CHECKLIST.md) — checklist trước tag / scale
+
+Preflight read-only: `bash ops/preflight_linux_control_plane.sh` (tuỳ chọn `BACKEND_ENV_FILE=...`).
 
 ---
 
-## 1. Yêu cầu hệ thống
+## 1. Tổng quan dự án
+
+| Thành phần | Vai trò |
+|------------|---------|
+| **backend_ai/** | FastAPI: API `/api/v2/*`, ingest runner, TradingView broadcast, orchestration; Postgres = source of truth; Redis = queue/stream/cache; serve static Mini App (`frontend-v2/out`) |
+| **hubbot/** | Telegram bot (long-poll mặc định), gọi backend HTTP + `X-Backend-Api-Key` |
+| **frontend-v2/** | Next.js 14, `output: "export"` — build ra HTML/JS tĩnh, mount vào backend |
+| **Redis** | Command queue, event transport, cache (theo module) |
+| **PostgreSQL** | User, account, deployment, command state, subscriptions, … |
+| **Nginx** (tuỳ deploy) | TLS, reverse proxy tới Uvicorn — xem `nginx.conf` / `config/` |
+| **runner/** (trong repo) | Stub/reference + tài liệu hợp đồng; runner production trên Windows là repo/process riêng |
+| **bot-trading/** | Registry package bot trên Linux (thường có `bot_manifest.json`); clone tối giản có thể **rỗng** — lấy package từ release nội bộ. Không chứa secret. |
+| **ops/** | Preflight read-only, helper `compose-*.sh`, smoke `monitoring/check_prod_readiness.sh` |
+| **docs/** | Runbook bổ sung (mesh, TradingView, index) |
+
+**Health (backend):** `GET /health` (chi tiết), `GET /ready` (readiness), `GET /api/v2/system/healthz` (probe legacy).
+
+**TradingView (nếu bật):** public broadcast — xem [docs/TRADINGVIEW_MT5_WEBHOOK_RUNBOOK.md](docs/TRADINGVIEW_MT5_WEBHOOK_RUNBOOK.md).
+
+---
+
+## 2. Quy tắc an toàn production
+
+- **Không** sửa `.env`, `.env.dev`, `secrets/*`, hoặc dán secret/token/password vào tài liệu, issue, log công khai.
+- **Không** `FLUSHALL`, truncate/drop DB, hay thao tác xoá dữ liệu ngoài cửa sổ bảo trì có kế hoạch rollback.
+- **Không** restart/kill process production (PM2, systemd, container) khi chưa có maintenance window và owner dịch vụ.
+- **Không** deploy frontend/backend mới lên prod khi chưa có checklist (env build-time `NEXT_PUBLIC_*`, `BACKEND_API_KEY`, tunnel/domain).
+- Mọi thay đổi **runtime** (Python/JS, router, migration) phải qua review riêng — README này chỉ định hướng vận hành.
+
+---
+
+## 3. Tóm tắt kiến trúc
+
+```text
+User (Telegram) ──► Hubbot (long-poll) ──HTTP──► FastAPI backend
+                        │                        │
+ Mini App (HTTPS) ◄───┴────────────────────────┤ static export
+                                                 │
+                    Postgres ◄──ORM/repo/state──┤
+                    Redis ◄──queue/stream──────┤
+                                                 │
+ Windows Runner fleet ◄──Redis: lệnh; HTTP: events/heartbeat/register──┘
+        │
+        ▼
+     MT5 ──► Broker
+```
+
+- **Control plane** (Linux): quyết định, lưu state, publish lệnh lên **Redis**; HTTP runner chỉ tác vụ điều phối ngắn.
+- **Execution plane** (Windows): MT5 terminal, worker/slot, báo event ngược.
+
+---
+
+## 4. Bản đồ thư mục
+
+| Path | Mô tả ngắn |
+|------|------------|
+| `backend_ai/` | Dockerfile build `spider-app`; code FastAPI dưới `backend_ai/backend/` — onboarding: [backend_ai/README.md](backend_ai/README.md) |
+| `hubbot/` | Dockerfile `hubbot`; `requirements.txt` riêng |
+| `frontend-v2/` | Next 14; `package.json` + `package-lock.json` — **Node 20** khi build trong Linux container |
+| `bot-trading/` | Package bot chuẩn hoá (có thể rỗng trên clone); không có `requirements.txt` Python trong thư mục này |
+| `runner/` | Tham chiếu schema / prompt tích hợp Windows |
+| `config/` | Ghi chú nginx / handoff cấu hình |
+| `docs/` | Runbook + **[DOCS_INDEX.md](docs/DOCS_INDEX.md)** |
+| `ops/` | Compose dev helper, monitoring notes |
+| `logs/` | Thư mục log runtime (thường bind mount) — không commit |
+| `secrets/` | Chỉ trên máy chủ — **không** commit |
+| `nginx.conf` | Baseline sample |
+| `docker-compose.yml` | Dev/local: `db`, `redis`, `spider-app`, `hubbot` |
+| `ecosystem.config.js` | PM2 mẫu (path host hard-code — chỉnh theo server thật) |
+| `vercel.json` | Tuỳ chọn — Vercel build Mini App; **`rewrites`** phải trỏ tới backend Linux **reachable từ edge Vercel** (thường `http://<PUBLIC_IP>:8001` API, `:8081` webhook). **Cập nhật** khi đổi VPS/domain; không commit IP môi trường khác nếu fork công khai. |
+| `DEPLOY_FRESH_VPS.md` | Checklist VPS Rocky/RHEL + Docker |
+| `CLAUDE.md` | Bối cảnh kỹ thuật sâu (canonical cho AI/engineer) |
+
+**Dependencies Python:** `backend_ai/backend/requirements.txt` (image mặc định), `hubbot/requirements.txt`; tùy chọn `requirements-ai-vector.txt`, `requirements-ai-lora.txt`; snapshot tham chiếu `requirements_enterprise_v1.txt`.
+
+---
+
+## 5. Fresh VPS & setup an toàn
+
+1. Đọc [DEPLOY_FRESH_VPS.md](DEPLOY_FRESH_VPS.md) (checklist có **CHECK** và tách **Maintenance window only**).
+2. **OS:** Rocky 9 / RHEL family như runbook; **Docker 24+** + compose v2 cho luồng compose.
+3. **Python:** **3.11** khớp `FROM python:3.11-slim` trong `backend_ai/Dockerfile`. PM2/host install: tạo venv riêng backend và hubbot, `pip install -r` đúng file từng service (không gộp lung tung).
+4. **Node:** **20 LTS** cho build Mini App (không build Next trên Windows native — lỗi ESM drive letter; dùng container Linux như runbook).
+5. **Postgres / Redis:** Compose dùng `postgres:16-alpine`, `redis:7-alpine`; production nên managed/HA riêng.
+6. **Env:** copy template thủ công từ README/CLAUDE (không commit secret); `chmod 600 .env`.
+7. **Kiểm tra:** `curl` `/ready` localhost sau khi stack đã được phép chạy trong bảo trì.
+
+---
+
+## 6. Biến môi trường theo nhóm
+
+*Chỉ tên biến và ý nghĩa — không ghi value thật.*
+
+### Backend / API
+
+| Biến | Bắt buộc | Mô tả |
+|------|-----------|--------|
+| `BACKEND_HOST` / `API_HOST` | Có (compose) | Trong container phải `0.0.0.0` để port-forward |
+| `BACKEND_API_KEY` | Có (prod) | Hubbot ↔ backend ↔ runner; header `X-Backend-Api-Key` |
+| `PUBLIC_BASE_URL` | Có cho Mini App | HTTPS; menu Telegram + URL public |
+| `DRY_RUN` | Tuỳ | `1` = không đẩy lệnh thật xuống runner |
+
+### Database
+
+| Biến | Bắt buộc | Mô tả |
+|------|-----------|--------|
+| `LOCAL_POSTGRES_*` | Compose | User/db/password cho service `db` (xem `docker-compose.yml`) |
+
+### Redis
+
+| Biến | Bắt buộc | Mô tả |
+|------|-----------|--------|
+| `LOCAL_REDIS_PASSWORD` | Compose | Bắt buộc trong `docker-compose.yml` hiện tại |
+| `REDIS_URL` | Có | URL kết nối, có thể gồm password |
+| `BOT_COMMAND_QUEUE_REDIS_URL` | Tuỳ | Hàng đợi lệnh bot nếu tách URL |
+
+### Telegram
+
+| Biến | Bắt buộc | Mô tả |
+|------|-----------|--------|
+| `TELEGRAM_BOT_TOKEN` | Có | Một token ↔ một consumer long-poll |
+
+### Runner / control plane
+
+| Biến | Bắt buộc | Mô tả |
+|------|-----------|--------|
+| `RUNNER_CONTROL_PLANE_URL` | Khuyến nghị | Base URL runner gọi HTTP ngắn (bootstrap/register/heartbeat/events/delivery). **Lệnh thực thi** do runner lấy từ Redis (`RUNNER_TRANSPORT=redis_queue` trên Windows), không phải biến này. |
+| `RUNNER_RECOMMENDED_TRANSPORT` | Tuỳ | Bootstrap `transport.recommended`; mặc định `redis_queue`. |
+| `BACKEND_URL` | Có (hubbot) | Trong Docker Compose: **`http://spider-app:8001`** (nội bộ). Không nhất thiết trùng `PUBLIC_BASE_URL` |
+
+### TradingView / Webhook
+
+| Biến | Bắt buộc | Mô tả |
+|------|-----------|--------|
+| *(endpoint public)* | Tuỳ | `POST /api/v2/public/tradingview/broadcast` — xem runbook TradingView |
+
+### Frontend (build-time)
+
+| Biến | Bắt buộc | Mô tả |
+|------|-----------|--------|
+| `NEXT_PUBLIC_BACKEND_URL` | Có khi build | Inline vào bundle — đổi URL phải **rebuild** |
+| `NEXT_PUBLIC_API_URL` | Thường cùng base | Giống trên |
+
+Chi tiết logging, login lease, v.v.: [CLAUDE.md](CLAUDE.md).
+
+---
+
+## 7. Lệnh thường dùng (chỉ read-only / trạng thái)
+
+```bash
+git status
+git rev-parse --show-toplevel
+python3 --version
+test -f .env && echo ".env exists" || echo ".env missing"
+test -f backend_ai/backend/requirements.txt && echo backend requirements OK
+test -f hubbot/requirements.txt && echo hubbot requirements OK
+curl -fsS http://127.0.0.1:8001/ready 2>/dev/null | head -c 120 || echo "backend not listening on :8001"
+pm2 status 2>/dev/null || true
+systemctl is-active nginx 2>/dev/null || true
+systemctl is-active redis 2>/dev/null || true
+systemctl is-active postgresql 2>/dev/null || true
+docker compose ps 2>/dev/null || true
+```
+
+*(Lệnh có tác động dịch vụ — restart, `down -v`, migration — chỉ trong cửa sổ bảo trì; xem [DEPLOY_FRESH_VPS.md](DEPLOY_FRESH_VPS.md) mục “Maintenance window” và mục 10 bên dưới.)*
+
+---
+
+## 8. Checklist deploy
+
+**Preflight**
+
+- [ ] Đúng branch/tag release; diff đã review.
+- [ ] `BACKEND_API_KEY` đồng bộ backend / hubbot / runner.
+- [ ] `NEXT_PUBLIC_*` đã rebuild nếu đổi domain/tunnel.
+
+**Hạ tầng**
+
+- [ ] Postgres reachable, connection pool đủ (theo tải).
+- [ ] Redis reachable, password/TLS đúng môi trường.
+
+**Ứng dụng**
+
+- [ ] `GET /ready` = OK sau khi triển khai được phép.
+- [ ] Hubbot: một instance / token; rõ long-poll vs webhook.
+- [ ] Nginx route đúng host → upstream Uvicorn.
+- [ ] Runner: `RUNNER_TRANSPORT=redis_queue`, Redis và `BACKEND_URL`/`BACKEND_API_KEY` khớp môi trường.
+
+**Rollback plan**
+
+- [ ] Giữ image/tag/git SHA trước khi deploy; rollback runtime = checkout + redeploy đã thống nhất — **không** xoá DB.
+
+---
+
+## 9. Tích hợp Windows runner
+
+- Linux **dispatch** `RunnerCommand` (START/STOP/UPDATE, …) xuống **Redis** (list per runner) sau khi ghi Postgres; không có HTTP long-poll để runner “lấy lệnh”.
+- Runner **POST** event/heartbeat/register/delivery về **`/api/v2/runner/*`** (HTTP ngắn) với cùng `X-Backend-Api-Key`.
+- **Một account active:** tránh hai deployment/bot “running” cùng lúc trừ khi kiến trúc product cho phép — xem [CLAUDE.md](CLAUDE.md) mục one-active-deployment.
+- **Slot/sticky:** không gán nhầm account sang slot reserved của user khác; ưu tiên identifier ổn định (`account_id`, `deployment_id`) thay vì path/profile tạm thời.
+- Handoff node cụ thể: [WINDOWS_RUNNER_HANDOFF_runner-win-01.md](WINDOWS_RUNNER_HANDOFF_runner-win-01.md) — **đối chiếu** với môi trường thật trước khi làm theo.
+
+---
+
+## 10. Local dev — Docker Compose (A→Z)
+
+### Tài liệu theo vai trò
+
+| Tài liệu | Khi nào đọc |
+|----------|-------------|
+| [README.md](README.md) | Entry chính (file này) |
+| [docs/DOCS_INDEX.md](docs/DOCS_INDEX.md) | Tất cả link doc |
+| [backend_ai/README.md](backend_ai/README.md) | Docker context `spider-app` + vào `backend/` |
+| [backend_ai/backend/README.md](backend_ai/backend/README.md) | Chi tiết backend |
+| [backend_ai/backend/app/README.md](backend_ai/backend/app/README.md) | Bản đồ `app/` (router, services, events) |
+| [backend_ai/backend/app/repositories/control_plane/sql/README.md](backend_ai/backend/app/repositories/control_plane/sql/README.md) | Mục lục SQL theo domain |
+| [frontend-v2/README.md](frontend-v2/README.md) | Mini App, env build |
+| [hubbot/README.md](hubbot/README.md) | Telegram bot layout |
+| [bot-trading/README.md](bot-trading/README.md) | Registry bot *(chỉ có khi team commit/submodule — nếu 404 thì bỏ qua dòng này)* |
+| [runner/README.md](runner/README.md) | Hợp đồng runner |
+| [config/README.md](config/README.md) | Nginx / sở hữu file cấu hình |
+| [ops/README.md](ops/README.md) | Script preflight / compose helper / monitoring |
+
+**Quy ước file env**
+
+- Repo root `.env` (hoặc `ENV_FILE`) là runtime chính cho `docker compose` (đã `.gitignore`).
+- `backend_ai/backend/.env` khi chạy backend ngoài compose (PM2/host).
+- `frontend-v2/.env` khi dev frontend riêng (sao chép từ `frontend-v2/.env.example`).
+- Runner Windows: `.env` riêng trên máy Windows.
+
+### 10.1. Yêu cầu hệ thống
 
 | Bắt buộc | Phiên bản tối thiểu |
-|---|---|
-| Docker Desktop (Windows/macOS) hoặc Docker Engine + plugin compose v2 (Linux) | Docker 24+, compose v2 |
-| Node.js + npm — chỉ cần khi build frontend | Node 20 LTS |
+|----------|---------------------|
+| Docker + compose v2 | Docker 24+ |
+| Node (chỉ khi build frontend) | **20 LTS** |
 
-| Tuỳ chọn | Khi nào cần |
-|---|---|
-| `cloudflared` hoặc `ngrok` | Khi muốn nút Mini App trong Telegram hoạt động (Telegram bắt buộc URL HTTPS cho `web_app`) |
-| `psql` client | Truy vấn DB từ host khi debug |
+Tuỳ chọn: `cloudflared` / `ngrok` (HTTPS cho Mini App), `psql` client.
 
-Tất cả service chạy trong container, host **không cần** cài Postgres/Redis/Python sẵn cho luồng compose.
+### 10.2. Chuẩn bị `.env` (compose)
 
----
+`docker-compose.yml` đọc `${ENV_FILE:-.env}`. Thêm các biến bắt buộc theo comment trong file compose (ví dụ `LOCAL_REDIS_PASSWORD`).
 
-## 2. Chuẩn bị một lần
-
-### 2.1 Token Telegram bot
-
-Tạo bot mới qua [@BotFather](https://t.me/BotFather) → `/newbot`. Lấy token dạng `123456:ABC-DEF...`.
-
-> ⚠️ **Không dùng token bot prod cho dev.** Telegram chỉ cho 1 consumer/`getUpdates` cùng token — chạy hubbot local cùng token với hubbot prod sẽ làm cả hai trả `Conflict: terminated by other getUpdates request`.
-
-### 2.2 File `.env.linux` (override compose)
-
-`docker-compose.yml` đọc env theo thứ tự `.env.linux.example` → `.env.linux` (override, optional). File `.env.linux` đã được `.gitignore` qua pattern `.env*` nên an toàn để chứa secret.
-
-Tạo `.env.linux` ở repo root:
+Ví dụ khung (không copy secret thật):
 
 ```env
-# Bind uvicorn ra 0.0.0.0 để Docker port-forward 8001 đến được container.
 BACKEND_HOST=0.0.0.0
 API_HOST=0.0.0.0
-
-# Token bot Telegram cho compose local.
-TELEGRAM_BOT_TOKEN=<paste-token-bot-test-cua-ban>
-
-# (Tuỳ chọn) URL HTTPS công khai trỏ về backend, cần cho Mini App.
-# Sau khi mở tunnel ở mục 3, điền URL vào đây và restart.
-# PUBLIC_BASE_URL=https://<random>.trycloudflare.com
-# BACKEND_URL=https://<random>.trycloudflare.com
+TELEGRAM_BOT_TOKEN=<from-botfather>
+BACKEND_URL=http://spider-app:8001
+PUBLIC_BASE_URL=https://<your-https-base>
+RUNNER_CONTROL_PLANE_URL=https://<public-control-plane>
+LOCAL_REDIS_PASSWORD=<strong-password>
 ```
 
----
-
-## 3. Khởi chạy nhanh (Docker Compose)
+### 10.3. Khởi chạy compose
 
 ```bash
-# Tại repo root
 docker compose up -d --build
-```
-
-Lần đầu mất 5–15 phút (pull image, cài Python deps). Các lần sau dùng cache, vài giây.
-
-Xác nhận trạng thái:
-
-```bash
 docker compose ps
+curl -fsS http://127.0.0.1:8001/health | jq .ok
+curl -fsS http://127.0.0.1:8001/ready  | jq .ok
 ```
 
-Kết quả mong đợi: `db`, `redis`, `spider-app`, `hubbot` đều `Up`. `spider-app` map `0.0.0.0:8001->8001/tcp`.
+### 10.4. Mini App — tunnel HTTPS + build frontend
 
-Verify backend:
-
-```bash
-curl -fsS http://127.0.0.1:8001/health | jq .ok    # true
-curl -fsS http://127.0.0.1:8001/ready  | jq .ok    # true
-```
-
-Lúc này:
-- Bot đã long-poll Telegram, gõ `/ping` cho bot trên Telegram là phải có phản hồi.
-- Mini App chưa hoạt động vì `PUBLIC_BASE_URL` còn HTTP — xem mục 4.
-
----
-
-## 4. Mini App: tunnel HTTPS + build frontend
-
-Telegram chặn mọi `web_app` URL không phải HTTPS, nên cần URL HTTPS công khai trỏ về backend local. Quá trình gồm 2 bước, làm theo thứ tự.
-
-### 4.1 Mở tunnel HTTPS
-
-Cách nhanh nhất là **Cloudflare Quick Tunnel** (không cần đăng ký, URL random):
+Telegram yêu cầu **HTTPS** cho `web_app`. Ví dụ Cloudflare quick tunnel (URL random):
 
 ```bash
 cloudflared tunnel --url http://localhost:8001
 ```
 
-Cloudflared in ra dòng dạng `https://<adj>-<noun>-<adj>-<noun>.trycloudflare.com` — copy URL này. Để tunnel chạy ở terminal riêng (URL chết khi process tắt).
+Cập nhật `PUBLIC_BASE_URL` / `RUNNER_CONTROL_PLANE_URL` trong `.env`; **giữ** `BACKEND_URL=http://spider-app:8001`.
 
-> 🔁 **URL random sẽ đổi mỗi lần restart tunnel.** Stable hơn: `cloudflared tunnel create <name>` + DNS route Cloudflare (cần Cloudflare account + domain). Hoặc `ngrok` với reserved domain (paid).
-
-### 4.2 Update `.env.linux`
-
-Mở `.env.linux`, set hai biến trỏ về URL tunnel vừa lấy:
-
-```env
-PUBLIC_BASE_URL=https://<your-tunnel>.trycloudflare.com
-BACKEND_URL=https://<your-tunnel>.trycloudflare.com
-```
-
-### 4.3 Build frontend Next.js
-
-Frontend cấu hình `output: "export"` — `next build` sinh `frontend-v2/out/`. Backend đã sẵn sàng mount thư mục này.
-
-> ⚠️ **Bắt buộc build trong container Linux.** Build `next build` trên Windows native fail với `ERR_UNSUPPORTED_ESM_URL_SCHEME ... Received protocol 'd:'` (bug Node ESM với absolute path có drive letter).
+Build trong container Linux (đổi đường dẫn volume cho đúng máy bạn):
 
 ```bash
 docker run --rm \
-  -v "D:/Spider/linux-root-backend-hubot-v1/frontend-v2:/app" \
-  -w /app \
-  -e NEXT_PUBLIC_BACKEND_URL=https://<your-tunnel>.trycloudflare.com \
-  -e NEXT_PUBLIC_API_URL=https://<your-tunnel>.trycloudflare.com \
+  -v "/path/to/linux-root-backend-hubot-v1/frontend-v2:/app" -w /app \
+  -e NEXT_PUBLIC_BACKEND_URL=https://<your-tunnel> \
+  -e NEXT_PUBLIC_API_URL=https://<your-tunnel> \
   node:20-bookworm-slim \
   bash -c "rm -rf node_modules out .next && npm install --no-audit --no-fund && npm run build"
 ```
 
-Đổi đường dẫn host cho phù hợp máy bạn. Build xong có 8 route static dưới `frontend-v2/out/`.
+`NEXT_PUBLIC_*` inline tại build — đổi URL phải build lại.
 
-> 📌 `NEXT_PUBLIC_*` được **inline tại build time** vào client bundle. Mỗi lần đổi URL tunnel phải build lại frontend.
+Sau đó (trong bảo trì) recreate/restart service để pick env + mount — xem [DEPLOY_FRESH_VPS.md](DEPLOY_FRESH_VPS.md).
 
-### 4.4 Apply
-
-`docker-compose.yml` đã có volume mount `./frontend-v2/out:/app/frontend-v2/out:ro`. Chỉ cần restart spider-app + hubbot để đọc `.env.linux` mới:
+### 10.5. Lệnh vận hành compose (có tác động)
 
 ```bash
-docker compose up -d spider-app hubbot
-```
-
-Verify Mini App home (qua tunnel):
-
-```bash
-curl -sS -o /dev/null -w "%{http_code}\n" https://<your-tunnel>.trycloudflare.com/
-# → 200
-```
-
-Trên Telegram: `/start` lại với bot — tin nhắn sẽ kèm nút Mini App, click vào load được trang.
-
-Trong log hubbot phải thấy:
-
-```
-Telegram menu button configured for Mini App home.
-```
-
-Nếu vẫn thấy `Menu button web app url '...' is invalid: only https links are allowed` → `.env.linux` chưa được load (kiểm tra path) hoặc chưa restart hubbot.
-
----
-
-## 5. Lệnh thường dùng
-
-```bash
-# Trạng thái + log
-docker compose ps
-docker compose logs -f spider-app          # tail backend log
-docker compose logs -f hubbot              # tail hubbot log
-docker compose logs --tail=50 spider-app   # 50 dòng cuối
-
-# Restart 1 service
+docker compose logs -f spider-app
+docker compose logs -f hubbot
 docker compose restart hubbot
-docker compose up -d --no-deps spider-app  # restart không kéo deps lên lại
-
-# Rebuild image sau khi sửa Dockerfile
-docker compose build spider-app
-docker compose up -d spider-app
-
-# Vào shell container
+docker compose up -d --no-deps spider-app
 docker compose exec spider-app bash
 docker compose exec db psql -U spider_dev -d spider_dev
-
-# Tắt
-docker compose down              # giữ volume db/redis
-docker compose down -v           # XOÁ volume → mất dữ liệu DB
 ```
 
-### Migration thủ công
-
-Backend tự chạy `init_postgres_schema()` ở startup (idempotent). Chỉ cần manual khi muốn áp Alembic revision mới:
+Migration thủ công (chỉ khi team vận hành chủ động chạy):
 
 ```bash
 docker compose exec spider-app bash -lc 'cd /app/backend_ai/backend && alembic upgrade head'
 docker compose exec spider-app bash -lc 'cd /app/backend_ai/backend && alembic current'
 ```
 
-Quy ước an toàn theo [backend_ai/backend/migrations/README.md](backend_ai/backend/migrations/README.md):
-- DB **mới**: `alembic upgrade head`
-- DB **đang chạy với schema từ `init_pg_schema.py`**: `alembic stamp head` (đánh dấu, không thực thi)
+Quy ước: DB mới → `alembic upgrade head`; DB đã có schema từ `init_pg_schema` → có thể cần `alembic stamp head` — chi tiết [backend_ai/backend/migrations/README.md](backend_ai/backend/migrations/README.md).
 
----
-
-## 6. Cấu trúc env files
-
-| File | Vai trò | Có commit không |
-|---|---|---|
-| `.env.linux.example` | Defaults compose local — luôn được load | ✅ committed |
-| `.env.linux` | Override per-machine, chứa secret | ❌ gitignored (`.env*`) |
-| `backend_ai/backend/.env.connect.example` | Adapter cTrader legacy, đã đóng băng | ✅ committed |
-| `backend_ai/backend/.env.control-plane.example` | Baseline cho deploy production-style | ✅ committed |
-| `backend_ai/backend/.env.mt5-runner.example` | Cho runner Windows | ✅ committed |
-| `backend_ai/backend/.env.redis.example` | Mẫu Redis prod | ✅ committed |
-| `backend_ai/backend/.env` | Production thực — KHÔNG commit | ❌ gitignored |
-| `frontend-v2/.env.example` | Mẫu cho frontend dev | ✅ committed |
-
-Biến quan trọng nhất ở compose layer:
-
-| Biến | Ý nghĩa |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | Token bot — bắt buộc để hubbot khởi động |
-| `BACKEND_HOST` | Phải `0.0.0.0` trong container để port-forward Docker tới được |
-| `PUBLIC_BASE_URL` | URL công khai — Mini App URL build từ đây |
-| `BACKEND_URL` | URL hubbot dùng để gọi backend |
-| `BACKEND_API_KEY` | Khoá hubbot ↔ backend, phải khớp 2 phía |
-| `REDIS_URL`, `BOT_COMMAND_QUEUE_REDIS_URL` | DB index 0 = prod, dev có thể đổi `/1` |
-| `DRY_RUN` | `1` = không gửi lệnh thật xuống MT5 |
-
----
-
-## 7. Troubleshooting
-
-### `spider-app` exit(1) — `ModuleNotFoundError: No module named 'ops_telegram_alerts'`
-
-[backend_ai/Dockerfile](backend_ai/Dockerfile) phải có dòng `COPY ops_telegram_alerts.py /app/ops_telegram_alerts.py` (file ở repo root, code import top-level).
-
-### `spider-app` exit(1) — `init_postgres_schema_failed: relation "runtime_logs" does not exist`
-
-Bug thứ tự trong [backend_ai/backend/init_pg_schema.py](backend_ai/backend/init_pg_schema.py): hàm `_create_control_plane_scale_indexes(cur)` phải gọi **sau** khi `runtime_logs` đã được tạo (cuối hàm, không phải giữa hàm).
-
-### Curl `/health` trả `Empty reply from server` mặc dù container Up
-
-Uvicorn bind `127.0.0.1` trong container thay vì `0.0.0.0`. Set `BACKEND_HOST=0.0.0.0` trong `.env.linux`, restart spider-app.
-
-### Bot trả "Hệ thống đang xử lý nhiều yêu cầu"
-
-Đây là **generic error fallback** ở [hubbot/app/lifecycle/error_handlers.py](hubbot/app/lifecycle/error_handlers.py) — bất kỳ exception nào trong handler đều trả câu này. Xem log hubbot để biết exception thật:
+### 10.6. Reset & cleanup (nguy hiểm)
 
 ```bash
-docker compose logs --tail=100 hubbot | grep -A 5 ERROR
-```
-
-Nguyên nhân hay gặp: URL Mini App chưa HTTPS → Telegram reject → hubbot fail → fallback. Fix bằng tunnel ở mục 4.
-
-### Mini App click mở ra trang trắng / 404
-
-`frontend-v2/out` chưa build hoặc chưa mount. Kiểm tra:
-
-```bash
-docker compose exec spider-app ls -la /app/frontend-v2/out/_next | head
-```
-
-Nếu trống → chạy lại lệnh build ở mục 4.3.
-
-### `next build` trên Windows fail `ERR_UNSUPPORTED_ESM_URL_SCHEME ... Received protocol 'd:'`
-
-Bug Node ESM loader với Windows path. **Phải build trong container Linux** (mục 4.3). Đừng `cd frontend-v2 && npm run build` trên PowerShell/CMD.
-
-### Hubbot vẫn báo `Conflict: terminated by other getUpdates request`
-
-Token đang được instance khác poll (hubbot prod, máy đồng nghiệp, hoặc instance bot trước chưa thoát hẳn). Tạo bot mới qua @BotFather hoặc dừng instance kia.
-
-### Tunnel cloudflared chết, Mini App lại lỗi
-
-Quick Tunnel sống theo process. Nếu dùng quen, cân nhắc:
-- `cloudflared service install` + Cloudflare named tunnel + DNS route → URL cố định.
-- Hoặc dùng `ngrok http 8001` với reserved domain (paid plan).
-
----
-
-## 8. Reset & cleanup
-
-```bash
-# Tắt + xoá container, giữ volume
 docker compose down
-
-# Tắt + xoá volume (mất toàn bộ DB Postgres + Redis dump)
 docker compose down -v
-
-# Xoá image build local
-docker image rm linux-root-backend-hubot-v1-spider-app linux-root-backend-hubot-v1-hubbot
-
-# Reset frontend artifacts
-rm -rf frontend-v2/node_modules frontend-v2/out frontend-v2/.next
 ```
 
----
-
-## 9. Kiến trúc deploy production (ngoài phạm vi compose)
-
-Production dùng PM2 trên Linux host theo [ecosystem.config.js](ecosystem.config.js):
-
-- `spider-backend`: cwd `/root/spider-ai/backend_ai/backend`, venv `venv/bin/python3`, script `scripts/run_api.py`. 2 instance, port = `API_PORT_BASE` (8002) + `INSTANCE_ID` → 8002 và 8003.
-- `spider-hubbot`: cwd `/root/spider-ai/hubbot`, venv `venv_hub/bin/python3`, script `main.py`. 1 instance.
-
-Các path được hard-code cho Linux host — **không** chạy được trên Windows native. Compose là cách duy nhất để dev/test trên Windows hoặc macOS.
-
-Baseline env: [backend_ai/backend/.env.control-plane.example](backend_ai/backend/.env.control-plane.example).
+`down -v` **xoá volume** Postgres + Redis.
 
 ---
 
-## 10. Tham khảo nhanh
+## 11. Troubleshooting
+
+| Hiện tượng | Hướng xử lý |
+|------------|-------------|
+| `/ready` fail | Đọc JSON `/health`; kiểm tra Postgres + Redis URL/password |
+| Nginx sai vhost | So khớp `server_name` và upstream port (8001 / 8002+ theo PM2) |
+| Redis connection fail | Password, bind `127.0.0.1` vs public, firewall |
+| Postgres “too many connections” | Giảm pool app hoặc tăng `max_connections` / scale read |
+| Telegram `Conflict getUpdates` | Hai process cùng token — dừng một bên |
+| Runner offline / không dequeue lệnh | HTTP: heartbeat, `RUNNER_CONTROL_PLANE_URL`; **Redis**: host/port/password, `RUNNER_TRANSPORT=redis_queue`, firewall/tailnet |
+| Command kẹt queued/pending | Redis, reconciler, log `runner.command.*` (xem CLAUDE runbook) |
+| Callback timeout | Latency mạng, runner load, timeout HTTP |
+| TradingView 4xx/5xx | Payload alert, auth, URL user webhook nếu có chuỗi giao hàng |
+| Frontend sai API | Rebuild với `NEXT_PUBLIC_*` đúng |
+
+Chi tiết lỗi đã biết: [CLAUDE.md](CLAUDE.md) phần Troubleshooting / Runbook.
+
+---
+
+## 12. Gợi ý scale
+
+- **Backend Linux:** scale ngang instance API (PM2 / LB) — đảm bảo idempotent command + Postgres truth.
+- **Runner Windows:** scale theo `runner_id`/máy; không nhồi quá nhiều MT5 trên một OS không đủ RAM/CPU.
+- **Redis/DB:** pool, backpressure, reconciler; Redis chỉ transport.
+- **Lane tách:** nếu sau này có broker API-only (cTrader, …) có thể tách lane runner — product decision.
+
+---
+
+## 13. Rollback tài liệu / repo
+
+- Chỉ đổi doc/requirements comment trong release này → rollback bằng `git checkout -- <file>`.
+- **Không** “rollback” production DB/Redis state bằng tay qua các lệnh trong README.
+
+---
+
+## 14. Tham khảo endpoint
 
 | Endpoint | Mục đích |
-|---|---|
-| `GET /health` | Liveness chi tiết (DB, Redis, runtime, AI) |
-| `GET /ready` | Readiness gọn cho load balancer |
-| `GET /api/v2/system/healthz` | Legacy nginx probe |
-| `GET /` (qua tunnel) | Mini App home (Next.js export) |
+|----------|----------|
+| `GET /health` | Liveness chi tiết |
+| `GET /ready` | Readiness cho LB |
+| `GET /api/v2/system/healthz` | Probe legacy |
+| `GET /` (public) | Mini App static |
 
-| File | Tài liệu chuyên đề |
-|---|---|
-| [backend_ai/backend/migrations/README.md](backend_ai/backend/migrations/README.md) | Quy trình Alembic migration |
-| [hubbot/README.md](hubbot/README.md) | Cấu trúc hubbot |
-| [runner/README.md](runner/README.md) | MT5 runner Windows |
-| [config/README.md](config/README.md) | Cấu hình chung |
+---
+
+## 15. Kiến trúc deploy production (PM2)
+
+Theo [ecosystem.config.js](ecosystem.config.js): `PROJECT_ROOT` mặc định là thư mục chứa file (cwd backend/hubbot là `backend_ai/backend`, `hubbot` tương đối root đó). Trên VPS **chỉnh** nếu layout khác. Compose vẫn là cách khuyến nghị cho dev trên Windows/macOS.
