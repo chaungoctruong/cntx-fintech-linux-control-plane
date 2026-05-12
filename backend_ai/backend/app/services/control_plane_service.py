@@ -106,6 +106,42 @@ def _contract_bool(value: Any) -> bool:
     return _norm_text(value).lower() in {"1", "true", "yes", "on"}
 
 
+def _risk_policy_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _risk_policy_tz_offset(value: Any) -> int:
+    try:
+        offset = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return min(14 * 60, max(-14 * 60, offset))
+
+
+def _runner_risk_policy_contract(*, policy: Any, user_id: int, account_id: int, deployment_id: int) -> dict[str, Any]:
+    raw = policy if isinstance(policy, dict) else {}
+    return {
+        "schema_version": "account_risk_policy.v1",
+        "source": "broker_accounts.risk_policy_json",
+        "scope": "account",
+        "user_id": int(user_id),
+        "account_id": int(account_id),
+        "deployment_id": int(deployment_id),
+        "daily_loss_limit_usd": _risk_policy_number(raw.get("daily_loss_limit_usd")),
+        "daily_loss_limit_percent": _risk_policy_number(raw.get("daily_loss_limit_percent")),
+        "auto_stop_on_breach": bool(raw.get("auto_stop_on_breach")),
+        "timezone_offset_minutes": _risk_policy_tz_offset(raw.get("timezone_offset_minutes")),
+        "updated_at": raw.get("updated_at"),
+        "updated_by": raw.get("updated_by"),
+    }
+
+
 def _iter_bot_contract_sources(*sources: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for source in sources:
@@ -3080,10 +3116,17 @@ class MT5ControlPlaneService:
             bot=bot_contract,
             config=package.get("config_json") or {},
         )
+        risk_policy = _runner_risk_policy_contract(
+            policy=package.get("account_risk_policy"),
+            user_id=int(package["user_id"]),
+            account_id=int(package["account_id"]),
+            deployment_id=int(package["deployment_id"]),
+        )
         return {
             "deployment_id": int(package["deployment_id"]),
             "account_id": int(package["account_id"]),
             "trace_id": package.get("trace_id"),
+            "risk_policy": risk_policy,
             "account": {
                 "account_id": int(package["account_id"]),
                 "user_id": int(package["user_id"]),
@@ -3094,6 +3137,7 @@ class MT5ControlPlaneService:
                 "status": package.get("account_status"),
                 "label": package.get("label"),
                 "last_error": package.get("account_last_error"),
+                "risk_policy": risk_policy,
             },
             "binding": {
                 "binding_id": package.get("binding_id"),
@@ -3129,15 +3173,11 @@ class MT5ControlPlaneService:
     def miniapp_dashboard(self, *, telegram_id: str, username: Optional[str]) -> dict[str, Any]:
         user = self.ensure_user(telegram_id=telegram_id, username=username)
         user_id = int(user["id"])
-        cached = self._dashboard_cache_get(user_id=user_id)
-        if cached is not None:
-            cached["cache"] = {"hit": True, "ttl_sec": self._dashboard_cache_ttl_sec}
-            return cached
         base = self._metrics.user_dashboard(user_id=user_id)
         base["accounts"] = self._repo.list_accounts_for_user(user_id=user_id)
         base["deployments"] = self._repo.list_deployments(user_id=user_id)
-        base["cache"] = {"hit": False, "ttl_sec": self._dashboard_cache_ttl_sec}
-        return self._dashboard_cache_set(user_id=user_id, payload=base)
+        base["cache"] = {"hit": False, "ttl_sec": 0, "fresh": True}
+        return base
 
     def runtime_health_summary(self) -> dict[str, Any]:
         return self._metrics.runtime_health_summary()

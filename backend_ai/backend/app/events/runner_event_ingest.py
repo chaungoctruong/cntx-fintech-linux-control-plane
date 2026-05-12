@@ -166,6 +166,21 @@ def _payload_confirms_terminal_stopped(payload: dict[str, Any]) -> bool:
     return bool(terminal_pid) and terminal_pid in {"0", "none", "null"}
 
 
+def _runtime_log_terminal_event_type(payload: dict[str, Any], runtime_message: str) -> str | None:
+    raw = str(
+        payload.get("runner_event_type")
+        or payload.get("runner_event_message")
+        or runtime_message
+        or ""
+    ).strip().upper()
+    if raw in {
+        EventType.SLOT_TERMINAL_KILL_BEGIN.value,
+        EventType.SLOT_TERMINAL_KILL_DONE.value,
+    }:
+        return raw
+    return None
+
+
 def _should_fallback_config_hot_update(reason: str) -> bool:
     normalized = str(reason or "").strip().lower()
     if not normalized:
@@ -436,6 +451,52 @@ class RunnerEventIngestService:
             previous_deployment_id=event_model.deployment_id,
             command_id=command_id,
         )
+
+    async def _apply_terminal_kill_event(
+        self,
+        *,
+        event_model: RunnerEvent,
+        command_id: str | None,
+        terminal_event_type: str,
+    ) -> None:
+        if event_model.deployment_id is None:
+            return
+        deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
+        if not _deployment_wants_stopped(deployment):
+            return
+        status = str((deployment or {}).get("status") or "").strip().lower()
+        health_status = str((deployment or {}).get("health_status") or "").strip().lower()
+        if status == DeploymentStatus.STOPPED.value and health_status == "stopped":
+            return
+        if terminal_event_type == EventType.SLOT_TERMINAL_KILL_DONE.value:
+            if health_status == "terminal_cleanup_pending":
+                await self._finalize_stopped_deployment(
+                    event_model=event_model,
+                    command_id=command_id,
+                )
+            else:
+                self._repo.update_deployment_status(
+                    deployment_id=event_model.deployment_id,
+                    status=DeploymentStatus.STOP_REQUESTED.value,
+                    desired_state="stopped",
+                    is_active=True,
+                    health_status="terminal_cleanup_done",
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                )
+        elif (
+            terminal_event_type == EventType.SLOT_TERMINAL_KILL_BEGIN.value
+            and health_status not in {"terminal_cleanup_pending", "terminal_cleanup_done"}
+        ):
+            self._repo.update_deployment_status(
+                deployment_id=event_model.deployment_id,
+                status=DeploymentStatus.STOP_REQUESTED.value,
+                desired_state="stopped",
+                is_active=True,
+                health_status="terminal_cleanup_started",
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+            )
 
     async def _fallback_config_hot_update_restart(
         self,
@@ -1321,37 +1382,15 @@ class RunnerEventIngestService:
                     event_model=event_model,
                     command_id=event_command_id,
                 )
-        elif event_type_value == EventType.SLOT_TERMINAL_KILL_DONE.value and event_model.deployment_id is not None:
-            deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
-            if _deployment_wants_stopped(deployment):
-                if str((deployment or {}).get("health_status") or "").strip().lower() == "terminal_cleanup_pending":
-                    await self._finalize_stopped_deployment(
-                        event_model=event_model,
-                        command_id=event_command_id,
-                    )
-                else:
-                    self._repo.update_deployment_status(
-                        deployment_id=event_model.deployment_id,
-                        status=DeploymentStatus.STOP_REQUESTED.value,
-                        desired_state="stopped",
-                        is_active=True,
-                        health_status="terminal_cleanup_done",
-                        runner_id=event_model.runner_id,
-                        slot_id=event_model.slot_id,
-                    )
-        elif event_type_value == EventType.SLOT_TERMINAL_KILL_BEGIN.value and event_model.deployment_id is not None:
-            deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
-            current_health = str((deployment or {}).get("health_status") or "").strip().lower()
-            if _deployment_wants_stopped(deployment) and current_health not in {"terminal_cleanup_pending", "terminal_cleanup_done"}:
-                self._repo.update_deployment_status(
-                    deployment_id=event_model.deployment_id,
-                    status=DeploymentStatus.STOP_REQUESTED.value,
-                    desired_state="stopped",
-                    is_active=True,
-                    health_status="terminal_cleanup_started",
-                    runner_id=event_model.runner_id,
-                    slot_id=event_model.slot_id,
-                )
+        elif event_type_value in {
+            EventType.SLOT_TERMINAL_KILL_BEGIN.value,
+            EventType.SLOT_TERMINAL_KILL_DONE.value,
+        }:
+            await self._apply_terminal_kill_event(
+                event_model=event_model,
+                command_id=event_command_id,
+                terminal_event_type=event_type_value,
+            )
         elif event_type_value == EventType.SLOT_BROKEN.value:
             if event_model.slot_id:
                 self._repo.update_runner_slot_state(
@@ -1624,6 +1663,13 @@ class RunnerEventIngestService:
                 payload=payload_map,
                 trace_id=event_model.trace_id,
             )
+            terminal_event_type = _runtime_log_terminal_event_type(payload_map, runtime_message)
+            if terminal_event_type:
+                await self._apply_terminal_kill_event(
+                    event_model=event_model,
+                    command_id=event_command_id,
+                    terminal_event_type=terminal_event_type,
+                )
             runtime_text = f"{runtime_message} {_event_reason(payload_map)}".lower()
             if "backend_state" in runtime_text or "store_candle_skipped" in runtime_text:
                 schedule_error_alert(
