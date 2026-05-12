@@ -2836,8 +2836,8 @@ class MT5ControlPlaneService:
                     "stop_policy": "end_task",
                     "end_task": True,
                     "kill_worker": True,
-                    "kill_mt5": False,
-                    "terminate_mt5": False,
+                    "kill_mt5": True,
+                    "terminate_mt5": True,
                     "release_terminal": True,
                 },
                 "credential_error_codes": [

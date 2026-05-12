@@ -111,8 +111,8 @@ def normalize_runner_command_payload(
         normalized.setdefault("stop_policy", "end_task")
         normalized.setdefault("end_task", True)
         normalized.setdefault("kill_worker", True)
-        normalized.setdefault("kill_mt5", False)
-        normalized.setdefault("terminate_mt5", False)
+        normalized.setdefault("kill_mt5", True)
+        normalized.setdefault("terminate_mt5", True)
         normalized.setdefault("release_terminal", True)
 
     hints = dict(slot_runtime_hints or {})
