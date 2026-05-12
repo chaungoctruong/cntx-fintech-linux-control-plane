@@ -1,6 +1,6 @@
 # Spider AI — Linux control plane (CNTX MT5 SaaS)
 
-**Repo này** là control-plane trên Linux cho nền tảng Spider AI: **không** chạy MT5 trực tiếp; lệnh trade đi xuống **Windows runner** qua Redis/HTTP theo hợp đồng command/event.
+**Repo này** là control-plane trên Linux cho nền tảng Spider AI: **không** chạy MT5 trực tiếp. **Lệnh điều khiển bot** (`START_BOT`, `PLACE_ORDER`, …) Linux publish xuống **Redis** (queue per `runner_id`); runner Windows dùng **`RUNNER_TRANSPORT=redis_queue`**. **HTTP** (`/api/v2/runner/*`) chỉ cho luồng ngắn: đăng ký, heartbeat, events, delivery — theo hợp đồng command/event.
 
 **Mục lục nhanh:** [Tổng quan](#1-tổng-quan-dự-án) · [Quy tắc an toàn production](#2-quy-tắc-an-toàn-production) · [Kiến trúc](#3-tóm-tắt-kiến-trúc) · [Thư mục](#4-bản-đồ-thư-mục) · [VPS mới](#5-fresh-vps--setup-an-toàn) · [Biến môi trường](#6-biến-môi-trường-theo-nhóm) · [Lệnh an toàn](#7-lệnh-thường-dùng-chỉ-read-only--trạng-thái) · [Checklist deploy](#8-checklist-deploy) · [Windows runner](#9-tích-hợp-windows-runner) · [Compose A→Z](#10-local-dev--docker-compose-a-z) · [Troubleshooting](#11-troubleshooting) · [Scale](#12-gợi-ý-scale) · [Rollback tài liệu](#13-rollback-tài-liệu--repo)
 
@@ -29,8 +29,8 @@ Preflight read-only: `bash ops/preflight_linux_control_plane.sh` (tuỳ chọn `
 | **PostgreSQL** | User, account, deployment, command state, subscriptions, … |
 | **Nginx** (tuỳ deploy) | TLS, reverse proxy tới Uvicorn — xem `nginx.conf` / `config/` |
 | **runner/** (trong repo) | Stub/reference + tài liệu hợp đồng; runner production trên Windows là repo/process riêng |
-| **bot-trading/** | Registry package bot trên Linux (`gsalgovip`), không chứa secret |
-| **ops/** | Script HA/monitoring compose dev helper |
+| **bot-trading/** | Registry package bot trên Linux (thường có `bot_manifest.json`); clone tối giản có thể **rỗng** — lấy package từ release nội bộ. Không chứa secret. |
+| **ops/** | Preflight read-only, helper `compose-*.sh`, smoke `monitoring/check_prod_readiness.sh` |
 | **docs/** | Runbook bổ sung (mesh, TradingView, index) |
 
 **Health (backend):** `GET /health` (chi tiết), `GET /ready` (readiness), `GET /api/v2/system/healthz` (probe legacy).
@@ -59,13 +59,13 @@ User (Telegram) ──► Hubbot (long-poll) ──HTTP──► FastAPI backend
                     Postgres ◄──ORM/repo/state──┤
                     Redis ◄──queue/stream──────┤
                                                  │
- Windows Runner fleet ◄──commands / events──────┘
+ Windows Runner fleet ◄──Redis: lệnh; HTTP: events/heartbeat/register──┘
         │
         ▼
      MT5 ──► Broker
 ```
 
-- **Control plane** (Linux): quyết định, lưu state, publish command.
+- **Control plane** (Linux): quyết định, lưu state, publish lệnh lên **Redis**; HTTP runner chỉ tác vụ điều phối ngắn.
 - **Execution plane** (Windows): MT5 terminal, worker/slot, báo event ngược.
 
 ---
@@ -74,10 +74,10 @@ User (Telegram) ──► Hubbot (long-poll) ──HTTP──► FastAPI backend
 
 | Path | Mô tả ngắn |
 |------|------------|
-| `backend_ai/` | Dockerfile build `spider-app`; code FastAPI dưới `backend_ai/backend/` |
+| `backend_ai/` | Dockerfile build `spider-app`; code FastAPI dưới `backend_ai/backend/` — onboarding: [backend_ai/README.md](backend_ai/README.md) |
 | `hubbot/` | Dockerfile `hubbot`; `requirements.txt` riêng |
 | `frontend-v2/` | Next 14; `package.json` + `package-lock.json` — **Node 20** khi build trong Linux container |
-| `bot-trading/` | Package bot chuẩn hoá; không có `requirements.txt` Python |
+| `bot-trading/` | Package bot chuẩn hoá (có thể rỗng trên clone); không có `requirements.txt` Python trong thư mục này |
 | `runner/` | Tham chiếu schema / prompt tích hợp Windows |
 | `config/` | Ghi chú nginx / handoff cấu hình |
 | `docs/` | Runbook + **[DOCS_INDEX.md](docs/DOCS_INDEX.md)** |
@@ -87,6 +87,7 @@ User (Telegram) ──► Hubbot (long-poll) ──HTTP──► FastAPI backend
 | `nginx.conf` | Baseline sample |
 | `docker-compose.yml` | Dev/local: `db`, `redis`, `spider-app`, `hubbot` |
 | `ecosystem.config.js` | PM2 mẫu (path host hard-code — chỉnh theo server thật) |
+| `vercel.json` | Tuỳ chọn — Vercel build Mini App; **`rewrites`** phải trỏ tới backend Linux **reachable từ edge Vercel** (thường `http://<PUBLIC_IP>:8001` API, `:8081` webhook). **Cập nhật** khi đổi VPS/domain; không commit IP môi trường khác nếu fork công khai. |
 | `DEPLOY_FRESH_VPS.md` | Checklist VPS Rocky/RHEL + Docker |
 | `CLAUDE.md` | Bối cảnh kỹ thuật sâu (canonical cho AI/engineer) |
 
@@ -143,7 +144,8 @@ User (Telegram) ──► Hubbot (long-poll) ──HTTP──► FastAPI backend
 
 | Biến | Bắt buộc | Mô tả |
 |------|-----------|--------|
-| `RUNNER_CONTROL_PLANE_URL` | Khuyến nghị | URL công khai runner gọi register/heartbeat/API runner |
+| `RUNNER_CONTROL_PLANE_URL` | Khuyến nghị | Base URL runner gọi HTTP ngắn (bootstrap/register/heartbeat/events/delivery). **Lệnh thực thi** do runner lấy từ Redis (`RUNNER_TRANSPORT=redis_queue` trên Windows), không phải biến này. |
+| `RUNNER_RECOMMENDED_TRANSPORT` | Tuỳ | Bootstrap `transport.recommended`; mặc định `redis_queue`. |
 | `BACKEND_URL` | Có (hubbot) | Trong Docker Compose: **`http://spider-app:8001`** (nội bộ). Không nhất thiết trùng `PUBLIC_BASE_URL` |
 
 ### TradingView / Webhook
@@ -202,7 +204,7 @@ docker compose ps 2>/dev/null || true
 - [ ] `GET /ready` = OK sau khi triển khai được phép.
 - [ ] Hubbot: một instance / token; rõ long-poll vs webhook.
 - [ ] Nginx route đúng host → upstream Uvicorn.
-- [ ] Runner: transport (`redis_queue` vs HTTP poll) khớp ops target.
+- [ ] Runner: `RUNNER_TRANSPORT=redis_queue`, Redis và `BACKEND_URL`/`BACKEND_API_KEY` khớp môi trường.
 
 **Rollback plan**
 
@@ -212,8 +214,8 @@ docker compose ps 2>/dev/null || true
 
 ## 9. Tích hợp Windows runner
 
-- Linux **dispatch** `RunnerCommand` (START/STOP/UPDATE, …) xuống queue/stream theo `runner_id` / account.
-- Runner **callback** event (`BOT_STOPPED`, heartbeat, …) về API `/api/v2/runner/*` với cùng API key contract.
+- Linux **dispatch** `RunnerCommand` (START/STOP/UPDATE, …) xuống **Redis** (list per runner) sau khi ghi Postgres; không có HTTP long-poll để runner “lấy lệnh”.
+- Runner **POST** event/heartbeat/register/delivery về **`/api/v2/runner/*`** (HTTP ngắn) với cùng `X-Backend-Api-Key`.
 - **Một account active:** tránh hai deployment/bot “running” cùng lúc trừ khi kiến trúc product cho phép — xem [CLAUDE.md](CLAUDE.md) mục one-active-deployment.
 - **Slot/sticky:** không gán nhầm account sang slot reserved của user khác; ưu tiên identifier ổn định (`account_id`, `deployment_id`) thay vì path/profile tạm thời.
 - Handoff node cụ thể: [WINDOWS_RUNNER_HANDOFF_runner-win-01.md](WINDOWS_RUNNER_HANDOFF_runner-win-01.md) — **đối chiếu** với môi trường thật trước khi làm theo.
@@ -228,17 +230,22 @@ docker compose ps 2>/dev/null || true
 |----------|-------------|
 | [README.md](README.md) | Entry chính (file này) |
 | [docs/DOCS_INDEX.md](docs/DOCS_INDEX.md) | Tất cả link doc |
+| [backend_ai/README.md](backend_ai/README.md) | Docker context `spider-app` + vào `backend/` |
 | [backend_ai/backend/README.md](backend_ai/backend/README.md) | Chi tiết backend |
+| [backend_ai/backend/app/README.md](backend_ai/backend/app/README.md) | Bản đồ `app/` (router, services, events) |
+| [backend_ai/backend/app/repositories/control_plane/sql/README.md](backend_ai/backend/app/repositories/control_plane/sql/README.md) | Mục lục SQL theo domain |
 | [frontend-v2/README.md](frontend-v2/README.md) | Mini App, env build |
-| [bot-trading/README.md](bot-trading/README.md) | Registry bot |
+| [hubbot/README.md](hubbot/README.md) | Telegram bot layout |
+| [bot-trading/README.md](bot-trading/README.md) | Registry bot *(chỉ có khi team commit/submodule — nếu 404 thì bỏ qua dòng này)* |
 | [runner/README.md](runner/README.md) | Hợp đồng runner |
 | [config/README.md](config/README.md) | Nginx / sở hữu file cấu hình |
+| [ops/README.md](ops/README.md) | Script preflight / compose helper / monitoring |
 
 **Quy ước file env**
 
 - Repo root `.env` (hoặc `ENV_FILE`) là runtime chính cho `docker compose` (đã `.gitignore`).
 - `backend_ai/backend/.env` khi chạy backend ngoài compose (PM2/host).
-- `frontend-v2/.env` khi dev frontend riêng.
+- `frontend-v2/.env` khi dev frontend riêng (sao chép từ `frontend-v2/.env.example`).
 - Runner Windows: `.env` riêng trên máy Windows.
 
 ### 10.1. Yêu cầu hệ thống
@@ -340,7 +347,7 @@ docker compose down -v
 | Redis connection fail | Password, bind `127.0.0.1` vs public, firewall |
 | Postgres “too many connections” | Giảm pool app hoặc tăng `max_connections` / scale read |
 | Telegram `Conflict getUpdates` | Hai process cùng token — dừng một bên |
-| Runner offline | Heartbeat, tailnet/firewall, `RUNNER_CONTROL_PLANE_URL` |
+| Runner offline / không dequeue lệnh | HTTP: heartbeat, `RUNNER_CONTROL_PLANE_URL`; **Redis**: host/port/password, `RUNNER_TRANSPORT=redis_queue`, firewall/tailnet |
 | Command kẹt queued/pending | Redis, reconciler, log `runner.command.*` (xem CLAUDE runbook) |
 | Callback timeout | Latency mạng, runner load, timeout HTTP |
 | TradingView 4xx/5xx | Payload alert, auth, URL user webhook nếu có chuỗi giao hàng |
@@ -379,4 +386,4 @@ Chi tiết lỗi đã biết: [CLAUDE.md](CLAUDE.md) phần Troubleshooting / Ru
 
 ## 15. Kiến trúc deploy production (PM2)
 
-Theo [ecosystem.config.js](ecosystem.config.js): path mẫu trên Linux host (`/root/spider-ai/...`) — **chỉnh** cho đúng server. Compose vẫn là cách khuyến nghị cho dev trên Windows/macOS.
+Theo [ecosystem.config.js](ecosystem.config.js): `PROJECT_ROOT` mặc định là thư mục chứa file (cwd backend/hubbot là `backend_ai/backend`, `hubbot` tương đối root đó). Trên VPS **chỉnh** nếu layout khác. Compose vẫn là cách khuyến nghị cho dev trên Windows/macOS.

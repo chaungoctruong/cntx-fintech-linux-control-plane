@@ -5,11 +5,13 @@
 - Tập trung hóa logic tích hợp để route/component không gọi hạ tầng trực tiếp.
 - Giữ contract dữ liệu nhất quán giữa frontend và backend.
 
-## Nhiệm vụ chính
+## Nhiệm vụ chính (inventory file)
+
 - `api.ts`: lớp gọi backend API, chuẩn hóa request/response và lỗi.
 - `store.ts`: quản lý state dùng chung ở mức ứng dụng.
 - `telegram.ts`: adapter tích hợp Telegram Mini App.
 - `mt5-preferences.ts`: tiện ích lưu/đọc tùy chọn liên quan MT5 phía client.
+- `clientLogger.ts`: gom lỗi client / beacon tới backend telemetry (đồng bộ với endpoint `/api/v2/system/client-events` khi bật).
 
 ## Hành vi kiến trúc bắt buộc
 - Mọi gọi API đi qua `lib/api.ts` (hoặc wrapper từ file này).

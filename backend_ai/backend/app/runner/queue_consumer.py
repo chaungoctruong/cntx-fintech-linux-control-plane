@@ -42,7 +42,7 @@ class MT5RunnerRedisQueueConsumer:
             raise RuntimeError("redis_unavailable")
         return redis
 
-    async def _claim_from_queue(
+    async def _blocking_dequeue_to_processing(
         self,
         *,
         source_queue: str,
@@ -61,14 +61,14 @@ class MT5RunnerRedisQueueConsumer:
         return envelope.model_copy(update={"processing_queue_name": processing_queue})
 
     async def pop_next_verification(self, *, timeout_sec: int = 5) -> Optional[QueueEnvelope]:
-        return await self._claim_from_queue(
+        return await self._blocking_dequeue_to_processing(
             source_queue=self._verification_queue,
             processing_queue=self._verification_processing_queue,
             timeout_sec=timeout_sec,
         )
 
     async def pop_next_command(self, *, timeout_sec: int = 5) -> Optional[QueueEnvelope]:
-        return await self._claim_from_queue(
+        return await self._blocking_dequeue_to_processing(
             source_queue=self._command_queue,
             processing_queue=self._command_processing_queue,
             timeout_sec=timeout_sec,

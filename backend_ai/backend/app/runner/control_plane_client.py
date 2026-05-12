@@ -140,8 +140,5 @@ class MT5RunnerControlPlaneClient:
     async def get_command(self, command_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/api/v2/runner/commands/{command_id}")
 
-    async def claim_command(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", "/api/v2/runner/commands/claim", json_payload=payload)
-
     async def update_command_delivery(self, command_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", f"/api/v2/runner/commands/{command_id}/delivery", json_payload=payload)

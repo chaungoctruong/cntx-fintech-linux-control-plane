@@ -1,60 +1,32 @@
-# Vận hành production thử
+# `ops/` — Script tiện ích vận hành (monorepo)
 
-Thư mục này chứa runbook và script vận hành cho Linux backend khi chạy product-style bằng Docker Compose.
+Thư mục này gồm **vài script bash** dùng khi dev/kiểm tra trên máy có Docker Compose; **không** thay cho runbook đầy đủ trong `docs/` hay `DEPLOY_FRESH_VPS.md`.
 
-## Ranh giới hiện tại
+## File thực tế (inventory)
 
-- Đây là cấu hình production thử một node, chưa phải HA thật.
-- Backend, Postgres và Redis chạy trên cùng VPS bằng Docker Compose.
-- Frontend/Mini App dùng Vercel HTTPS tại `https://work-mu-five.vercel.app`.
-- Windows runner nên gọi control-plane qua `https://work-mu-five.vercel.app`, không gọi IP HTTP trực tiếp.
+| File | Việc làm |
+|------|----------|
+| **`preflight_linux_control_plane.sh`** | Kiểm tra read-only trước khi scale/deploy (tuỳ chọn `BACKEND_ENV_FILE=...`). Gọi từ root monorepo. |
+| **`compose-dev.sh`** | Helper chạy stack dev (đọc nội dung file trước khi tin cậy). |
+| **`compose-prod.sh`** | Helper compose kiểu production thử (đọc nội dung — không ngầm định là prod thật). |
+| **`monitoring/check_prod_readiness.sh`** | Smoke: `docker compose ps`, `curl` `/ready` local, `curl` health public, kiểm tra catalog `/api/v2/bots`. |
+| **`monitoring/README.md`** | Ghi chú ngắn cho script trên. |
 
-## Việc đã chuẩn hóa
+## Public URL mặc định trong script
 
-- `APP_ENV=production` để backend bật kiểm tra secret production.
-- `SERVICE_MODE=production` để tránh nhầm với local/dev.
-- Redis nội bộ có password và AOF persistence.
-- Docker Compose có healthcheck cho Postgres, Redis và backend.
-- Có script backup Postgres/Redis.
-- Có script kiểm tra readiness/public API/catalog.
+`check_prod_readiness.sh` đọc `PUBLIC_BASE_URL` từ `.env` (root); nếu trống thì fallback một URL mẫu trong script — **luôn chỉnh `.env` theo domain/tunnel thật** của bạn.
 
-## Việc vẫn phải làm trước production thật
+## Windows runner ↔ control-plane
 
-- Rotate token Telegram/Gemini ở nhà cung cấp nếu token từng bị lộ trong chat/log.
-- Thêm backup offsite, ví dụ đẩy file backup sang object storage.
-- Thêm monitoring ngoài VPS, ví dụ uptime check, alert Telegram, disk usage, CPU/RAM.
-- Chốt quy trình release bằng commit/tag rõ ràng.
-- Nếu nhận live-money traffic, nên tách Postgres/Redis sang managed hoặc HA.
+- Runner production nên theo **hợp đồng** trong `CLAUDE.md` và [docs/HEADSCALE_MESH_SETUP.md](../docs/HEADSCALE_MESH_SETUP.md) (mạng riêng, Redis trên tailnet).
+- Gọi API công khai qua CDN/reverse-proxy có thể gặp **timeout** cho tác vụ dài; ưu tiên đường nội bộ đã chốt trong kiến trúc deploy.
 
-## Lệnh kiểm tra nhanh
+## Backup / HA
 
-```bash
-bash ops/monitoring/check_prod_readiness.sh
-```
+- **Không** có `ops/backup/` hay artifact backup được commit trong repo này. Backup Postgres/Redis làm theo runbook VPS (`DEPLOY_FRESH_VPS.md`) hoặc công cụ managed DB.
 
-## Lệnh backup
+## Đào tạo nhân viên
 
-```bash
-bash ops/backup/backup_postgres.sh
-bash ops/backup/backup_redis.sh
-```
-
-File backup tạo trong `ops/artifacts/backups/`, thư mục này đã được git ignore.
-
-## Runbook runner khi slot bị kẹt
-
-- Nếu Windows báo slot cũ `LISTENING` nhưng Linux deployment đã `stopped`, ưu tiên drain runner trước khi dọn.
-- Gửi `STOP_BOT` cleanup đúng deployment bị kẹt, không clear toàn bộ Redis và không sửa slot/account live khác.
-- Chỉ resume runner khi inventory đã sạch: slot cũ về `READY/EMPTY`, queue `commands`, `commands_processing`, `verification`, `verification_processing` đều bằng `0`.
-- Sau cleanup chỉ start lại một deployment test/đang vận hành thật cần thiết, rồi xác nhận chỉ có một slot `LISTENING`.
-
-## AI hiện tại
-
-- Trading/go-live hiện không phụ thuộc `ai_available`.
-- `AI_PROVIDER=ollama` đang được defer nếu máy chưa có Ollama/model sẵn sàng.
-- Khi cần bật AI production, chọn một hướng rõ ràng: cài Ollama model trên server hoặc chuyển sang Gemini/API provider rồi test riêng.
-
-## Public health
-
-- Vercel phải proxy `/ready` và `/health` về Linux backend để monitor ngoài server kiểm tra được.
-- `/api/v2/*` vẫn giữ nguyên contract runner/control-plane hiện có.
+1. Chạy `bash ops/preflight_linux_control_plane.sh` trên máy lab (read-only).
+2. Đọc `monitoring/check_prod_readiness.sh` để biết thứ tự kiểm tra.
+3. Không giả định script này tồn tại trên runner Windows — chỉ dùng trên Linux control-plane host.

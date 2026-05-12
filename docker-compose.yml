@@ -1,5 +1,5 @@
-# Local/dev compose only. Production deployment uses PM2/HA samples under
-# `ecosystem.config.js` and `ops/ha/`; do not treat this file as a production
+# Local/dev compose only. Production-style host deploy uses PM2 (`ecosystem.config.js`)
+# and runbooks in `docs/`; do not treat this file as a production
 # Postgres/Redis/security baseline.
 #
 # Env file selection (gitignored .env*):
@@ -39,7 +39,7 @@ services:
     #   -e NEXT_PUBLIC_BACKEND_URL=<https-tunnel> node:20-bookworm-slim
     #   bash -c "npm install && npm run build"
     volumes:
-      - ./frontend-v2/out:/app/frontend-v2/out:ro
+      - ./frontend-v2:/app/frontend-v2:ro
       - ./logs:/app/logs
     depends_on:
       db:

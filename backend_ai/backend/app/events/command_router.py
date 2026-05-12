@@ -200,6 +200,68 @@ class CommandRouterService:
             return command_record
 
         # ---------------------------------------------------------------
+        # Latest-intent guard. For START_BOT we re-read the deployment row
+        # right before publishing so a stale START (eg. queued replacement
+        # whose user pressed OFF in the meantime) cannot escape to Redis.
+        # `intent_seq` on the payload — set at command creation by the
+        # orchestration layer — is compared against the deployment's current
+        # intent_seq; payload value < current means a newer user action has
+        # invalidated this command and we must drop.
+        # ---------------------------------------------------------------
+        if command_type == CommandType.START_BOT:
+            intent_state = self._repo.get_deployment_intent_state(deployment_id=deployment_id)
+            current_desired_state = str((intent_state or {}).get("desired_state") or "").strip().lower()
+            current_status = str((intent_state or {}).get("status") or "").strip().lower()
+            current_intent_seq = (intent_state or {}).get("intent_seq")
+            payload_intent_seq = routed_payload.get("intent_seq")
+            drop_reason: str | None = None
+            if not intent_state:
+                drop_reason = "deployment_missing"
+            elif current_desired_state != "running":
+                drop_reason = "desired_state_stopped"
+            elif current_status in {"stopped", "failed", "blocked"}:
+                drop_reason = "deployment_terminal"
+            else:
+                try:
+                    if (
+                        payload_intent_seq is not None
+                        and current_intent_seq is not None
+                        and int(payload_intent_seq) < int(current_intent_seq)
+                    ):
+                        drop_reason = "stale_intent"
+                except Exception:
+                    drop_reason = None
+            if drop_reason:
+                self._repo.mark_command_failed_pre_publish(
+                    command_id=envelope_model.command_id,
+                    reason=drop_reason,
+                )
+                log_agent_event(
+                    _log,
+                    logging.INFO,
+                    "runner.command.dispatch.dropped",
+                    hint=(
+                        "START_BOT dropped before Redis publish — desired_state/intent_seq diverged from the user's latest intent. "
+                        "Not a runner issue: backend refused to deliver a START the user already invalidated."
+                    ),
+                    operation="command_dispatch",
+                    outcome="dropped",
+                    dispatch_decision="dropped",
+                    drop_reason=drop_reason,
+                    desired_state=current_desired_state or None,
+                    deployment_status=current_status or None,
+                    intent_seq=int(payload_intent_seq) if payload_intent_seq is not None else None,
+                    latest_seq=int(current_intent_seq) if current_intent_seq is not None else None,
+                    **dispatch_ctx,
+                )
+                return {
+                    **command_record,
+                    "delivery_status": "failed",
+                    "dispatch_decision": "dropped",
+                    "drop_reason": drop_reason,
+                }
+
+        # ---------------------------------------------------------------
         # Distributed login lease (spec §2.2). For START_BOT only.
         # Idempotent — same runner re-acquiring just renews TTL. Conflicts
         # with another runner are blocked iff LOGIN_LEASE_ENFORCED=True;
@@ -272,9 +334,10 @@ class CommandRouterService:
             _log,
             logging.INFO,
             "runner.command.dispatch.queued",
-            hint="Command queued to Redis; expect runner to claim within a few seconds.",
+            hint="Command queued to Redis; expect runner to BRPOP/dequeue within a few seconds.",
             operation="command_dispatch",
             outcome="queued",
+            dispatch_decision="sent",
             redis_stream_id=stream_id,
             publish_elapsed_ms=round((time.monotonic() - publish_started) * 1000, 1),
             **dispatch_ctx,

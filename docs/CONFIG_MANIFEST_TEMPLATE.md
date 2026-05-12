@@ -1,5 +1,7 @@
 # Configuration manifest — template (no secrets)
 
+**Tiếng Việt:** Bảng manifest **mỗi máy** (không dán password) — điền khi release freeze / chuyển VPS; lưu ngoài git hoặc vault.
+
 Điền một bản **mỗi server** (hoặc mỗi vai trò) khi release freeze / chuyển máy. Lưu ngoài git hoặc trong vault nội bộ (file manifest **không** chứa password/token — chỉ path và version).
 
 | Field | Value (placeholder) |

@@ -42,10 +42,8 @@ _DEFAULT_SKIP_PREFIXES = (
 # drown the INFO sink. Real state lives elsewhere:
 #   - heartbeat: tracked separately via `runner.event.ingest` for actual events
 #     and via the existing access-log noise filter
-#   - commands/claim: 10s long-poll, runners hit constantly
 # Errors (5xx/4xx) on these paths are still WARN/ERROR — only success demoted.
 _DEFAULT_DEBUG_EXACT = frozenset({
-    "/api/v2/runner/commands/claim",
     "/api/v2/runner/heartbeat",
 })
 

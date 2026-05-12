@@ -64,7 +64,7 @@ hubbot/                          # Telegram bot (python-telegram-bot, long-poll)
   Dockerfile
   main.py                        # Entry: build Application, register handlers, run_polling
   app/
-    commands/                    # /start, /ping, /server_status
+    commands/                    # /start, /ping, /trangthai, /sys (dev status)
     callback/                    # CallbackQuery router
     consumer/                    # rabbitmq_commands (consume từ queue → reply Telegram)
     api/                         # client gọi backend FastAPI + ai_chat
@@ -80,9 +80,10 @@ frontend-v2/                     # Next.js 14 Mini App (static export)
 runner/                          # Stub reference, KHÔNG phải Windows runner thật.
                                  # Windows runner production nằm ở repo `windowns-runner-mt5-user-v1`.
 
-config/                          # nginx-spider.conf
+config/                          # nginx-spider.conf (+ README)
 docker-compose.yml               # Local/dev: db + redis + spider-app + hubbot
-ecosystem.config.js              # PM2 production: spider-backend (2 instance) + spider-hubbot
+ecosystem.config.js              # PM2: spider-backend + spider-hubbot (`PROJECT_ROOT`)
+vercel.json                      # Tuỳ chọn: Vercel build Mini App + rewrites → backend Linux
 nginx.conf                       # Nginx baseline
 ops_telegram_alerts.py           # Telegram error notifier shared (top-level vì backend import top-level)
 DEPLOY_FRESH_VPS.md              # SOP deploy fresh VPS (Rocky 9)
@@ -104,7 +105,7 @@ README.md                        # Hướng dẫn chạy A→Z (luồng compose)
   - `accounts.py` — connect/verify MT5 account
   - `bots.py` — bot catalog (đọc-only từ user perspective, admin upsert qua admin route)
   - `deployments.py` — start/stop/config/commands/events/logs/performance
-  - `runners.py` — endpoint nội bộ Windows runner gọi vào (register, heartbeat, claim commands, callback verification)
+  - `runners.py` — endpoint nội bộ Windows runner (register, heartbeat, events, command delivery, packages, verification)
   - `miniapp.py` + `mini_router` — serve Mini App + API riêng
   - `streams.py` — SSE/long-poll cho client
   - `system.py` — `/health`, `/ready`, `/api/v2/system/healthz`
@@ -130,7 +131,7 @@ README.md                        # Hướng dẫn chạy A→Z (luồng compose)
 
 ### 3.4 runner/ trong repo này
 
-- **Không phải Windows runner production**. Là stub/reference + `WINDOWS_RUNNER_INTEGRATION_PROMPT.md` ở [backend_ai/backend/app/runner/](backend_ai/backend/app/runner/) làm hợp đồng để repo Windows implement đúng.
+- **Không phải Windows runner production**. Là stub/reference + `WINDOWS_RUNNER_INTEGRATION_PROMPT.md` (tiếng Việt) ở [backend_ai/backend/app/runner/](backend_ai/backend/app/runner/) làm hợp đồng để repo Windows implement đúng.
 - Windows runner thật: repo `windowns-runner-mt5-user-v1`.
 
 ---
@@ -151,10 +152,10 @@ docker compose logs -f hubbot
 ### 4.2 PM2 (production-style trên Linux host)
 
 [ecosystem.config.js](ecosystem.config.js):
-- **`spider-backend`**: cwd `/root/spider-ai/backend_ai/backend`, venv `venv/bin/python3`, script `scripts/run_api.py`. 2 instance fork, port = `API_PORT_BASE` (8002) + `INSTANCE_ID` → **8002 và 8003**.
-- **`spider-hubbot`**: cwd `/root/spider-ai/hubbot`, venv `venv_hub/bin/python3`, script `main.py`. 1 instance.
+- **`spider-backend`**: `cwd` = `path.join(PROJECT_ROOT, "backend_ai/backend")` (mặc định `PROJECT_ROOT` là thư mục chứa `ecosystem.config.js`), venv `venv/bin/python3`, script `scripts/run_api.py`. 2 instance fork, port = `API_PORT_BASE` (8002) + `INSTANCE_ID` → **8002 và 8003**.
+- **`spider-hubbot`**: `cwd` = `path.join(PROJECT_ROOT, "hubbot")`, venv `venv_hub/bin/python3`, script `main.py`. 1 instance.
 
-Path **hard-code cho Linux host** — KHÔNG chạy được trên Windows native. Compose là cách duy nhất để dev trên Windows/macOS.
+Trên VPS đặt `PROJECT_ROOT` (env) nếu layout khác mặc định. Path tuyệt đối kiểu `/root/...` trong tài liệu cũ chỉ là ví dụ — luôn đối chiếu file `ecosystem.config.js` thực tế.
 
 ---
 
@@ -171,7 +172,7 @@ Path **hard-code cho Linux host** — KHÔNG chạy được trên Windows nativ
 | `backend_ai/backend/.env.mt5-runner.example` | Cho runner Windows | ✅ |
 | `backend_ai/backend/.env.redis.example` | Mẫu Redis prod | ✅ |
 | `backend_ai/backend/.env` | Production thực | ❌ |
-| `frontend-v2/.env.example` | Mẫu cho frontend dev | ✅ |
+| `frontend-v2/.env.example` | Mẫu `NEXT_PUBLIC_*` (commit được) — `cp .env.example .env` rồi build |
 
 ### Biến quan trọng
 
@@ -214,9 +215,8 @@ Path **hard-code cho Linux host** — KHÔNG chạy được trên Windows nativ
 
 ### Transport — production: Redis qua Headscale mesh
 **Production target** (vài trăm runner + vài nghìn user + TradingView fan-out):
-- **`redis_queue`** (primary): backend pipeline LPUSH `mt5:runner:{RUNNER_ID}:commands` → runner BRPOP. Latency ~50ms cho fan-out N user. Setup: [docs/HEADSCALE_MESH_SETUP.md](docs/HEADSCALE_MESH_SETUP.md).
-- **HTTP** (chỉ register/heartbeat/events/bootstrap, request ngắn): runner gọi qua tailnet `http://100.64.0.1:8001`. KHÔNG qua Vercel (Vercel timeout 10s gây 502 cho long-poll).
-- **`http_poll` claim** (deprecated cho production): chỉ giữ cho debug/emergency. Khi runner set `RUNNER_TRANSPORT=redis_queue` thì skip endpoint này.
+- **`redis_queue`**: backend pipeline LPUSH `mt5:runner:{RUNNER_ID}:commands` → runner BRPOP/BRPOPLPUSH. Latency ~50ms cho fan-out N user. Setup: [docs/HEADSCALE_MESH_SETUP.md](docs/HEADSCALE_MESH_SETUP.md).
+- **HTTP** (register/heartbeat/events/bootstrap/delivery — request ngắn): runner gọi backend qua tailnet `http://100.64.0.1:8001`. Tránh proxy timeout ngắn (vd. Vercel) cho tải không phù hợp. **Điều khiển bot / lệnh thực thi** chỉ qua Redis `mt5:runner:{RUNNER_ID}:commands`.
 
 **Bootstrap**: `GET /api/v2/runner/bootstrap?runner_id=runner-win-01` trả về contract đầy đủ — runner gọi sau khi cài Tailscale + join tailnet.
 
@@ -414,7 +414,7 @@ Module này có lifecycle riêng: `start_ai_care_campaign`, `start_ai_continuous
 - **Đổi tunnel URL nhưng quên rebuild frontend** → client vẫn gọi URL cũ vì `NEXT_PUBLIC_*` inline tại build time.
 - **Sửa schema control-plane mà không sync repo Windows** → command bị reject ở runner hoặc event không parse được ở backend.
 - **Gọi API user/Mini App từ Windows runner** → vi phạm contract, runner chỉ được dùng `/api/v2/runner/*`.
-- **Dùng PM2 trên Windows native** — path hard-code `/root/spider-ai/...`, sẽ fail. Compose là đường duy nhất trên Windows/macOS.
+- **Dùng PM2 trên Windows native** — `ecosystem.config.js` dự kiến chạy trên Linux host (venv path Unix). Compose là đường duy nhất trên Windows/macOS.
 - **`docker compose down -v`** khi đang dev DB có dữ liệu test → mất volume Postgres + Redis dump. Chỉ dùng khi cần reset sạch.
 
 ---

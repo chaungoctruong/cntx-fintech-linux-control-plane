@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
@@ -14,7 +12,6 @@ from app.schemas.control_plane import (
     AccountVerificationResultRequest,
     CommandDeliveryUpdateRequest,
     GsAlgoBotStateRequest,
-    RunnerCommandClaimRequest,
     RunnerDrainRequest,
     RunnerEventRequest,
     RunnerHeartbeatRequest,
@@ -240,28 +237,6 @@ async def runner_bootstrap(
 ) -> dict:
     request_base_url = f"{request.url.scheme}://{request.url.netloc}".rstrip("/")
     return service.runner_bootstrap(runner_id=runner_id or None, request_base_url=request_base_url)
-
-
-@router.post("/runner/commands/claim")
-async def claim_runner_command(
-    payload: RunnerCommandClaimRequest,
-    _: dict = Depends(require_backend_api_key),
-    service: MT5ControlPlaneService = Depends(service_dep),
-) -> dict:
-    command_types = [str(getattr(item, "value", item) or "").strip().upper() for item in payload.command_types]
-    deadline = time.monotonic() + max(0, int(payload.wait_timeout_sec or 0))
-    while True:
-        try:
-            result = await service.claim_runner_command(
-                runner_id=payload.runner_id,
-                slot_id=payload.slot_id,
-                command_types=command_types,
-            )
-        except Exception as exc:
-            raise translate_control_plane_error(exc) from exc
-        if not result.get("empty") or time.monotonic() >= deadline:
-            return result
-        await asyncio.sleep(min(1.0, max(0.1, deadline - time.monotonic())))
 
 
 @router.get("/runner/commands/{command_id}")

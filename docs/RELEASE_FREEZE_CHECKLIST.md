@@ -1,6 +1,6 @@
 # Release freeze — checklist (config guardrail)
 
-Dùng ngay trước khi **tag release**, **đóng băng cấu hình**, hoặc **thêm server** control-plane. Chỉ tick khi đã xác minh.
+**Tiếng Việt:** Checklist trước khi **tag release**, **đóng băng cấu hình**, hoặc **thêm server** control-plane — chỉ tick khi đã xác minh.
 
 ---
 

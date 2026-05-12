@@ -22,7 +22,20 @@ import {
 } from "@/components/Bot/mt5ControlUtils";
 import { getDeploymentFailureMessage, getFriendlyMt5ActionError } from "@/components/Bot/mt5ControlMessages";
 
-const START_STOP_POLL_DELAYS_MS = [500, 750, 1000, 1250, 1500, 2000, 2500, 3000];
+// Poll cadence calibrated against measured runner timings (xem
+// scripts/measure_command_latency.py): STOP_BOT → BOT_STOPPED p50 14s / p95
+// 17s; START_BOT → BOT_STARTED p50 91s / max 98s vì MT5 cold start. Budget cũ
+// 12.5s ngắn hơn p50 nên spinner clear sớm trước khi runner kịp ack.
+// Cadence fast trong ~5s đầu (đa số transition nhanh) rồi giãn ra để khỏi đốt
+// băng thông.
+const STOP_POLL_DELAYS_MS = [
+  500, 750, 1000, 1250, 1500, 2000, 2500, 3000, 3500, 4000, 5000,
+];
+const START_POLL_DELAYS_MS = [
+  800, 1000, 1500, 2000, 2500, 3000, 3000, 3500, 4000, 4500,
+  5000, 5000, 5000, 5000, 5000, 5000, 5000, 5000, 5000, 5000,
+  5000, 5000, 5000, 5000, 5000, 5000, 5000, 5000, 5000, 5000,
+];
 
 type NoticeTone = "success" | "error" | "info";
 
@@ -92,6 +105,11 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function isStartFailureStatus(status?: string | null): boolean {
+  const normalized = String(status || "").trim().toLowerCase();
+  return normalized === "failed" || normalized === "blocked" || normalized === "stopped";
+}
+
 export function useMt5BotActions({
   loadState,
   mt5FullAccess,
@@ -118,7 +136,8 @@ export function useMt5BotActions({
       outcome: "pending",
     };
 
-    for (const delayMs of START_STOP_POLL_DELAYS_MS) {
+    const schedule = kind === "start" ? START_POLL_DELAYS_MS : STOP_POLL_DELAYS_MS;
+    for (const delayMs of schedule) {
       await sleep(delayMs);
       const snapshot = await loadState({ silentErrors: true, spinner: false, includeBots: false });
       if (!snapshot) {
@@ -152,8 +171,25 @@ export function useMt5BotActions({
         const accountActiveStatus = String(account?.active_deployment_status || "").trim().toLowerCase();
         const accountMatchesTrackedStart =
           !startDeploymentId || !accountActiveDeploymentId || accountActiveDeploymentId === startDeploymentId;
-        const failureMessage = getDeploymentFailureMessage("start", account, outcomeDeployment);
+        const newerFailureDeployment =
+          startAfterDeploymentId &&
+          latestDeployment &&
+          latestDeployment.id > startAfterDeploymentId &&
+          isStartFailureStatus(latestDeployment.status)
+            ? latestDeployment
+            : null;
+        const failureDeployment = newerFailureDeployment ?? outcomeDeployment;
+        const failureMessage = getDeploymentFailureMessage("start", account, failureDeployment);
         if (failureMessage) {
+          return {
+            settled: true,
+            success: false,
+            account,
+            latestDeployment: failureDeployment,
+            outcome: "failed",
+          };
+        }
+        if (outcomeDeployment?.id && isStartFailureStatus(outcomeDeployment.status)) {
           return {
             settled: true,
             success: false,
@@ -301,6 +337,10 @@ export function useMt5BotActions({
       const failureMessage = getDeploymentFailureMessage("start", pollResult.account, pollResult.latestDeployment);
       if (failureMessage) {
         onNotice("error", failureMessage);
+        return;
+      }
+      if (pollResult.settled && !pollResult.success) {
+        onNotice("error", "Bot chưa khởi động ổn định. Vui lòng thử lại sau ít phút.");
         return;
       }
       onNotice("info", "Đang bật");

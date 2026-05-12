@@ -120,22 +120,6 @@ class CommandDeliveryUpdateRequest(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
-class RunnerCommandClaimRequest(BaseModel):
-    runner_id: str = Field(min_length=1)
-    slot_id: Optional[str] = None
-    command_types: list[CommandType] = Field(
-        default_factory=lambda: [
-            CommandType.STOP_BOT,
-            CommandType.START_BOT,
-            CommandType.UPDATE_BOT_CONFIG,
-            CommandType.PLACE_ORDER,
-            CommandType.CLOSE_ORDER,
-            CommandType.SYNC_STATE,
-        ]
-    )
-    wait_timeout_sec: int = Field(default=0, ge=0, le=30)
-
-
 class BotSelectRequest(BaseModel):
     account_id: int
     bot_name: str = Field(min_length=1)

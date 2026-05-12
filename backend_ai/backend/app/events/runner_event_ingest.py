@@ -697,6 +697,57 @@ class RunnerEventIngestService:
             )
             return
 
+        # Latest-intent guard: the queued replacement may have been cancelled
+        # by a later user OFF press. Re-read state and skip the START_BOT if
+        # the user is no longer asking for a running bot on this account.
+        intent_state = self._repo.get_deployment_intent_state(deployment_id=replacement_deployment_id)
+        replacement_desired = str((intent_state or {}).get("desired_state") or "").strip().lower()
+        replacement_status = str((intent_state or {}).get("status") or "").strip().lower()
+        if not intent_state or replacement_desired != "running" or replacement_status != "queued":
+            drop_reason = (
+                "replacement_missing"
+                if not intent_state
+                else "desired_state_stopped"
+                if replacement_desired != "running"
+                else "replacement_not_queued"
+            )
+            self._repo.insert_deployment_audit(
+                deployment_id=replacement_deployment_id,
+                action="deployment.replacement_start_dropped",
+                payload={
+                    "deployment_id": replacement_deployment_id,
+                    "previous_deployment_id": previous_deployment_id,
+                    "stop_command_id": stop_command.get("command_id"),
+                    "drop_reason": drop_reason,
+                    "desired_state": replacement_desired or None,
+                    "deployment_status": replacement_status or None,
+                },
+                result="dropped",
+                trace_id=stop_command.get("trace_id"),
+            )
+            _log.info(
+                "runner.command.dispatch.dropped previous_deployment_id=%s replacement_deployment_id=%s drop_reason=%s desired_state=%s status=%s stop_command_id=%s",
+                previous_deployment_id,
+                replacement_deployment_id,
+                drop_reason,
+                replacement_desired or "",
+                replacement_status or "",
+                stop_command.get("command_id"),
+                extra={
+                    "event": "runner.command.dispatch.dropped",
+                    "dispatch_decision": "dropped",
+                    "drop_reason": drop_reason,
+                    "command_type": "START_BOT",
+                    "account_id": stop_command.get("account_id"),
+                    "deployment_id": replacement_deployment_id,
+                    "previous_deployment_id": previous_deployment_id,
+                    "trace_id": stop_command.get("trace_id"),
+                    "desired_state": replacement_desired or None,
+                    "deployment_status": replacement_status or None,
+                },
+            )
+            return
+
         previous = self._repo.get_deployment(deployment_id=previous_deployment_id) or {
             "id": previous_deployment_id,
             "account_id": stop_command.get("account_id"),

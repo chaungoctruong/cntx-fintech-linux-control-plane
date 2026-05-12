@@ -1,37 +1,35 @@
-# Quyền sở hữu cấu hình
+# `config/` — Cấu hình handoff (Nginx mẫu)
 
-Thư mục này chứa các file cấu hình handoff cho Linux control-plane.
+Thư mục này chứa **một file cấu hình Nginx mẫu** dùng khi bàn giao hoặc ghép vào edge thật.
 
-## File Nginx chuẩn
+## File trong thư mục
 
-- `config/nginx-spider.conf`
-  - mẫu Nginx cho control-plane một node
-  - dùng khi chuẩn bị release manifest hoặc bàn giao vận hành
-- `ops/ha/nginx/control-plane-edge.conf`
-  - mẫu edge/include cho HA control-plane
+| File | Việc làm |
+|------|----------|
+| **`nginx-spider.conf`** | Mẫu reverse proxy / static cho control-plane một node (chỉnh `server_name`, upstream, TLS theo môi trường). |
 
-## File legacy/local giữ để tham khảo
+## File ở cấp monorepo (liên quan)
 
-- `../nginx.conf`
-  - file local hoặc legacy ở host-level
-  - không phải artifact release chuẩn
-  - không dùng làm nguồn sự thật khi bàn giao sạch
+| File | Việc làm |
+|------|----------|
+| **`../nginx.conf`** | Baseline sample ở root repo — có thể là bản local/legacy; không tự động đồng bộ với `nginx-spider.conf`. |
 
-## File env runtime
+## Mẫu HA / edge khác
 
-- `../.env`
-  - runtime chính cho Docker Compose trên Linux
-  - không commit, không dán secret ra ngoài
-- `../backend_ai/backend/.env`
-  - chỉ dùng khi chạy backend trực tiếp ngoài compose
-- `../frontend-v2/.env`
-  - chỉ dùng cho frontend khi build/chạy riêng
+Nếu team cần **mẫu HA** (multi-node, include split), đặt trong repo deploy riêng hoặc `docs/` theo manifest — **hiện không có** thư mục `ops/ha/` trong monorepo này.
 
-Các file `.env.example` ở root/backend/frontend đã được bỏ để tránh nhân viên sửa nhầm. Riêng bot package có thể vẫn có `.env.example` rỗng để document contract của package, không phải runtime secret.
+## File env runtime (tham chiếu)
+
+| File | Khi nào |
+|------|---------|
+| **`../.env`** | Docker Compose trên Linux — thường là file env chính. |
+| **`../backend_ai/backend/.env`** | Chạy backend trực tiếp trên host (không qua Compose). |
+| **`../frontend-v2/.env`** | Build Mini App (`NEXT_PUBLIC_*` nhúng lúc build). |
+
+Không commit secret. Không dán token/password vào README hay ticket công khai.
 
 ## Quy tắc khi sửa cấu hình
 
-- Sửa đúng file runtime đang được service đọc.
-- Không chỉnh Nginx khi chỉ muốn đổi DB/Redis/API key.
-- Không restart production nếu chưa kiểm `docker compose config --quiet`.
-- Không để Windows runner dùng trực tiếp DB Linux; runner gọi backend/control-plane qua HTTP.
+- Sửa đúng file mà dịch vụ thật đang `include` / mount.
+- Không chỉnh Nginx khi chỉ đổi credential DB/Redis — đổi env/service tương ứng.
+- Trước khi reload production: `nginx -t` (hoặc `docker compose config --quiet` cho compose).

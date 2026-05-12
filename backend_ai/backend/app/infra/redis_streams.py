@@ -256,9 +256,9 @@ class RedisStreamPublisher:
     ) -> dict[str, Any]:
         """Move one stale runner command from processing back to the live queue.
 
-        Windows runners claim list items with BRPOPLPUSH/LMOVE into
+        Windows runners dequeue with BRPOPLPUSH/LMOVE into
         `mt5:runner:{runner_id}:commands:processing`. PostgreSQL remains the
-        source of truth for deciding when a claimed command is stale; Redis is
+        source of truth for deciding when an in-flight command is stale; Redis is
         only scanned for the physical payload that must be requeued.
         """
         redis = await get_redis_write(decode_responses=True)

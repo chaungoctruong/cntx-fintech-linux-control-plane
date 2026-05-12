@@ -14,6 +14,7 @@ import {
   getAccountStatusPillClassName,
   getDeploymentStatusPillClassName,
   humanizeAccountStatus,
+  humanizeDeploymentProgress,
   humanizeDeploymentStatus,
   isMt5AccountReady,
   isTransitionalDeploymentStatus,
@@ -40,6 +41,11 @@ const selectClassName =
 const statusPillClassName =
   "shrink-0 rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.14em]";
 const CONTROL_PLANE_REFRESH_MS = 15000;
+// While a deployment is in transitional state (start_requested / starting /
+// stop_requested / queued) poll faster so the UI catches the moment Windows
+// runner flips to running/stopped instead of waiting up to 15s. 3s matches
+// the runner heartbeat cadence without becoming spammy at scale.
+const CONTROL_PLANE_TRANSITION_REFRESH_MS = 3000;
 type Mt5BotControlPanelProps = {
   selectedBroker: string;
   preferredBotName?: string;
@@ -266,14 +272,29 @@ export default function Mt5BotControlPanel({
     if (backgroundPollingPaused) {
       return;
     }
+    const inTransition =
+      startingBot ||
+      stoppingBot ||
+      isTransitionalDeploymentStatus(latestDeployment?.status) ||
+      String(latestDeployment?.status || "").trim().toLowerCase() === "queued";
+    const refreshMs = inTransition
+      ? CONTROL_PLANE_TRANSITION_REFRESH_MS
+      : CONTROL_PLANE_REFRESH_MS;
     const intervalId = window.setInterval(() => {
       void loadState({ silentErrors: true, spinner: false, includeBots: false });
-    }, CONTROL_PLANE_REFRESH_MS);
+    }, refreshMs);
 
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [backgroundPollingPaused, loadState, selectedBroker]);
+  }, [
+    backgroundPollingPaused,
+    latestDeployment?.status,
+    loadState,
+    selectedBroker,
+    startingBot,
+    stoppingBot,
+  ]);
 
   return (
     <section className="rounded-3xl border border-cyan-300/15 bg-transparent p-4">
@@ -597,11 +618,30 @@ export default function Mt5BotControlPanel({
               </button>
             </div>
 
-            {actionHint && (
-              <div className="rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-100">
-                {actionHint}
-              </div>
-            )}
+            {(() => {
+              // Show the real Windows-runner sub-state during transitions so user
+              // sees genuine progress (executor_preparing, executor_ready, etc.)
+              // instead of a silent spinner. Falls back to actionHint when idle.
+              const progressText = (startingBot || stoppingBot || isTransitionalDeploymentStatus(latestDeployment?.status))
+                ? humanizeDeploymentProgress(latestDeployment ?? selectedDeployment)
+                : null;
+              if (progressText) {
+                return (
+                  <div className="flex items-center gap-2 rounded-2xl border border-cyan-300/20 bg-cyan-300/10 px-4 py-3 text-sm leading-6 text-cyan-100">
+                    <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.9} />
+                    <span>{progressText}</span>
+                  </div>
+                );
+              }
+              if (actionHint) {
+                return (
+                  <div className="rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-sm leading-6 text-amber-100">
+                    {actionHint}
+                  </div>
+                );
+              }
+              return null;
+            })()}
           </>
         )}
 

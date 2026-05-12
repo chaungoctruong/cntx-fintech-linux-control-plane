@@ -19,8 +19,8 @@
 - Export tập trung qua `schemas/__init__.py` để import thống nhất.
 
 ## Hành vi chuẩn bắt buộc
-- Windows Phase 1 catalog handoff chạy được bằng:
-  `python -m runner.bot_catalog --root bot-trading --expect-bot gsalgovip --expect-version 0.3.0`.
+- Kiểm tra catalog cục bộ (khi đã có package dưới `bot-trading/` với `bot_manifest.json`):
+  `python -m runner.bot_catalog --root bot-trading --expect-bot <code> --expect-version <semver từ manifest>`.
 - Mọi dữ liệu lệnh/sự kiện đi qua biên hệ thống phải map về các schema trong thư mục này.
 - Không tự ý thêm trường ngoài schema ở từng service riêng lẻ; nếu cần mở rộng thì cập nhật schema gốc trước.
 - Dùng enum chuẩn thay vì string tự do để tránh sai chính tả và lệch nghiệp vụ giữa các hệ.

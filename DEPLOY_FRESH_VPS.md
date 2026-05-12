@@ -2,6 +2,8 @@
 
 Runbook cho **VPS mới** hoặc **môi trường cô lập**. Mỗi mục có **CHECK** để bỏ qua bước đã làm.
 
+**Đường dẫn ví dụ** dưới đây dùng `/root/linux-root-backend-hubot-v1/` — trên máy thật hãy thay bằng thư mục clone của bạn (hoặc export `REPO_ROOT=...` và `cd` theo biến đó).
+
 **An toàn dữ liệu**
 
 - Không dán token, password, API key thật vào file hay chat. Dùng biến môi trường cục bộ hoặc secret manager.

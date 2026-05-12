@@ -20,7 +20,6 @@ from app.bot_catalog.mt5_repository_loader import (
     is_disabled_mt5_bot_catalog_entry,
 )
 from app.events.runner_event_ingest import RunnerEventIngestService
-from app.infra.redis_streams import RedisStreamPublisher
 from app.models.control_plane import ACTIVE_DEPLOYMENT_STATUSES, CommandType
 from app.monitoring.control_plane_metrics import ControlPlaneMetricsService
 from app.monitoring.control_plane_reconciler import ControlPlaneReconcilerService
@@ -42,7 +41,6 @@ from app.orchestration.deployment_manager import DeploymentManagerService, _inje
 from app.orchestration.runner_payload_identity import normalize_runner_payload_identity
 from app.orchestration.scheduler import preview_slots_for_account
 from app.repositories.control_plane_repository import ControlPlaneRepository
-from app.runner.protocol import build_runner_command_from_row
 from app.risk.account_risk_policy_service import AccountRiskPolicyService
 from app.risk.quota_policy import (
     describe_quota,
@@ -1899,6 +1897,52 @@ class MT5ControlPlaneService:
         return dict(trading) if isinstance(trading, dict) else {}
 
     @staticmethod
+    def _json_object(raw: Any) -> dict[str, Any]:
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = {}
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    @classmethod
+    def _tradingview_symbol_map(cls, *sources: Any) -> dict[str, str]:
+        merged: dict[str, str] = {}
+        for source in sources:
+            cfg = cls._json_object(source)
+            candidates: list[Any] = [cfg.get("symbol_map")]
+            symbols = cfg.get("symbols")
+            if isinstance(symbols, dict):
+                candidates.append(symbols.get("symbol_map"))
+            trading = cfg.get("trading")
+            if isinstance(trading, dict):
+                candidates.append(trading.get("symbol_map"))
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                for raw_src, raw_dst in candidate.items():
+                    src = str(raw_src or "").strip()
+                    dst = str(raw_dst or "").strip()
+                    if src and dst:
+                        merged[src] = dst
+                        merged[src.upper()] = dst
+                        merged[src.lower()] = dst
+        return merged
+
+    @classmethod
+    def _map_tradingview_symbol(cls, symbol: str, *sources: Any) -> str:
+        symbol_s = str(symbol or "").strip()
+        if not symbol_s:
+            return ""
+        symbol_map = cls._tradingview_symbol_map(*sources)
+        return str(
+            symbol_map.get(symbol_s)
+            or symbol_map.get(symbol_s.upper())
+            or symbol_map.get(symbol_s.lower())
+            or symbol_s
+        ).strip()
+
+    @staticmethod
     def _stable_order_magic(*, account_id: int, deployment_id: int, bot_code: str) -> int:
         seed = f"{int(account_id)}:{int(deployment_id)}:{str(bot_code or '').strip()}".encode("utf-8")
         digest = hashlib.sha256(seed).digest()
@@ -2021,8 +2065,10 @@ class MT5ControlPlaneService:
             symbol = str(body.get("symbol") or body.get("ticker") or "").strip()
             if not symbol:
                 raise ValueError("tradingview_symbol_required")
+            source_symbol = symbol
 
             trading = self._deployment_trading_config(dep)
+            symbol = self._map_tradingview_symbol(symbol, dep.get("config_json"))
             vol_raw = body.get("volume") if body.get("volume") is not None else body.get("lot")
             if vol_raw is not None and str(vol_raw).strip():
                 try:
@@ -2077,10 +2123,14 @@ class MT5ControlPlaneService:
                 }
 
             validate_runtime_command_request(deployment=dep, allowed_statuses={"running"})
+            payload: dict[str, Any] = {"request": req}
+            if symbol != source_symbol:
+                payload["source_symbol"] = source_symbol
+                payload["mapped_symbol"] = symbol
             result = await self._deployment_manager.dispatch_runtime_command(
                 deployment=dep,
                 command_type=CommandType.PLACE_ORDER,
-                payload={"request": req},
+                payload=payload,
                 trace_id=trace_id,
             )
             cmd = result.get("command") or {}
@@ -2094,6 +2144,9 @@ class MT5ControlPlaneService:
 
         # CLOSE_ORDER — Windows: ticket or position required; symbol/magic are supplementary only.
         symbol_close = str(body.get("symbol") or body.get("ticker") or "").strip()
+        source_symbol_close = symbol_close
+        if symbol_close:
+            symbol_close = self._map_tradingview_symbol(symbol_close, dep.get("config_json"))
         magic_c = self._stable_order_magic(
             account_id=account_id_i,
             deployment_id=deployment_id_i,
@@ -2149,10 +2202,14 @@ class MT5ControlPlaneService:
             }
 
         validate_runtime_command_request(deployment=dep, allowed_statuses={"running"})
+        close_payload: dict[str, Any] = {"request": close_req}
+        if symbol_close and symbol_close != source_symbol_close:
+            close_payload["source_symbol"] = source_symbol_close
+            close_payload["mapped_symbol"] = symbol_close
         result_c = await self._deployment_manager.dispatch_runtime_command(
             deployment=dep,
             command_type=CommandType.CLOSE_ORDER,
-            payload={"request": close_req},
+            payload=close_payload,
             trace_id=trace_id,
         )
         cmd_c = result_c.get("command") or {}
@@ -2303,10 +2360,15 @@ class MT5ControlPlaneService:
                 bot_code=bot_code,
             )
             trace_id = f"tv_bcast:{alert_id}:{account_id}:{kind.lower()}"
+            order_symbol = self._map_tradingview_symbol(
+                symbol,
+                sub.get("subscription_metadata"),
+                sub.get("deployment_config_json"),
+            )
 
             if kind == "PLACE_ORDER":
                 request = {
-                    "symbol": symbol,
+                    "symbol": order_symbol,
                     "side": side,
                     "volume": vol,
                     "magic": magic,
@@ -2335,6 +2397,8 @@ class MT5ControlPlaneService:
                     "broadcast_signal_id": signal_id,
                     "broadcast_alert_id": alert_id,
                     "broadcast_bot_code": requested_bot_code,
+                    "broadcast_source_symbol": symbol,
+                    "broadcast_mapped_symbol": order_symbol,
                 },
                 "_subscription_id": sub.get("subscription_id"),
             })
@@ -2705,7 +2769,6 @@ class MT5ControlPlaneService:
         runner_id: Optional[str] = None,
         request_base_url: Optional[str] = None,
     ) -> dict[str, Any]:
-        lease_sec = max(30, int(getattr(settings, "COMMAND_DELIVERY_PROCESSING_REQUEUE_TIMEOUT_SEC", 180) or 180))
         heartbeat_sec = max(3.0, float(getattr(settings, "RUNNER_HEARTBEAT_WRITE_THROTTLE_SEC", 5.0) or 5.0))
         configured_base_url = (
             str(getattr(settings, "RUNNER_CONTROL_PLANE_URL", "") or "").strip()
@@ -2726,15 +2789,7 @@ class MT5ControlPlaneService:
         else:
             base_url = configured_base_url
         runner_id_s = str(runner_id or "").strip()
-        command_types = [
-            CommandType.STOP_BOT.value,
-            CommandType.START_BOT.value,
-            CommandType.UPDATE_BOT_CONFIG.value,
-            CommandType.PLACE_ORDER.value,
-            CommandType.CLOSE_ORDER.value,
-            CommandType.SYNC_STATE.value,
-        ]
-        supported_transports = ["http_poll", "redis_queue"]
+        supported_transports = ["redis_queue"]
         recommended_transport = str(
             getattr(settings, "RUNNER_RECOMMENDED_TRANSPORT", "redis_queue") or "redis_queue"
         ).strip().lower()
@@ -2751,13 +2806,6 @@ class MT5ControlPlaneService:
             "transport": {
                 "recommended": recommended_transport,
                 "supported": supported_transports,
-                "http_poll": {
-                    "claim_path": "/api/v2/runner/commands/claim",
-                    "wait_timeout_sec": 10,
-                    "idle_poll_sec": 1,
-                    "claim_lease_sec": lease_sec,
-                    "command_types": command_types,
-                },
                 "redis_queue": {
                     "commands": f"mt5:runner:{runner_id_s or '<runner_id>'}:commands",
                     "commands_processing": f"mt5:runner:{runner_id_s or '<runner_id>'}:commands:processing",
@@ -2769,7 +2817,6 @@ class MT5ControlPlaneService:
                 "register": "/api/v2/runner/register",
                 "heartbeat": "/api/v2/runner/heartbeat",
                 "events": "/api/v2/runner/events",
-                "claim_command": "/api/v2/runner/commands/claim",
                 "command_delivery": "/api/v2/runner/commands/{command_id}/delivery",
                 "deployment_package": "/api/v2/runner/deployments/{deployment_id}/package",
                 "account_bundle": "/api/v2/runner/accounts/{account_id}/bundle",
@@ -2778,7 +2825,6 @@ class MT5ControlPlaneService:
             "timing": {
                 "heartbeat_interval_sec": heartbeat_sec,
                 "runner_stale_sec": max(30, int(getattr(settings, "CONTROL_PLANE_RUNNER_STALE_SEC", 180) or 180)),
-                "claim_lease_sec": lease_sec,
             },
             "contract": {
                 "start_bot": {
@@ -2790,8 +2836,8 @@ class MT5ControlPlaneService:
                     "stop_policy": "end_task",
                     "end_task": True,
                     "kill_worker": True,
-                    "kill_mt5": True,
-                    "terminate_mt5": True,
+                    "kill_mt5": False,
+                    "terminate_mt5": False,
                     "release_terminal": True,
                 },
                 "credential_error_codes": [
@@ -2801,68 +2847,6 @@ class MT5ControlPlaneService:
                     "ACCOUNT_NOT_FOUND",
                 ],
             },
-        }
-
-    async def claim_runner_command(
-        self,
-        *,
-        runner_id: str,
-        slot_id: Optional[str] = None,
-        command_types: Optional[list[str]] = None,
-    ) -> dict[str, Any]:
-        lease_sec = max(30, int(getattr(settings, "COMMAND_DELIVERY_PROCESSING_REQUEUE_TIMEOUT_SEC", 180) or 180))
-        requeued_expired_claims = self._repo.requeue_stale_http_claimed_execution_commands(
-            runner_id=runner_id,
-            older_than_sec=lease_sec,
-            command_types=command_types,
-            limit=50,
-        )
-        row = self._repo.claim_next_execution_command_for_runner(
-            runner_id=runner_id,
-            slot_id=slot_id,
-            command_types=command_types,
-        )
-        if not row:
-            return {
-                "empty": True,
-                "command": None,
-                "runner_id": str(runner_id or "").strip(),
-                "slot_id": str(slot_id or "").strip() or None,
-                "delivery_transport": "http_poll",
-                "next_poll_sec": 1,
-                "claim_lease_sec": lease_sec,
-                "requeued_expired_claims": requeued_expired_claims,
-            }
-
-        envelope = build_runner_command_from_row(row)
-        redis_cleanup: dict[str, Any] = {"removed": 0}
-        try:
-            redis_cleanup = await RedisStreamPublisher().remove_runner_command(
-                runner_id=envelope.runner_id,
-                command_id=envelope.command_id,
-            )
-        except Exception as exc:
-            redis_cleanup = {"removed": 0, "error": exc.__class__.__name__}
-            log.warning(
-                "runner_http_claim_redis_cleanup_failed command_id=%s runner_id=%s error=%s",
-                envelope.command_id,
-                envelope.runner_id,
-                exc.__class__.__name__,
-            )
-
-        return {
-            "empty": False,
-            "runner_id": envelope.runner_id,
-            "slot_id": envelope.slot_id,
-            "command_id": envelope.command_id,
-            "delivery_status": "dispatched",
-            "delivery_transport": "http_poll",
-            "claim_lease_sec": lease_sec,
-            "lease_expires_at_epoch": int(time.time()) + lease_sec,
-            "requeued_expired_claims": requeued_expired_claims,
-            "next_poll_sec": 0,
-            "redis_cleanup": redis_cleanup,
-            "command": envelope.model_dump(mode="json"),
         }
 
     async def ingest_runner_heartbeat(self, **payload: Any) -> dict[str, Any]:

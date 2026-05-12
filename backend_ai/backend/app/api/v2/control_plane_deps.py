@@ -6,6 +6,7 @@ from fastapi import Depends, HTTPException, status
 
 from app.api.v2.error_catalog import to_http_exception
 from app.core.auth import get_tg_user
+from app.core.redis_client import is_redis_retryable_connection_error
 from app.risk.orchestration_policy import OrchestrationPolicyError
 from app.services import login_lease
 from app.services.control_plane_service import MT5ControlPlaneService, get_control_plane_service
@@ -63,6 +64,30 @@ def _detect_unique_violation_code(exc: Exception) -> str | None:
     return None
 
 
+def _is_database_connection_error(exc: Exception) -> bool:
+    pgcode = str(getattr(exc, "pgcode", "") or "")
+    if pgcode.startswith("08"):
+        return True
+
+    module = str(exc.__class__.__module__ or "").lower()
+    name = str(exc.__class__.__name__ or "").lower()
+    if "psycopg" not in module and "psycopg" not in name:
+        return False
+
+    text = str(exc or "").lower()
+    markers = (
+        "server closed the connection",
+        "connection already closed",
+        "connection not open",
+        "terminating connection",
+        "could not connect to server",
+        "connection refused",
+        "connection timed out",
+        "ssl syscall error",
+    )
+    return any(marker in text for marker in markers)
+
+
 def translate_control_plane_error(exc: Exception) -> HTTPException:
     """Chuan hoa moi exception tu service layer -> HTTPException voi payload chuan.
 
@@ -90,6 +115,12 @@ def translate_control_plane_error(exc: Exception) -> HTTPException:
 
     if detail == "login_lease_unavailable":
         return to_http_exception("login_lease_unavailable")
+
+    if is_redis_retryable_connection_error(exc):
+        return to_http_exception("redis_unavailable")
+
+    if _is_database_connection_error(exc):
+        return to_http_exception("database_unavailable")
 
     unique_code = _detect_unique_violation_code(exc)
     if unique_code is not None:

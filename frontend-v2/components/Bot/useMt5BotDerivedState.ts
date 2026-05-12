@@ -52,7 +52,7 @@ export function useMt5BotDerivedState({
   const latestDeploymentIsCurrent =
     !activeDeployment && isActiveDeploymentStatus(latestDeployment?.status) ? latestDeployment : null;
   const selectedDeployment = activeDeployment ?? latestDeploymentIsCurrent;
-  const statusDeployment = selectedDeployment;
+  const statusDeployment = selectedDeployment ?? latestDeployment;
   const activeStopDeploymentId =
     selectedAccount?.active_deployment_id ??
     (isActiveDeploymentStatus(selectedDeployment?.status) ? (selectedDeployment?.id ?? null) : null);

@@ -53,7 +53,7 @@ docker run -d --name headscale \
 
 # Tạo config tối thiểu:
 cat > /etc/headscale/config.yaml <<'EOF'
-server_url: https://headscale.cntxlabs.com:50443
+server_url: https://headscale.<your-domain>:50443
 listen_addr: 0.0.0.0:50443
 metrics_listen_addr: 0.0.0.0:9090
 
@@ -76,7 +76,7 @@ database:
     path: /var/lib/headscale/db.sqlite
 
 # TLS — tự lấy cert qua Let's Encrypt nếu có domain. Hoặc dùng cert tự ký.
-tls_letsencrypt_hostname: headscale.cntxlabs.com
+tls_letsencrypt_hostname: headscale.<your-domain>
 tls_letsencrypt_cache_dir: /var/lib/headscale/cache
 tls_letsencrypt_challenge_type: HTTP-01
 tls_letsencrypt_listen: ":80"
@@ -99,7 +99,7 @@ docker restart headscale
 docker logs headscale | tail
 ```
 
-**DNS cần làm trước**: A record `headscale.cntxlabs.com → 103.56.161.178`. Mở port **50443** + **80** (cho ACME challenge) trên VPS.
+**DNS cần làm trước**: A record `headscale.<your-domain> → <YOUR_HEADSCALE_VPS_PUBLIC_IP>`. Mở port **50443** + **80** (cho ACME challenge) trên VPS.
 
 ---
 
@@ -152,10 +152,10 @@ dnf install -y tailscale
 systemctl enable --now tailscaled
 
 # Join headscale với tag:backend:
-tailscale up --login-server=https://headscale.cntxlabs.com:50443 \
+tailscale up --login-server=https://headscale.<your-domain>:50443 \
   --authkey="$(cat /tmp/preauthkey.txt)" \
   --advertise-tags=tag:backend \
-  --hostname=cntxlabs-backend
+  --hostname=linux-control-plane
 
 # Verify:
 tailscale ip -4
@@ -233,14 +233,14 @@ winget install Tailscale.Tailscale -e
 
 # Step 2: Join tailnet với pre-auth key + tag
 & "C:\Program Files\Tailscale\tailscale.exe" up `
-  --login-server=https://headscale.cntxlabs.com:50443 `
+  --login-server=https://headscale.<your-domain>:50443 `
   --authkey="<PASTE PREAUTH KEY>" `
   --advertise-tags="tag:runner" `
   --hostname="runner-win-$(hostname)"
 
 # Step 3: Verify connectivity
 & "C:\Program Files\Tailscale\tailscale.exe" ping 100.64.0.1
-# Expected: pong from cntxlabs-backend
+# Expected: pong from linux-control-plane
 
 # Step 4: Test Redis from Windows (nếu có redis-cli):
 # redis-cli -h 100.64.0.1 -p 6379 -a "<PASSWORD>" PING
@@ -258,9 +258,10 @@ Với vài trăm runner, **tự động hoá**:
 Sau khi node lên tailnet, đổi env runner — gửi cho Windows team:
 
 ```env
-# CŨ:
-# BACKEND_URL=https://cntxlabs.vercel.app
-# RUNNER_TRANSPORT=http_poll
+# CŨ (public URL):
+# BACKEND_URL=https://<YOUR_PUBLIC_CONTROL_PLANE_HOST>
+# RUNNER_TRANSPORT=redis_queue
+# (Redis phải reach được từ Windows)
 
 # MỚI:
 BACKEND_URL=http://100.64.0.1:8001
@@ -321,7 +322,7 @@ curl -X POST http://100.64.0.1:8001/api/v2/public/tradingview/broadcast \
 docker exec headscale headscale nodes list
 
 # Health Headscale:
-curl https://headscale.cntxlabs.com:50443/health
+curl https://headscale.<your-domain>:50443/health
 
 # Redis backlog per runner:
 docker compose exec -T redis redis-cli -a "$REDIS_PASSWORD" \
@@ -362,9 +363,9 @@ Nếu sau khi cutover gặp issue lớn:
    ```powershell
    & "C:\Program Files\Tailscale\tailscale.exe" down
    ```
-2. Revert env runner về `BACKEND_URL=https://cntxlabs.vercel.app` + `RUNNER_TRANSPORT=http_poll`
+2. Revert env runner (ví dụ `BACKEND_URL` công khai cũ) — **giữ** `RUNNER_TRANSPORT=redis_queue` và `REDIS_*` tới Redis còn reach được.
 3. Restart node_control
-4. Bug 502 quay lại nhưng các flow khác (heartbeat, register, events) vẫn chạy
+4. Nếu Redis không tới được từ Windows, lệnh sẽ không xuống runner cho tới khi sửa mạng hoặc cấu hình Redis.
 5. Báo backend admin tìm root cause trên Headscale/Redis trước khi cutover lại
 
 ---

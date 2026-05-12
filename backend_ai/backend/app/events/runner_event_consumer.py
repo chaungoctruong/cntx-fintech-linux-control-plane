@@ -103,7 +103,7 @@ class RunnerEventConsumerService:
             except Exception as exc:
                 message = str(exc or "").strip()
                 if "Timeout reading from" in message:
-                    log.debug("runner_event_consumer idle poll timeout: %s", message)
+                    log.debug("runner_event_consumer idle redis read timeout: %s", message)
                 else:
                     log_periodic(
                         log,

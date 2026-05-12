@@ -14,7 +14,6 @@ from app.repositories.control_plane.support import (
 
 
 class ControlPlaneCommandsMixin:
-    _SQL_CLAIM_NEXT_EXECUTION_COMMAND_FOR_RUNNER = load_sql("commands/claim_next_execution_command_for_runner.sql")
     _SQL_COUNT_COMMAND_DELIVERY_REPLAY_BACKLOG_BASE = load_sql("commands/count_command_delivery_replay_backlog_base.sql")
     _SQL_CREATE_EXECUTION_COMMAND = load_sql("commands/create_execution_command.sql")
     _SQL_FAIL_PENDING_START_COMMANDS_FOR_DEPLOYMENT = load_sql("commands/fail_pending_start_commands_for_deployment.sql")
@@ -35,9 +34,6 @@ class ControlPlaneCommandsMixin:
     _SQL_MARK_COMMAND_PROCESSING_REQUEUED = load_sql("commands/mark_command_processing_requeued.sql")
     _SQL_MARK_COMMAND_REPLAY_FAILURE = load_sql("commands/mark_command_replay_failure.sql")
     _SQL_RECONCILE_TERMINAL_BOT_CONTROL_COMMANDS = load_sql("commands/reconcile_terminal_bot_control_commands.sql")
-    _SQL_REQUEUE_STALE_HTTP_CLAIMED_EXECUTION_COMMANDS = load_sql(
-        "commands/requeue_stale_http_claimed_execution_commands.sql"
-    )
     _SQL_UPDATE_EXECUTION_COMMAND_DELIVERY = load_sql("commands/update_execution_command_delivery.sql")
     _SQL_UPSERT_EXECUTION_AUDIT = load_sql("commands/upsert_execution_audit.sql")
 
@@ -278,73 +274,6 @@ class ControlPlaneCommandsMixin:
 
         return self._store._with_retry_locked(_do)
 
-    def claim_next_execution_command_for_runner(
-        self,
-        *,
-        runner_id: str,
-        slot_id: Optional[str] = None,
-        command_types: Optional[list[str]] = None,
-    ) -> Optional[dict[str, Any]]:
-        runner_id_s = _norm(runner_id)
-        if not runner_id_s:
-            raise ValueError("runner_id_required")
-        slot_id_s = _norm_slot_id(slot_id) or None
-        default_types = ["STOP_BOT", "START_BOT", "UPDATE_BOT_CONFIG", "PLACE_ORDER", "CLOSE_ORDER", "SYNC_STATE"]
-        command_types_s = [
-            str(item or "").strip().upper()
-            for item in (command_types or default_types)
-            if str(item or "").strip()
-        ] or list(default_types)
-
-        def _do(con: Any, cur: Any) -> Optional[dict[str, Any]]:
-            cur.execute(
-                self._SQL_CLAIM_NEXT_EXECUTION_COMMAND_FOR_RUNNER,
-                (
-                    runner_id_s,
-                    runner_id_s,
-                    command_types_s,
-                    slot_id_s,
-                    slot_id_s,
-                    slot_id_s,
-                    slot_id_s,
-                    runner_id_s,
-                    slot_id_s,
-                    slot_id_s,
-                    slot_id_s,
-                ),
-            )
-            row = cur.fetchone()
-            return dict(row) if row else None
-
-        return self._store._with_retry_locked(_do)
-
-    def requeue_stale_http_claimed_execution_commands(
-        self,
-        *,
-        runner_id: Optional[str] = None,
-        limit: int = 100,
-        older_than_sec: int = 180,
-        command_types: Optional[list[str]] = None,
-    ) -> int:
-        runner_id_s = _norm(runner_id) or None
-        limit_i = max(1, min(int(limit or 100), 1000))
-        older_than_i = max(10, int(older_than_sec or 180))
-        default_types = ["STOP_BOT", "START_BOT", "UPDATE_BOT_CONFIG", "PLACE_ORDER", "CLOSE_ORDER", "SYNC_STATE"]
-        command_types_s = [
-            str(item or "").strip().upper()
-            for item in (command_types or default_types)
-            if str(item or "").strip()
-        ] or list(default_types)
-
-        def _do(con: Any, cur: Any) -> int:
-            cur.execute(
-                self._SQL_REQUEUE_STALE_HTTP_CLAIMED_EXECUTION_COMMANDS,
-                (command_types_s, runner_id_s, runner_id_s, older_than_i, limit_i, older_than_i),
-            )
-            return int(cur.rowcount or 0)
-
-        return self._store._with_retry_locked(_do)
-
     def fail_pending_start_commands_for_deployment(self, *, deployment_id: int, reason: str) -> int:
         reason_s = _norm(reason) or "stale_start_command_reconciled"
 
@@ -356,6 +285,57 @@ class ControlPlaneCommandsMixin:
             return int(cur.rowcount or 0)
 
         return self._store._with_retry_locked(_do)
+
+    def fail_pending_start_commands_for_account(self, *, account_id: int, reason: str) -> int:
+        """Fail any START_BOT still pending/queued/dispatched for an account.
+
+        Used when the user presses OFF: we must invalidate not just the running
+        deployment's stragglers but also any in-flight START attached to a
+        queued replacement deployment, otherwise BOT_STOPPED on the previous
+        deployment will hand them off to the runner.
+        """
+        reason_s = _norm(reason) or "stale_start_command_account_reconciled"
+
+        def _do(con: Any, cur: Any) -> int:
+            cur.execute(
+                """
+                UPDATE execution_commands
+                SET delivery_status = 'failed',
+                    last_error = COALESCE(NULLIF(last_error, ''), %s),
+                    updated_at = NOW()
+                WHERE account_id = %s
+                  AND command_type = 'START_BOT'
+                  AND delivery_status IN ('pending', 'queued', 'dispatched')
+                """,
+                (reason_s, int(account_id)),
+            )
+            return int(cur.rowcount or 0)
+
+        return self._store._with_retry_locked(_do)
+
+    def mark_command_failed_pre_publish(self, *, command_id: str, reason: str) -> None:
+        """Fail a command row that is still in 'pending' before any publish attempt.
+
+        Distinct from `mark_command_delivery`: this also records `last_error` so
+        the drop reason is visible in audit/SSE, and only applies when the row
+        has not yet been queued onto Redis.
+        """
+        reason_s = (_norm(reason) or "dispatch_dropped")[:200]
+
+        def _do(con: Any, cur: Any) -> None:
+            cur.execute(
+                """
+                UPDATE execution_commands
+                SET delivery_status = 'failed',
+                    last_error = %s,
+                    updated_at = NOW()
+                WHERE command_id = %s
+                  AND delivery_status = 'pending'
+                """,
+                (reason_s, _norm(command_id)),
+            )
+
+        self._store._with_retry_locked(_do)
 
     def reconcile_terminal_bot_control_commands(
         self,

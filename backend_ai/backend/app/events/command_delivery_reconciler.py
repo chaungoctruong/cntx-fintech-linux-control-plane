@@ -31,6 +31,8 @@ def _safe_error_label(exc: BaseException) -> str:
 
 
 class CommandDeliveryReconcilerService:
+    """Replay stuck commands to Redis and reconcile Redis processing queues."""
+
     def __init__(
         self,
         repo: Optional[ControlPlaneRepository] = None,
@@ -70,8 +72,6 @@ class CommandDeliveryReconcilerService:
             "processing_requeue_success": 0,
             "processing_requeue_not_found": 0,
             "processing_requeue_failed": 0,
-            "http_claim_requeued": 0,
-            "http_claim_requeue_error": 0,
             "terminal_failed_start": 0,
             "terminal_acknowledged_stop": 0,
             "stale_queued_start_checked": 0,
@@ -264,49 +264,6 @@ class CommandDeliveryReconcilerService:
                                 cooldown_sec=180,
                             )
 
-            http_claim_requeue = getattr(self._repo, "requeue_stale_http_claimed_execution_commands", None)
-            if callable(http_claim_requeue):
-                try:
-                    result["http_claim_requeued"] = int(
-                        http_claim_requeue(
-                            limit=max(
-                                1,
-                                int(getattr(settings, "COMMAND_DELIVERY_PROCESSING_REQUEUE_BATCH_SIZE", 100) or 100),
-                            ),
-                            older_than_sec=max(
-                                30,
-                                int(getattr(settings, "COMMAND_DELIVERY_PROCESSING_REQUEUE_TIMEOUT_SEC", 180) or 180),
-                            ),
-                            command_types=list(_REPLAY_COMMAND_TYPES),
-                        )
-                        or 0
-                    )
-                except Exception as exc:
-                    result["http_claim_requeue_error"] += 1
-                    self._last_error_at = int(time.time())
-                    self._last_error_class = exc.__class__.__name__
-                    log_agent_failure(
-                        log,
-                        "runner.command.http_claim_requeue_failed",
-                        error=exc,
-                        error_code="db_http_claim_requeue_failed",
-                        operation="http_claim_requeue",
-                        hint=(
-                            "Backend failed to release HTTP-claimed commands whose lease expired. "
-                            "Check the DB function `requeue_stale_http_claimed_execution_commands` and "
-                            "`execution_commands.delivery_status`."
-                        ),
-                    )
-                    schedule_error_alert(
-                        area="Lệnh runner",
-                        summary="Backend không thu hồi được lệnh HTTP-claim bị quá hạn.",
-                        exc=exc,
-                        impact="Một lệnh runner có thể kẹt ở trạng thái dispatched.",
-                        action="Kiểm tra execution_commands và command_delivery_reconciler.",
-                        alert_key=f"http_claim_requeue_failed:{exc.__class__.__name__}",
-                        cooldown_sec=180,
-                    )
-
             queued_start_lister = getattr(self._repo, "list_stale_queued_start_commands", None)
             queued_start_remover = getattr(self._publisher, "remove_runner_command", None)
             if callable(queued_start_lister):
@@ -416,8 +373,6 @@ class CommandDeliveryReconcilerService:
                 "replay_skipped_duplicate",
                 "processing_requeue_checked",
                 "processing_requeue_failed",
-                "http_claim_requeued",
-                "http_claim_requeue_error",
                 "terminal_failed_start",
                 "terminal_acknowledged_stop",
                 "stale_queued_start_checked",
@@ -425,7 +380,7 @@ class CommandDeliveryReconcilerService:
             )
         ):
             log.info(
-                "command_delivery_replay replay_attempted=%d replay_success=%d replay_skipped_duplicate=%d replay_failed=%d processing_requeue_checked=%d processing_requeue_success=%d processing_requeue_not_found=%d processing_requeue_failed=%d http_claim_requeued=%d http_claim_requeue_error=%d terminal_failed_start=%d terminal_acknowledged_stop=%d stale_queued_start_checked=%d stale_queued_start_failed=%d stale_queued_start_error=%d",
+                "command_delivery_replay replay_attempted=%d replay_success=%d replay_skipped_duplicate=%d replay_failed=%d processing_requeue_checked=%d processing_requeue_success=%d processing_requeue_not_found=%d processing_requeue_failed=%d terminal_failed_start=%d terminal_acknowledged_stop=%d stale_queued_start_checked=%d stale_queued_start_failed=%d stale_queued_start_error=%d",
                 result["replay_attempted"],
                 result["replay_success"],
                 result["replay_skipped_duplicate"],
@@ -434,8 +389,6 @@ class CommandDeliveryReconcilerService:
                 result["processing_requeue_success"],
                 result["processing_requeue_not_found"],
                 result["processing_requeue_failed"],
-                result["http_claim_requeued"],
-                result["http_claim_requeue_error"],
                 result["terminal_failed_start"],
                 result["terminal_acknowledged_stop"],
                 result["stale_queued_start_checked"],

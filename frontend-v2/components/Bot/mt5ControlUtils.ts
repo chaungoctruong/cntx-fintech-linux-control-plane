@@ -157,6 +157,56 @@ export function humanizeDeploymentStatus(
   return status ? status : "Đã tắt";
 }
 
+/**
+ * Map the real Windows-runner sub-state (status + health_status) into honest
+ * Vietnamese text. These come from BOT_STARTED/SIGNAL_EXECUTOR_PREPARING/READY
+ * /STOPPING events the runner emits — we do not invent stages. Return null when
+ * the deployment is not in flight so callers can fall back to the generic label.
+ */
+export function humanizeDeploymentProgress(
+  deployment: MT5DeploymentItem | null
+): string | null {
+  if (!deployment) return null;
+  const status = String(deployment.status || "").trim().toLowerCase();
+  const health = String(deployment.health_status || "").trim().toLowerCase();
+
+  if (status === "queued") {
+    if (health.startsWith("waiting_previous_deployment_stop") || health === "waiting_previous_runtime_stop") {
+      return "Đang chờ bot trước đó dừng hẳn...";
+    }
+    return "Đang xếp hàng chờ slot rảnh...";
+  }
+
+  if (status === "start_requested") {
+    if (health === "starting") return "Runner đã nhận lệnh bật, đang dựng MT5...";
+    return "Đang gửi lệnh xuống runner...";
+  }
+
+  if (status === "starting") {
+    if (health === "executor_preparing") return "Đang khởi MT5 và đăng nhập broker...";
+    if (health === "executor_ready") return "EA đã sẵn sàng, chờ MT5 nhận tín hiệu...";
+    if (health === "starting") return "Runner đã nhận lệnh bật, đang dựng MT5...";
+    return "Đang khởi bot...";
+  }
+
+  if (status === "stop_requested") {
+    if (health === "executor_stopping") return "EA đang đóng vị thế và dừng listener...";
+    if (health === "config_update_restart_requested") return "Đang dừng để áp cấu hình mới...";
+    if (health === "replacement_stop_requested") return "Đang dừng phiên cũ để bật phiên mới...";
+    if (health === "stop_requested") return "Runner đã nhận lệnh tắt, đang đóng MT5...";
+    return "Đang tắt bot...";
+  }
+
+  if (status === "running") {
+    if (health === "running") return "Bot đang chạy";
+    if (health === "degraded") return "Bot đang chạy (slot đang xuống cấp)";
+    if (health === "executor_ready") return "Bot đã sẵn sàng nhận tín hiệu";
+    return "Bot đang chạy";
+  }
+
+  return null;
+}
+
 export function getAccountStatusPillClassName(account: MT5AccountItem | null): string {
   const status = String(account?.status || "").trim().toLowerCase();
 

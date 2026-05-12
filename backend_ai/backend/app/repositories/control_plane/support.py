@@ -763,7 +763,22 @@ def _slot_inventory_projection_status(entry: dict[str, Any]) -> str | None:
         raw = _norm(entry.get(key)).lower()
         if not raw:
             continue
-        if raw in {"ready", "empty", "stopped"}:
+        if raw in {
+            "ready",
+            "empty",
+            "stopped",
+            "idle",
+            "warm",
+            "warm_idle",
+            "warm-idle",
+            "ipc_ready",
+            "ipc-ready",
+            "slot_ipc_ready",
+            "terminal_ready",
+            "terminal-ready",
+            "bridge_ready",
+            "bridge-ready",
+        }:
             return "ready"
         if raw in {"allocated", "active", "running", "verifying", "preparing", "stopping"}:
             return "allocated"

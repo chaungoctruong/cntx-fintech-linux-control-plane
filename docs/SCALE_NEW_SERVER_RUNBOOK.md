@@ -1,5 +1,7 @@
 # Scale / new Linux control-plane server — runbook
 
+**Tiếng Việt:** Runbook khi **clone server Linux control-plane mới** — đúng tag, venv, env keys, preflight, health. Không chứa secret trong file.
+
 Mục tiêu: server mới **giống production** về version, env keys, và layout — không đoán mò path hay branch.
 
 **Không** chứa secret. Mọi giá trị nhạy cảm điền trong file env ngoài git.
@@ -137,7 +139,7 @@ curl -fsS https://<domain>/ready
 | Hubbot không gọi được backend | `BACKEND_URL` trỏ tunnel thay vì `http://spider-app:8001` trong compose |
 | `/ready` false | Postgres/Redis URL sai; password; firewall |
 | Mini App trắng | Chưa build `frontend-v2/out` hoặc `NEXT_PUBLIC_*` sai tag |
-| Runner không claim | Redis URL/password; transport `redis_queue` vs HTTP |
+| Runner không nhận lệnh từ Redis | `REDIS_URL`/password; `RUNNER_TRANSPORT=redis_queue`; queue `mt5:runner:{RUNNER_ID}:commands` |
 | 401 runner | `BACKEND_API_KEY` lệch giữa backend và runner |
 | Hai bot Conflict | Hai hubbot cùng `TELEGRAM_BOT_TOKEN` |
 

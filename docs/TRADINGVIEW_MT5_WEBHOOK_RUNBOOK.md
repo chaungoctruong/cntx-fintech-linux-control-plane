@@ -1,32 +1,42 @@
-# TradingView -> MT5 Fan-Out Runbook
+# Runbook TradingView → MT5 (fan-out)
 
-This runbook connects one TradingView signal to many MT5 user accounts:
+Runbook nối **một tín hiệu TradingView** với **nhiều tài khoản MT5**: TradingView gửi HTTP → backend đọc bảng `tradingview_signal_subscriptions` (Postgres) → ghi `execution_commands` → đẩy lệnh lên **Redis** (`mt5:runner:{runner_id}:commands`) → runner Windows thực thi lệnh trên MT5.
+
+**Điều kiện:** backend Linux chạy ổn; Redis tới được từ runner Windows; runner bật `RUNNER_TRANSPORT=redis_queue`; deployment bot của khách ở trạng thái `running`; tài khoản đã **subscribe** đúng `signal_id` dùng trong TradingView.
+
+**Công cụ:** `scripts/setup_tradingview_signal.py` (subscribe / doctor / alert-json / test-broadcast).
+
+**Webhook công khai:** `https://<HOST_CONTROL_PLANE_PUBLIC>/api/v2/public/tradingview/broadcast` (thay host bằng domain/tunnel thật).
+
+Luồng tóm tắt:
 
 ```text
-TradingView alert
--> POST /api/v2/public/tradingview/broadcast
--> backend selects tradingview_signal_subscriptions
--> backend writes execution_commands
--> Redis list mt5:runner:{runner_id}:commands
--> Windows runner executes MT5 order
+Cảnh báo TradingView
+  → POST /api/v2/public/tradingview/broadcast
+  → backend đọc tradingview_signal_subscriptions
+  → backend ghi execution_commands
+  → Redis list mt5:runner:{runner_id}:commands
+  → runner Windows thực thi lệnh MT5
 ```
 
-## 1. Requirements
+---
 
-- Linux backend is running and healthy.
-- Redis is reachable by Windows runner.
-- Windows runner is online with `RUNNER_TRANSPORT=redis_queue`.
-- The customer account has a bot deployment with `status=running`.
-- The account is subscribed to the same `signal_id` used in TradingView.
-- For multi-bot operation, use a distinct `signal_id` per bot and include the
-  matching `bot_code` in the subscription/alert JSON.
+## 1. Điều kiện cần có
 
-If the deployment is not `running`, the broadcast endpoint will accept the alert
-but it will not dispatch an MT5 order for that account.
+- Backend Linux đang chạy và `/health` / `/ready` ổn.
+- Runner Windows **tới được** Redis (mạng, mật khẩu, cổng).
+- Runner online với `RUNNER_TRANSPORT=redis_queue`.
+- Tài khoản khách có deployment bot với `status=running`.
+- Tài khoản đã subscribe đúng `signal_id` như trong cảnh báo TradingView.
+- Nếu nhiều bot: dùng `signal_id` **khác nhau** cho từng bot và khai báo đúng `bot_code` trong JSON subscribe / alert.
 
-## 2. Subscribe An Account To A Signal
+Nếu deployment **không** ở trạng thái `running`, endpoint broadcast vẫn có thể **nhận** cảnh báo nhưng **sẽ không** gửi lệnh MT5 cho tài khoản đó.
 
-Run inside the backend container:
+---
+
+## 2. Gắn tài khoản với một tín hiệu (subscribe)
+
+Chạy **trong container** backend:
 
 ```bash
 docker compose exec spider-app python scripts/setup_tradingview_signal.py subscribe \
@@ -36,19 +46,20 @@ docker compose exec spider-app python scripts/setup_tradingview_signal.py subscr
   --priority 60
 ```
 
-Check readiness:
+Kiểm tra trạng thái “sẵn sàng”:
 
 ```bash
 docker compose exec spider-app python scripts/setup_tradingview_signal.py doctor \
   --signal-id gsalgovip-xauusd
 ```
 
-`ready_for_live_signal` becomes `true` only when at least one subscribed account
-has an active running deployment with runner and slot assigned.
+`ready_for_live_signal` chỉ thành `true` khi có **ít nhất một** tài khoản đã subscribe đang có deployment **running**, đã gán runner và slot.
 
-## 3. Generate TradingView Alert JSON
+---
 
-Print the webhook URL and three messages:
+## 3. Sinh JSON cảnh báo cho TradingView
+
+In URL webhook và nội dung ba loại cảnh báo (BUY / SELL / CLOSE):
 
 ```bash
 docker compose exec spider-app python scripts/setup_tradingview_signal.py alert-json \
@@ -57,7 +68,7 @@ docker compose exec spider-app python scripts/setup_tradingview_signal.py alert-
   --symbol XAUUSD
 ```
 
-To print the configured webhook secret directly into the JSON:
+Nếu muốn script **nhúng luôn** `secret` webhook (đã cấu hình trên backend) vào JSON:
 
 ```bash
 docker compose exec spider-app python scripts/setup_tradingview_signal.py alert-json \
@@ -67,21 +78,23 @@ docker compose exec spider-app python scripts/setup_tradingview_signal.py alert-
   --include-secret
 ```
 
-Use the same webhook URL for all three TradingView alerts:
+Dùng **cùng một** URL webhook cho cả ba cảnh báo trên TradingView:
 
 ```text
-https://cntxlabs.vercel.app/api/v2/public/tradingview/broadcast
+https://<YOUR_PUBLIC_CONTROL_PLANE_HOST>/api/v2/public/tradingview/broadcast
 ```
 
-Create three alerts and paste one JSON body into each alert message:
+Tạo **ba** alert trên TradingView, mỗi alert dán **một** JSON tương ứng:
 
 - `BUY`
 - `SELL`
 - `CLOSE`
 
-## 4. Test Without Sending A Real Order
+---
 
-Dry-run payload:
+## 4. Thử nghiệm (không / có gửi lệnh thật)
+
+**Chạy thử payload (dry-run, không gửi HTTP ra ngoài theo mặc định script):**
 
 ```bash
 docker compose exec spider-app python scripts/setup_tradingview_signal.py test-broadcast \
@@ -91,7 +104,7 @@ docker compose exec spider-app python scripts/setup_tradingview_signal.py test-b
   --symbol XAUUSD
 ```
 
-Actually send the webhook:
+**Gửi thật** webhook (cẩn thận — có thể tạo lệnh MT5):
 
 ```bash
 docker compose exec spider-app python scripts/setup_tradingview_signal.py test-broadcast \
@@ -102,13 +115,13 @@ docker compose exec spider-app python scripts/setup_tradingview_signal.py test-b
   --send
 ```
 
-Only run `--send` when the account is intended to receive a live/test MT5 order.
+Chỉ dùng `--send` khi tài khoản đích **được phép** nhận lệnh test / live.
 
-## 5. TradingView Notes
+---
 
-- Enable 2FA on the TradingView account; webhooks require it.
-- Keep the alert message valid JSON.
-- `alert_id` is optional. If present, use a unique value per real signal; the
-  backend dedupes retries by `alert_id`, account, and command kind. If omitted,
-  backend generates an id automatically.
-- Keep lot size small during first tests.
+## 5. Ghi chép khi cấu hình TradingView
+
+- Bật **2FA** trên tài khoản TradingView (webhook thường yêu cầu).
+- Nội dung alert phải là **JSON hợp lệ**.
+- `alert_id` là **tuỳ chọn**. Nếu có: mỗi tín hiệu thật nên một giá trị **duy nhất**; backend dùng để **chống trùng** khi TradingView gửi lại. Nếu không có: backend tự sinh id.
+- Lần đầu test nên để **khối lượng (lot) nhỏ**.

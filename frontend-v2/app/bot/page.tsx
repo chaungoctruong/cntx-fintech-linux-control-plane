@@ -61,9 +61,41 @@ type BrokerPreset = {
 };
 
 const DBG_MARKETS_BROKER_NAME = "DBG Markets";
-const DBG_MARKETS_FIXED_SERVER = "DBGMarkets-Live";
 const DBG_MARKETS_SERVER_PENDING_LABEL = "Server đang cập nhật";
-const SERVER_PENDING_BROKER_NAMES = ["Exness", "XM", "Vantage"] as const;
+const DEFAULT_MT5_FIXED_SERVERS = [[DBG_MARKETS_BROKER_NAME, "DBGMarkets-Live"]] as const;
+const DEFAULT_SERVER_PENDING_BROKER_NAMES = ["XM", "Vantage"] as const;
+
+function parsePublicEnvList(raw: string | undefined, fallback: readonly string[]): string[] {
+  if (raw === undefined) {
+    return [...fallback];
+  }
+  return raw
+    .split(/[,\n;]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function parsePublicEnvFixedServers(raw: string | undefined): Map<string, string> {
+  const entries = raw === undefined
+    ? DEFAULT_MT5_FIXED_SERVERS
+    : raw
+        .split(/[,\n;]/)
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .map((item) => {
+          const [broker, ...serverParts] = item.split("=");
+          return [broker?.trim() || "", serverParts.join("=").trim()] as const;
+        })
+        .filter(([broker, server]) => broker && server);
+
+  return new Map(entries.map(([broker, server]) => [normalizeBrokerName(broker), server]));
+}
+
+const SERVER_PENDING_BROKER_NAMES = parsePublicEnvList(
+  process.env.NEXT_PUBLIC_MT5_SERVER_PENDING_BROKERS,
+  DEFAULT_SERVER_PENDING_BROKER_NAMES
+);
+const MT5_FIXED_SERVERS = parsePublicEnvFixedServers(process.env.NEXT_PUBLIC_MT5_FIXED_SERVERS);
 
 const brokerPresets: BrokerPreset[] = [
   {
@@ -535,7 +567,16 @@ function isServerPendingBroker(brokerName?: string | null): boolean {
 }
 
 function getFixedMt5Server(brokerName?: string | null): string | null {
-  return brokerNamesMatch(brokerName, DBG_MARKETS_BROKER_NAME) ? DBG_MARKETS_FIXED_SERVER : null;
+  const key = normalizeBrokerName(brokerName);
+  return key ? MT5_FIXED_SERVERS.get(key) ?? null : null;
+}
+
+function isReservedMt5ServerValue(server?: string | null): boolean {
+  const value = String(server || "").trim();
+  return Boolean(value) && (
+    value === DBG_MARKETS_SERVER_PENDING_LABEL ||
+    Array.from(MT5_FIXED_SERVERS.values()).some((fixedServer) => fixedServer === value)
+  );
 }
 
 function isReadyMt5Account(account: MT5AccountItem): boolean {
@@ -1177,7 +1218,7 @@ export default function BotPage() {
     }
 
     if (!selectedBrokerServerPending) {
-      if (form.server === DBG_MARKETS_SERVER_PENDING_LABEL || form.server === DBG_MARKETS_FIXED_SERVER) {
+      if (isReservedMt5ServerValue(form.server)) {
         setForm((current) => ({
           ...current,
           server: "",
@@ -1807,9 +1848,7 @@ export default function BotPage() {
                             server: getFixedMt5Server(preset.name) ??
                               (isServerPendingBroker(preset.name)
                               ? DBG_MARKETS_SERVER_PENDING_LABEL
-                              : current.server === DBG_MARKETS_SERVER_PENDING_LABEL
-                                ? ""
-                                : current.server === DBG_MARKETS_FIXED_SERVER
+                              : isReservedMt5ServerValue(current.server)
                                 ? ""
                                 : current.server),
                           }));
@@ -2018,7 +2057,7 @@ export default function BotPage() {
                                 />
                                 {selectedBrokerFixedServer && (
                                   <p className="text-xs leading-5 text-cyan-100">
-                                    Server DBG được cố định: {selectedBrokerFixedServer}.
+                                    Server được cố định: {selectedBrokerFixedServer}.
                                   </p>
                                 )}
                                 {selectedBrokerServerPending && (

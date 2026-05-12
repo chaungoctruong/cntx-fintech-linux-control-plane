@@ -12,10 +12,10 @@ Backend Linux đã setup **Headscale mesh VPN** (Tailscale tự host) cho produc
 
 1. Cài Tailscale client → join tailnet private
 2. Connect backend qua tailnet IP `100.64.0.1`
-3. **Switch transport từ HTTP long-poll → Redis BRPOP** — đây là điểm quan trọng nhất
+3. **Dùng `redis_queue` (BRPOP/BRPOPLPUSH) làm kênh lệnh duy nhất** — đây là điểm quan trọng nhất
 
 **Lý do**:
-- HTTP long-poll qua Vercel timeout 10s → 502 (vấn đề hiện tại)
+- Một số reverse proxy công khai có timeout ngắn → không phù hợp tải control-plane nặng
 - HTTP qua subdomain TLS cũng OK nhưng latency 0-10s
 - Redis push: dispatch latency <100ms, fan-out 1 TradingView signal → 100 user trong 1 batch ~50ms
 - Tailnet private = no public exposure, tự động encryption + ACL
@@ -44,14 +44,14 @@ winget install Tailscale.Tailscale -e
 # A2. Join tailnet với pre-auth key (Linux team sẽ gửi qua kênh an toàn)
 $PREAUTH_KEY = "<KEY-GỬI-RIÊNG>"
 & "C:\Program Files\Tailscale\tailscale.exe" up `
-  --login-server=https://headscale.cntxlabs.com:50443 `
+  --login-server=https://headscale.<your-domain>:50443 `
   --authkey="$PREAUTH_KEY" `
   --advertise-tags="tag:runner" `
   --hostname="runner-win-$(hostname)"
 
 # A3. Verify connectivity tới backend trong tailnet
 & "C:\Program Files\Tailscale\tailscale.exe" ping 100.64.0.1
-# Expected: pong from cntxlabs-backend (vài chục ms)
+# Expected: pong from linux-control-plane (vài chục ms)
 
 # A4. Test Redis từ Windows (cần redis-cli — có thể bỏ qua nếu node_control tự test)
 # redis-cli -h 100.64.0.1 -p 6379 -a "<REDIS_PASSWORD>" PING
@@ -63,9 +63,9 @@ $PREAUTH_KEY = "<KEY-GỬI-RIÊNG>"
 Đổi env runner — file `runner/.env` hoặc tương đương:
 
 ```env
-# CŨ:
-# BACKEND_URL=https://cntxlabs.vercel.app
-# RUNNER_TRANSPORT=http_poll
+# CŨ (public URL — tránh Vercel cho tải nặng):
+# BACKEND_URL=https://<YOUR_PUBLIC_CONTROL_PLANE_HOST>
+# RUNNER_TRANSPORT=redis_queue
 
 # MỚI:
 BACKEND_URL=http://100.64.0.1:8001
@@ -80,11 +80,10 @@ BACKEND_API_KEY=<unchanged — giữ key cũ>
 
 **Note quan trọng cho runner code**:
 - HTTP endpoint `/api/v2/runner/bootstrap` + `/register` + `/heartbeat` + `/events` **vẫn dùng HTTP** qua `BACKEND_URL=http://100.64.0.1:8001` (request ngắn, OK)
-- CHỈ command claim/dispatch chuyển sang Redis BRPOP:
+- CHỈ command dispatch qua Redis BRPOP:
   - Subscribe list: `mt5:runner:{RUNNER_ID}:commands`
   - Pop: `BRPOPLPUSH mt5:runner:{RUNNER_ID}:commands mt5:runner:{RUNNER_ID}:commands:processing 0`
   - Sau khi xử lý xong: `LREM` khỏi processing list
-  - KHÔNG còn `POST /api/v2/runner/commands/claim` long-poll nữa
 
 ### Phase C — Restart + verify
 
@@ -119,28 +118,25 @@ Windows team verify: với 100 user trên 5 runners, mỗi runner nhận ~20 com
 ## 3. Báo cáo Linux team sau khi xong
 
 - [ ] Tất cả VPS chạy Tailscale, ping `100.64.0.1` OK
-- [ ] node_control khởi động với `RUNNER_TRANSPORT=redis_queue`, không còn 502
+- [ ] node_control khởi động với `RUNNER_TRANSPORT=redis_queue`, tailnet + Redis hoạt động ổn định
 - [ ] Smoke test pop được command từ Redis (Linux team gửi)
 - [ ] Bot start được trên Mini App với account thật
 - [ ] Có lỗi gì khác không — gửi log snippet 100 dòng
 
 ## 4. Rollback nếu fail
 
+Rollback mạng: `tailscale down`, trả `BACKEND_URL` về URL cũ **nhưng** runner vẫn phải `RUNNER_TRANSPORT=redis_queue` và có `REDIS_*` tới Redis đạt được (public tunnel tạm / fix mesh).
+
 ```env
-# Revert .env:
-BACKEND_URL=https://cntxlabs.vercel.app
-RUNNER_TRANSPORT=http_poll
-# (xóa REDIS_HOST/PORT/PASSWORD)
+# Ví dụ revert chỉ BACKEND_URL (Redis giữ nguyên nếu vẫn dùng được):
+BACKEND_URL=https://<YOUR_PUBLIC_CONTROL_PLANE_HOST>
+RUNNER_TRANSPORT=redis_queue
 ```
 
 ```powershell
-# Tắt tailscale (giữ cài, không join):
 & "C:\Program Files\Tailscale\tailscale.exe" down
-
 Restart-Service node-control
 ```
-
-Hệ thống quay về trạng thái cũ (vẫn 502 cho claim, nhưng heartbeat/events/register chạy qua Vercel rewrite).
 
 ## 5. Vấn đề phụ team Windows tự fix
 

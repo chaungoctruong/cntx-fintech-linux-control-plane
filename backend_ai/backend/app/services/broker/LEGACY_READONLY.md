@@ -2,7 +2,7 @@
 
 Gói này triển khai lane cTrader public beta và các helper API client.
 Lane này đang ở trạng thái **đóng băng (freeze)** theo định hướng toàn repo
-(xem `docs/linux-backend-control-plane-mt5-directive.md` mục 0).
+(xem [README.md](../../../../../README.md) mục kiến trúc + [CLAUDE.md](../../../../../CLAUDE.md) nếu cần bối cảnh sâu).
 
 ## Trạng thái hiện tại
 
@@ -31,14 +31,13 @@ Lane này đang ở trạng thái **đóng băng (freeze)** theo định hướn
 Các file này **chưa thể xóa** vì UI cTrader đang chạy thực tế trong Mini App
 vẫn dùng endpoint public beta + callback.
 Chỉ xem xét gỡ khi product team duyệt ẩn/xóa lane cTrader ở `frontend-v2/`.
-Trước thời điểm đó, freeze notice toàn repo và `docs/TWO_TASK_EXECUTION_PLAN.md`
-là source of truth.
+Trước thời điểm đó, freeze notice toàn repo và review kiến trúc nội bộ là cơ sở quyết định.
 
 ## Tài liệu liên quan
 
-- `/root/spider-ai/AGENTS.md`
-- `/root/spider-ai/docs/linux-backend-control-plane-mt5-directive.md`
-- `/root/spider-ai/docs/TWO_TASK_EXECUTION_PLAN.md`
+- [README.md](../../../../../README.md) — monorepo, deploy, env
+- [CLAUDE.md](../../../../../CLAUDE.md) — contract runner, Redis transport, ops
+- [README.md](README.md) (cùng thư mục `broker/`) — lane broker trong app
 
 (`backend_ai/backend/app/legacy/LEGACY_READONLY.md` và
 `backend_ai/backend/scripts/legacy/LEGACY_READONLY.md` đã bị xóa

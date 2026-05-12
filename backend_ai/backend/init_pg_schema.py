@@ -879,6 +879,7 @@ def init_postgres_schema():
                     CHECK (status IN ('draft', 'start_requested', 'starting', 'running', 'stop_requested', 'stopped', 'failed', 'blocked', 'queued')),
                 desired_state TEXT NOT NULL DEFAULT 'stopped'
                     CHECK (desired_state IN ('running', 'stopped')),
+                intent_seq INTEGER NOT NULL DEFAULT 0,
                 is_active BOOLEAN NOT NULL DEFAULT FALSE,
                 runner_id TEXT NULL REFERENCES runner_nodes(runner_id) ON DELETE SET NULL,
                 slot_id TEXT NULL,
@@ -899,6 +900,9 @@ def init_postgres_schema():
             CREATE INDEX IF NOT EXISTS idx_bot_deployments_runner_slot ON bot_deployments(runner_id, slot_id);
         """)
         cur.execute("ALTER TABLE bot_deployments ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'live';")
+        cur.execute(
+            "ALTER TABLE bot_deployments ADD COLUMN IF NOT EXISTS intent_seq INTEGER NOT NULL DEFAULT 0;"
+        )
         cur.execute("""
             DO $$
             BEGIN

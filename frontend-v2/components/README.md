@@ -5,10 +5,13 @@
 - Chuẩn hóa trải nghiệm người dùng giữa các màn hình.
 - Giảm trùng lặp markup/style và giúp refactor an toàn hơn.
 
-## Nhiệm vụ chính
-- Component khung: `AppShell`, `PageHeader`, `BottomNav`, `PageTransition`.
-- Component hiển thị dữ liệu: `BalanceCard`, `CntxMarketScanner`, `Toast`.
-- Component theo domain: thư mục `Bot/`, `Wallet/`, `Rewards/`.
+## Nhiệm vụ chính (inventory — khớp tree hiện tại)
+
+- **Khung trang:** `AppShell.tsx`, `PageHeader.tsx`, `BottomNav.tsx`, `PageTransition.tsx`, `FeatureButton.tsx`.
+- **Chung / market:** `BalanceCard.tsx`, `CntxMarketScanner.tsx`, `Toast.tsx`, `DisclaimerAcknowledgment.tsx`.
+- **`Bot/`:** `Mt5BotControlPanel.tsx`, `MiniappTermsModal.tsx`, `mt5ControlMessages.ts`, `mt5ControlUtils.ts`, hooks cục bộ `useMt5BotActions.ts`, `useMt5BotControl.ts`, `useMt5BotDerivedState.ts`.
+- **`Wallet/`:** `WalletBalanceCard.tsx`, `DepositSection.tsx`, `WithdrawSection.tsx`, `TransactionHistory.tsx`.
+- **`Rewards/`:** `Leaderboard.tsx`, `BonusHistory.tsx`.
 
 ## Hành vi kiến trúc bắt buộc
 - Component ưu tiên nhận dữ liệu qua props rõ ràng.

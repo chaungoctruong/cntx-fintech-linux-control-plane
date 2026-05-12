@@ -42,9 +42,19 @@ router = APIRouter(prefix="/streams", tags=["streams"])
 
 
 # Channel events FE quan tam (filter ngay tai backend de tiet kiem network).
+# Bao gom ca sub-state cua MT5 cold start (executor preparing/ready/listening) +
+# stop (executor stopping, terminal kill) de UI hien thi tien trinh that thay vi
+# silent spinner. Tat ca chinh la event runner thuc gui ve, KHONG tu sinh.
 _INTERESTING_EVENT_TYPES = {
     "BOT_STARTED",
     "BOT_STOPPED",
+    "BOT_LISTENING",
+    "SIGNAL_EXECUTOR_PREPARING",
+    "SIGNAL_EXECUTOR_READY",
+    "SIGNAL_EXECUTOR_STOPPING",
+    "SIGNAL_EXECUTOR_STOPPED",
+    "SLOT_TERMINAL_KILL_BEGIN",
+    "SLOT_TERMINAL_KILL_DONE",
     "ORDER_SENT",
     "ORDER_FILLED",
     "ORDER_REJECTED",

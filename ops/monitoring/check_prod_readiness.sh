@@ -9,7 +9,11 @@ if [[ -z "$PUBLIC_URL" && -f .env ]]; then
   PUBLIC_URL="$(grep -E '^PUBLIC_BASE_URL=' .env | tail -n1 | cut -d= -f2-)"
 fi
 PUBLIC_URL="${PUBLIC_URL%/}"
-PUBLIC_URL="${PUBLIC_URL:-https://work-mu-five.vercel.app}"
+if [[ -z "$PUBLIC_URL" ]]; then
+  echo "ERROR: Set PUBLIC_BASE_URL (env) or add PUBLIC_BASE_URL=... to repo root .env before running this script." >&2
+  echo "       Refusing a baked-in default URL (product: no surprise traffic to the wrong host)." >&2
+  exit 1
+fi
 
 echo "[1/4] Docker services"
 docker compose ps

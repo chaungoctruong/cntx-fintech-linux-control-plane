@@ -1,39 +1,33 @@
-# Backend Linux Control-Plane
+# Backend Linux (Control-Plane) — `backend_ai/backend/`
 
-Thư mục này là backend FastAPI của hệ thống CNTx Labs MT5 SaaS. Backend Linux là nơi điều phối chính: quản lý catalog bot, user/account/deployment, runner register/heartbeat, package handoff, audit và các API `/api/v2/*`.
+FastAPI **Spider AI control-plane**: user, account, deployment, lệnh runner, Mini App API, TradingView fan-out, AI phụ trợ. **Không** chạy MT5, **không** `OrderSend` — thực thi nằm ở Windows runner.
 
-## Vai trò của backend
+## Đọc tiếp theo thứ tự (onboarding nhân viên)
 
-- Nhận request từ frontend, hubbot và Windows runner.
-- Lưu dữ liệu vào Postgres và dùng Redis cho queue/cache nội bộ.
-- Quản lý `bot_catalog`, trong đó `gsalgovip` hiện là bot `backend_webhook_signal`.
-- Tạo package/deployment payload để Windows runner hiểu bot nào được hỗ trợ.
-- Không mở MT5, không gọi `order_send`, không chạy TradingView webhook trên Windows.
+1. **[app/README.md](app/README.md)** — cây `app/`, từng thư mục con làm gì, file gốc (`main.py`, `settings.py`).
+2. **[migrations/README.md](migrations/README.md)** — Alembic vs `init_pg_schema.py`.
+3. **[scripts/README.md](scripts/README.md)** — script vận hành / smoke / AI (không nhầm với code API).
+4. SQL theo domain: **`app/repositories/control_plane/sql/README.md`** (mục lục) + từng `*/README.md`.
 
-## File env dùng khi nào
+## Vai trò (tách bạch)
 
-| File | Dùng cho | Ghi chú |
-|---|---|---|
-| `../../.env` | Docker Compose trên Linux | Đây là file chính khi chạy `docker compose up -d` |
-| `.env` | Chạy backend trực tiếp trên host | Chỉ dùng khi không chạy qua compose |
-| `../../frontend-v2/.env` | Frontend build/chạy riêng | Biến frontend được inline lúc build |
+| Tầng | Linux backend làm gì | Không làm gì |
+|------|----------------------|--------------|
+| **Bật/tắt deployment** | Ghi Postgres, tạo `START_BOT` / `STOP_BOT`, policy orchestration | Không bật terminal MT5 |
+| **Lệnh tới bot MT5** | Publish envelope lên **Redis** (`mt5:runner:{RUNNER_ID}:commands`) + stream audit | Không nói chuyện broker |
+| **Runner HTTP** | Nhận `POST /api/v2/runner/register`, `heartbeat`, `events`, `.../delivery`, package, verify | **Không** có HTTP long-poll để “lấy lệnh”; lệnh chỉ qua Redis |
 
-Không commit các file `.env`. Không in hoặc dán password, token, API key vào log/chat/tài liệu.
+## Env (tóm tắt)
 
-## Cấu hình product-style hiện tại
+| File | Khi nào |
+|------|---------|
+| **`../../.env`** (repo root) | Docker Compose — **file chính** khi `docker compose up`. |
+| **`.env`** (cùng thư mục `backend/`) | Chạy `uvicorn`/script trực tiếp trên host, không qua Compose. |
+| **`../../frontend-v2/.env`** | Build Mini App (`NEXT_PUBLIC_*` inline lúc build). |
 
-Khi chạy bằng Docker Compose:
+Không commit `.env`. Không dán secret vào chat/README.
 
-- Backend bind trong container bằng `BACKEND_HOST=0.0.0.0`.
-- Public API cho máy ngoài gọi vào là `PUBLIC_BASE_URL` và `RUNNER_CONTROL_PLANE_URL`.
-- Hubbot gọi backend qua Docker network bằng `BACKEND_URL=http://spider-app:8001`.
-- Postgres/Redis dùng service nội bộ `db` và `redis`.
-
-Windows runner chỉ cần gọi HTTP về backend. Windows không cần cấu hình `POSTGRES_*`, `DATABASE_URL` hoặc `DB_MODE`.
-
-## Checklist trước khi vận hành thử
-
-Chỉ đọc trạng thái, không gửi lệnh trade:
+## Checklist chỉ đọc (không trade live)
 
 ```bash
 curl -fsS http://127.0.0.1:8001/ready
@@ -42,20 +36,14 @@ docker compose ps
 docker compose logs --tail=100 spider-app
 ```
 
-Điều kiện tối thiểu:
+- `/ready` → Postgres + Redis (và các check đã wire).
+- Runner online: xem API ops hoặc DB `runner_nodes` / log `runner.register` (theo runbook dự án).
 
-- `/ready` trả `ok=true`.
-- Postgres và Redis healthy.
-- `runner-win-test-01` hoặc runner đang test online/fresh.
-- Queue command/processing sạch trước khi test lifecycle.
-- `bot_catalog` giữ contract `gsalgovip@0.3.0` với `required_params`, `risk_contract`, `resource_hints`, `bot_type`, `execution_owner`, `windows_role`.
+## Ranh giới an toàn (vận hành)
 
-## Ranh giới an toàn
+- Không gửi `START_BOT` / `STOP_BOT` / `PLACE_ORDER` production khi chưa có kế hoạch.
+- Mọi thay đổi schema DB: **Alembic** + review; xem [migrations/README.md](migrations/README.md).
 
-Không làm các việc này nếu chưa có phase/rundown rõ ràng:
+## Liên kết monorepo
 
-- Không gửi `START_BOT` hoặc `STOP_BOT` production.
-- Không gửi `PLACE_ORDER`, `MODIFY_ORDER`, `CLOSE_ORDER`.
-- Không gọi `EXECUTE_SIGNAL_BATCH` khi chưa sang phase batch.
-- Không mở MT5 từ Linux.
-- Không sửa account/deployment live khi chỉ đang kiểm catalog hoặc readiness.
+- Hubbot, frontend, compose: README gốc repo (`../../README.md`) và `CLAUDE.md`.

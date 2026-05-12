@@ -1,6 +1,8 @@
 # Frontend Mini App
 
-Thư mục này là frontend Next.js cho Mini App. Backend Linux sẽ serve bản build static từ `frontend-v2/out`.
+Thư mục này là frontend Next.js cho Mini App. Backend Linux serve bản build static từ **`frontend-v2/out`** (mount trong `docker-compose.yml`).
+
+**Telegram `web_app`:** menu và URL Mini App trên Telegram phải là **HTTPS** (production / tunnel). Các ví dụ `http://...` dưới đây chỉ phù hợp **dev nội bộ** (LAN, curl); đừng dùng HTTP công khai cho user Telegram.
 
 ## File env
 
@@ -9,6 +11,8 @@ Frontend dùng file:
 ```text
 frontend-v2/.env
 ```
+
+Sao chép từ mẫu (commit được): `cp .env.example .env` trong thư mục `frontend-v2/`, rồi chỉnh URL.
 
 Biến quan trọng:
 
@@ -35,9 +39,11 @@ docker run --rm \
 
 Sau khi build, backend Docker Compose sẽ đọc `frontend-v2/out` qua volume mount.
 
-## Deploy lên Vercel
+## Deploy lên Vercel (tuỳ chọn)
 
-Vercel dùng `vercel.json` ở repo root để build `frontend-v2` và serve thư mục `frontend-v2/out`.
+File **`vercel.json` ở root monorepo** (cùng cấp với `frontend-v2/`) định nghĩa `installCommand` / `buildCommand` / `outputDirectory` và **`rewrites`** tới backend Linux. **`destination`** phải là host/port mà **Vercel edge gọi được** (thường public IP VPS + `8001` cho API, `8081` cho webhook hubbot). Đổi toàn bộ khi đổi máy hoặc bảo vệ bằng tunnel HTTPS riêng. Clone/fork công khai: **không** giữ IP/domain của môi trường khác — thay bằng placeholder (vd. `192.0.2.1` RFC 5737) rồi cấu hình lại trước deploy.
+
+File **`frontend-v2/vercel.json`** chỉ dùng khi project Vercel gốc là thư mục `frontend-v2/` (cùng quy tắc `rewrites`).
 
 Khi chạy qua domain Vercel:
 

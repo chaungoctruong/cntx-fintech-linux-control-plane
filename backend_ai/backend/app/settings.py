@@ -80,7 +80,7 @@ class Settings(BaseSettings):
     BACKEND_HOST: str = "127.0.0.1"
     BACKEND_PORT: int = 8001
     BACKEND_URL: str = ""
-    RUNNER_CONTROL_PLANE_URL: str = ""
+    RUNNER_CONTROL_PLANE_URL: str = ""  # Base URL runners use for short HTTP calls (bootstrap/register/heartbeat/events).
     APP_SECRET_KEY: str = "CHANGE_ME"
     APP_SECRET_OLD_KEYS: str = ""
     BACKEND_API_KEY: str = ""
@@ -130,7 +130,7 @@ class Settings(BaseSettings):
     ADMIN_TELEGRAM_IDS: str = ""
     MINIAPP_FULL_ACCESS_TELEGRAM_IDS: str = ""
     # Keep disabled until product is ready to expose the legal consent flow.
-    # When enabled, connect/start/token claim require the current terms version.
+    # When enabled, connect/start/token flows require the current terms version.
     MINIAPP_TERMS_ENFORCEMENT_ENABLED: bool = False
  
     GEMINI_API_KEY: str = ""
@@ -296,7 +296,7 @@ class Settings(BaseSettings):
     CONTROL_PLANE_STOP_RECONCILE_SEC: int = 30
     ACCOUNT_RUNTIME_START_GUARD_STALE_SEC: int = 180
     RUNNER_HEARTBEAT_WRITE_THROTTLE_SEC: float = 5.0
-    RUNNER_RECOMMENDED_TRANSPORT: str = "redis_queue"
+    RUNNER_RECOMMENDED_TRANSPORT: str = "redis_queue"  # Bootstrap hint only; command transport is Redis queue.
     RUNNER_SLOT_PROJECTION_EVENT_LOOKBACK_SEC: int = 21600
     RUNNER_CATALOG_SYNC_TTL_SEC: int = 600
     MINIAPP_DASHBOARD_CACHE_TTL_SEC: float = 5.0

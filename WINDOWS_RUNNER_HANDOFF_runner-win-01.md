@@ -1,8 +1,16 @@
-# Windows Runner Handoff: runner-win-01
+# Bàn giao Windows Runner: runner-win-01
 
-Do not send backend-only secrets to Windows. Send only this runner env plus the matching API/Redis secrets through a private channel.
+**Mục đích:** hướng dẫn cấu hình **một node runner Windows** (`runner-win-01`): file `.env` trên Windows, khóa API khớp backend, Redis (thường qua SSH tunnel), kiểm tra `curl` tới `/health`, `/ready` và đăng ký runner.
 
-## 1. Windows `.env`
+**An toàn:** không gửi secret chỉ có trên backend (Postgres, token Telegram, khóa AI, v.v.) sang Windows. Chỉ gửi **env runner** + khóa API/Redis **khớp** backend qua **kênh riêng** (không chat công khai).
+
+**Lệnh điều khiển bot:** chỉ qua **Redis** (`RUNNER_TRANSPORT=redis_queue`). **Không** có HTTP poll / long-poll để “lấy lệnh” từ control-plane; các `GET`/`POST` runner chỉ là callback ngắn (bootstrap, register, heartbeat, events, delivery, package).
+
+Tài liệu liên quan: [WINDOWS_RUNNER_INTEGRATION_PROMPT.md](backend_ai/backend/app/runner/WINDOWS_RUNNER_INTEGRATION_PROMPT.md), [docs/WINDOWS_RUNNER_HANDOFF_PROMPT.md](docs/WINDOWS_RUNNER_HANDOFF_PROMPT.md).
+
+---
+
+## 1. File `.env` trên Windows
 
 ```env
 APP_ENV=test
@@ -11,7 +19,7 @@ BACKEND_URL=http://<TEST_BACKEND_HOST>:8001
 RUNNER_CONTROL_PLANE_URL=http://<TEST_BACKEND_HOST>:8001
 BACKEND_RUNNER_API_PREFIX=/api/v2
 
-# Copy from backend_ai/backend/.env. Must match backend runtime exactly.
+# Sao chép từ backend_ai/backend/.env — phải khớp 100% với backend đang chạy.
 BACKEND_API_KEY=<copy_BACKEND_API_KEY_from_backend_env>
 
 RUNNER_ID=runner-win-01
@@ -22,17 +30,17 @@ RUNNER_TRANSPORT=redis_queue
 RUNNER_MAX_SLOTS=10
 MT5_RUNNER_SLOT_PREFIX=slot-
 
-# Windows Phase 1 catalog-only handoff. This directory must contain:
+# Handoff catalog Windows phase 1 — thư mục phải có package, ví dụ:
 # gsalgovip/bot_manifest.json
 BOT_TRADING_ROOT=C:\spider-runner\bot-trading
 
-# Redis credentials are stored on the Linux VPS at:
+# Thông tin Redis thường lưu trên VPS Linux tại (ví dụ):
 # /root/runner-win-01-redis.env
 #
-# Recommended secure mode: open an SSH tunnel from Windows first:
+# Khuyến nghị: mở SSH tunnel từ Windows trước:
 # ssh -p 24700 -N -L 6380:127.0.0.1:6380 root@<TEST_BACKEND_HOST>
 #
-# Then use the REDIS_URL from /root/runner-win-01-redis.env:
+# Sau đó dùng REDIS_URL lấy từ file trên Linux, dạng map sang local:
 # redis://:<REDIS_PASSWORD>@127.0.0.1:6380/0
 REDIS_URL=redis://:<REDIS_PASSWORD>@127.0.0.1:6380/0
 BOT_COMMAND_QUEUE_REDIS_URL=redis://:<REDIS_PASSWORD>@127.0.0.1:6380/0
@@ -43,18 +51,20 @@ MT5_EXECUTION_COMMAND_STREAM=mt5:execution:commands
 MT5_EXECUTION_EVENT_STREAM=mt5:execution:events
 ```
 
-Do not send these to Windows: `POSTGRES_*`, `TELEGRAM_BOT_TOKEN`, `SYSTEM_BOT_TOKEN`, `GEMINI_API_KEY`, `APP_SECRET_KEY`, `BROKER_API_CTRADER_*`, `AI_*`, `CTRADER_*`.
+**Không** gửi sang Windows các biến chỉ dùng backend: `POSTGRES_*`, `TELEGRAM_BOT_TOKEN`, `SYSTEM_BOT_TOKEN`, `GEMINI_API_KEY`, `APP_SECRET_KEY`, `BROKER_API_CTRADER_*`, `AI_*`, `CTRADER_*`, v.v.
 
-## 2. Backend Endpoints
+---
 
-Reachability:
+## 2. Endpoint backend (tham chiếu)
+
+**Kiểm tra tới được máy chủ:**
 
 ```text
 GET http://<TEST_BACKEND_HOST>:8001/health
 GET http://<TEST_BACKEND_HOST>:8001/ready
 ```
 
-Runner API:
+**API runner** (gọi kèm header `X-Backend-Api-Key`):
 
 ```text
 GET  /api/v2/runner/bootstrap?runner_id=runner-win-01
@@ -63,19 +73,20 @@ POST /api/v2/runner/heartbeat
 POST /api/v2/runner/events
 GET  /api/v2/runner/commands/{command_id}
 POST /api/v2/runner/commands/{command_id}/delivery
-POST /api/v2/runner/commands/claim
 GET  /api/v2/runner/accounts/{account_id}/bundle
 GET  /api/v2/runner/deployments/{deployment_id}/package
 POST /api/v2/runner/account-verifications/result
 ```
 
-Every runner API request must include:
+Mọi request runner phải có:
 
 ```text
 X-Backend-Api-Key: <BACKEND_API_KEY>
 ```
 
-## 3. PowerShell Smoke Tests
+---
+
+## 3. Smoke test PowerShell
 
 ```powershell
 $Backend = "http://<TEST_BACKEND_HOST>:8001"
@@ -86,15 +97,17 @@ curl.exe "$Backend/health"
 curl.exe "$Backend/ready"
 curl.exe -H "X-Backend-Api-Key: $ApiKey" "$Backend/api/v2/runner/bootstrap?runner_id=runner-win-01"
 
-# From the Windows runner repo/root after syncing bot-trading/gsalgovip:
-python -m runner.bot_catalog --root "$env:BOT_TRADING_ROOT" --expect-bot gsalgovip --expect-version 0.3.0
+# Từ repo runner Windows, sau khi đồng bộ bot-trading/gsalgovip (semver lấy đúng bot_manifest.json):
+python -m runner.bot_catalog --root "$env:BOT_TRADING_ROOT" --expect-bot gsalgovip --expect-version <semver-trong-manifest>
 ```
 
-If bootstrap returns `401 invalid_backend_api_key`, the key in Windows does not match the backend process currently running, or backend has not been restarted after changing `.env`.
+Nếu `bootstrap` trả `401 invalid_backend_api_key`: khóa trên Windows **không khớp** process backend đang chạy, hoặc backend **chưa restart** sau khi đổi `.env`.
 
-## 4. Register runner-win-01
+---
 
-Register `max_slots=10` and use slot IDs `slot-01` through `slot-10`. Keep the same slot ID format in heartbeat, claim, delivery, and events.
+## 4. Đăng ký runner-win-01
+
+Đăng ký `max_slots=10`, slot `slot-01` … `slot-10`. Giữ **cùng định dạng** `slot_id` trong heartbeat, dequeue Redis, delivery và events.
 
 ```powershell
 $Backend = "http://<TEST_BACKEND_HOST>:8001"
@@ -123,11 +136,11 @@ $Body = @{
   host = $env:COMPUTERNAME
   status = "online"
   supported_profiles = @("light", "normal", "heavy")
-  capability_tags = @("windows", "mt5", "http_poll", "redis_queue")
+  capability_tags = @("windows", "mt5", "redis_queue")
   capabilities = @{
     os = "windows"
     transport = "redis_queue"
-    supported_transports = @("http_poll", "redis_queue")
+    supported_transports = @("redis_queue")
     mt5_recovery = $true
     runtime_login_required = $true
     stop_policy = "end_task"
@@ -162,49 +175,42 @@ $Body = @{
 Invoke-RestMethod -Method Post -Uri "$Backend/api/v2/runner/register" -Headers $Headers -Body $Body
 ```
 
-## 5. Runtime Loop Contract
+*(Trường `version` / `checksum` trong `bot_catalog` phải khớp output lệnh `runner.bot_catalog` trên máy Windows — không copy cứng nếu manifest đã đổi.)*
 
-Recommended transport is `redis_queue`:
+---
+
+## 5. Hợp đồng vòng lặp runtime
+
+**Transport khuyến nghị:** `redis_queue` — hàng đợi lệnh:
 
 ```text
 mt5:runner:runner-win-01:commands
 ```
 
-Use processing queue:
+Hàng xử lý (processing):
 
 ```text
 mt5:runner:runner-win-01:commands:processing
 ```
 
-HTTP polling remains available only as fallback:
-
-```json
-{
-  "runner_id": "runner-win-01",
-  "slot_id": "slot-01",
-  "command_types": ["STOP_BOT", "START_BOT", "UPDATE_BOT_CONFIG"],
-  "wait_timeout_sec": 10
-}
-```
-
-Backend also writes stream:
+Backend còn ghi stream (audit / pipeline):
 
 ```text
 mt5:execution:commands
 ```
 
-Runner events should be sent to:
+**Gửi event** về backend:
 
 ```text
 POST /api/v2/runner/events
 ```
 
-Important event types: `BOT_STARTED`, `BOT_STOPPED`, `COMMAND_REJECTED`, `RUNTIME_LOG`, `SLOT_STATE_CHANGED`, `SLOT_DEGRADED`, `SLOT_BROKEN`.
+Một số `event_type` quan trọng: `BOT_STARTED`, `BOT_STOPPED`, `COMMAND_REJECTED`, `RUNTIME_LOG`, `SLOT_STATE_CHANGED`, `SLOT_DEGRADED`, `SLOT_BROKEN`.
 
-For command completion, call:
+**Báo cáo kết quả giao lệnh** (delivery):
 
 ```text
 POST /api/v2/runner/commands/{command_id}/delivery
 ```
 
-Allowed `delivery_status`: `queued`, `dispatched`, `acknowledged`, `failed`.
+Giá trị `delivery_status` được phép (tuple nghiệp vụ): `queued`, `dispatched`, `acknowledged`, `failed`.
