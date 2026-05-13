@@ -132,7 +132,16 @@ class Settings(BaseSettings):
     # Keep disabled until product is ready to expose the legal consent flow.
     # When enabled, connect/start/token flows require the current terms version.
     MINIAPP_TERMS_ENFORCEMENT_ENABLED: bool = False
- 
+
+    # End-user (khách của partner) self-service module — module độc lập trong
+    # app/partner_users/. Khách chỉ dùng JWT cấp bởi token-bot, không cần
+    # đăng ký user. Backend verify JWT signature + Redis state mirror.
+    PARTNER_USER_JWT_SECRET: str = ""
+    PARTNER_USER_REDIS_KEY_PREFIX: str = "tokenbot:jti:"
+    # Khoá để token-bot gọi internal endpoint force-stop khi token hết hạn /
+    # bị revoke. Không được lộ ra client. Header: X-Token-Bot-Key.
+    PARTNER_USER_INTERNAL_KEY: str = ""
+
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.5-flash-lite"
     AI_PROVIDER: str = Field(

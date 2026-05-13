@@ -1,0 +1,42 @@
+from pathlib import Path
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    app_name: str = "token-bot"
+    host: str = "0.0.0.0"
+    port: int = 8090
+
+    master_key_b64: str
+    jwt_secret: str
+    admin_api_key: str
+
+    source_bot_dir: Path = Path("../bot-trading")
+    encrypted_bot_dir: Path = Path("./var/encrypted")
+    database_url: str = "sqlite:///./var/token_bot.db"
+
+    token_default_ttl_sec: int = 86400
+    enable_debug_decrypt: bool = False
+
+    telegram_bot_token: str | None = None
+    tg_admin_user_ids: str = ""
+
+    redis_url: str | None = None
+    redis_state_grace_sec: int = 7 * 86400
+
+    # Để lock/revoke tự dừng bot trên Windows runner, token-bot gọi internal
+    # endpoint của backend chính qua HTTP. Để trống = chỉ mark state, không
+    # chủ động stop bot (Mini App khách / TradingView signal vẫn chạy).
+    backend_url: str | None = None
+    backend_internal_key: str | None = None
+
+    def admin_id_set(self) -> set[int]:
+        return {int(x.strip()) for x in self.tg_admin_user_ids.split(",") if x.strip()}

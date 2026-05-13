@@ -1093,6 +1093,10 @@ app.include_router(public_status_v2_router, prefix="/api/v2")
 app.include_router(streams_v2_router, prefix="/api/v2")
 app.include_router(admin_v2_router, prefix="/api/v2")
 app.include_router(tradingview_webhook_v2_router, prefix="/api/v2")
+from .partner_users.routes import router as partner_users_v2_router  # noqa: E402
+from .partner_users.ui import router as partner_users_ui_router  # noqa: E402
+app.include_router(partner_users_v2_router, prefix="/api/v2")
+app.include_router(partner_users_ui_router, prefix="/api/v2")
 
 # Giữ prefix /ai cho hubbot gọi /ai/chat
 app.include_router(ai_router, prefix="/ai", tags=["AI Integration"])
