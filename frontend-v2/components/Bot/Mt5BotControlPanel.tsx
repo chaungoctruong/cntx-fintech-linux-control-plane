@@ -585,7 +585,7 @@ export default function Mt5BotControlPanel({
                 {startingBot ? (
                   <>
                     <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.9} />
-                    Đang bật
+                    Đang bật bot...
                   </>
                 ) : (
                   <>
@@ -623,7 +623,12 @@ export default function Mt5BotControlPanel({
               // sees genuine progress (executor_preparing, executor_ready, etc.)
               // instead of a silent spinner. Falls back to actionHint when idle.
               const progressText = (startingBot || stoppingBot || isTransitionalDeploymentStatus(latestDeployment?.status))
-                ? humanizeDeploymentProgress(latestDeployment ?? selectedDeployment)
+                ? humanizeDeploymentProgress(latestDeployment ?? selectedDeployment) ??
+                  (startingBot
+                    ? "Đang bật bot. vui lòng đợi 15-25 giây..."
+                    : stoppingBot
+                      ? "Đang tắt bot, vui lòng đợi vài giây..."
+                      : null)
                 : null;
               if (progressText) {
                 return (

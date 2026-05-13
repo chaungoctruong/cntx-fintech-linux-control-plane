@@ -56,6 +56,10 @@ _NON_REROUTE_FRAGMENTS = (
     "bot_not_available",
     "unsupported_command",
     "terminal_trade_not_allowed_manual_intervention_required",
+    "fatal_trading_disabled_on_server",
+    "trading_disabled_on_server",
+    "trading has been disabled",
+    "disabled on server",
 )
 
 _CREDENTIAL_FAILURE_FRAGMENTS = (

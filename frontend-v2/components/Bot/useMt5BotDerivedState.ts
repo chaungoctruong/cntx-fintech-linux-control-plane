@@ -62,7 +62,7 @@ export function useMt5BotDerivedState({
     accounts.some(
       (account) => Boolean(account.active_deployment_id) || isActiveDeploymentStatus(account.active_deployment_status)
     ) || deployments.some((deployment) => isActiveDeploymentStatus(deployment.status));
-  const telegramUserHasOtherActiveBot = telegramUserHasActiveBot && !selectedAccountHasActiveBot;
+  const telegramUserHasOtherActiveBot = !mt5FullAccess && telegramUserHasActiveBot && !selectedAccountHasActiveBot;
   const selectedBot =
     bots.find((bot) => bot.bot_name === selectedBotName) ??
     bots.find((bot) => bot.bot_name === selectedDeployment?.bot_name) ??

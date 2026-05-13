@@ -82,4 +82,4 @@ class ControlPlaneTradingViewMixin:
             row = cur.fetchone()
             return dict(row) if row else {}
 
-        return self._store._with_retry_write(_do)
+        return self._store._with_retry_locked(_do)

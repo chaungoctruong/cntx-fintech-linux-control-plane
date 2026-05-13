@@ -13,6 +13,7 @@ SELECT
   ba.server         AS server,
   ba.login          AS login,
   ba.user_id        AS user_id,
+  ba.risk_policy_json AS account_risk_policy_json,
   d.id              AS deployment_id,
   d.bot_code        AS bot_code,
   d.runner_id       AS runner_id,

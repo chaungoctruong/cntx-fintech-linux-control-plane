@@ -1451,7 +1451,7 @@ export default function BotPage() {
       setMt5VerificationPhase("VERIFIED");
       setNotice({
         tone: "success",
-        message: `Đã lưu tài khoản. Bạn có thể bật bot ${selectedMt5Bot.display_name} ở panel điều khiển.`,
+        message: `Đã đăng nhập thành công. Bạn có thể bật bot ${selectedMt5Bot.display_name}`,
       });
       writeStoredMt5Broker(resolvedBroker);
       setMt5WorkspaceTab("control");

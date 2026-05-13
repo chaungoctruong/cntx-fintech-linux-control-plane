@@ -70,11 +70,11 @@ export function entitlementMatchesBot(
 
 export function formatTokenExpiry(value?: string | null): string {
   if (!value) {
-    return "không rõ hạn";
+    return "Chưa có thông tin hạn";
   }
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
-    return "không rõ hạn";
+    return "Chưa có thông tin hạn";
   }
   return date.toLocaleString("vi-VN", {
     day: "2-digit",
@@ -129,14 +129,16 @@ export function getDeploymentLotSize(config?: Record<string, unknown> | null): s
 
 export function humanizeAccountStatus(account: MT5AccountItem | null): string {
   if (!account) {
-    return "Chưa có account";
+    return "Chưa chọn tài khoản";
   }
   const status = String(account.status || "").trim().toLowerCase();
   if (status === "connected") return "Đã kết nối";
-  if (status === "pending_verification" && account.has_credentials) return "Đã lưu account";
-  if (status === "pending_verification") return "Thiếu thông tin";
-  if (status === "verification_failed") return "Đăng nhập lỗi";
-  return account.status || "Không rõ";
+  if (status === "pending_verification" && account.has_credentials) {
+    return "Đã lưu, đang chờ xác minh";
+  }
+  if (status === "pending_verification") return "Cần nhập thông tin đăng nhập";
+  if (status === "verification_failed") return "Không đăng nhập được";
+  return account.status || "Đang cập nhật";
 }
 
 export function humanizeDeploymentStatus(
@@ -149,19 +151,19 @@ export function humanizeDeploymentStatus(
   const status = String(deployment?.status || account?.active_deployment_status || "")
     .trim()
     .toLowerCase();
-  if (status === "running" || status === "start_requested" || status === "starting")
+  if (status === "running" || status === "start_requested" || status === "starting") {
     return "Đang bật";
+  }
   if (status === "stop_requested") return "Đang tắt";
   if (status === "stopped") return "Đã tắt";
-  if (status === "failed" || status === "blocked") return "Lỗi";
-  return status ? status : "Đã tắt";
+  if (status === "failed" || status === "blocked") return "Cần thử lại";
+  if (status === "queued") return "Đang chờ";
+  return status ? "Đang xử lý" : "Đã tắt";
 }
 
 /**
- * Map the real Windows-runner sub-state (status + health_status) into honest
- * Vietnamese text. These come from BOT_STARTED/SIGNAL_EXECUTOR_PREPARING/READY
- * /STOPPING events the runner emits — we do not invent stages. Return null when
- * the deployment is not in flight so callers can fall back to the generic label.
+ * Map backend (status + health_status) into short, user-facing Vietnamese.
+ * Stages align with real runner events; return null when no in-flight detail applies.
  */
 export function humanizeDeploymentProgress(
   deployment: MT5DeploymentItem | null
@@ -172,35 +174,35 @@ export function humanizeDeploymentProgress(
 
   if (status === "queued") {
     if (health.startsWith("waiting_previous_deployment_stop") || health === "waiting_previous_runtime_stop") {
-      return "Đang chờ bot trước đó dừng hẳn...";
+      return "Đang chờ bot hiện tại tắt xong...";
     }
-    return "Đang xếp hàng chờ slot rảnh...";
+    return "Đang xếp hàng, sẽ tới lượt bạn trong giây lát...";
   }
 
   if (status === "start_requested") {
-    if (health === "starting") return "Runner đã nhận lệnh bật, đang dựng MT5...";
-    return "Đang gửi lệnh xuống runner...";
+    if (health === "starting") return "Đang bật bot, vui lòng đợi thêm chút...";
+    return "Đang bắt đầu, vui lòng đợi thêm chút...";
   }
 
   if (status === "starting") {
-    if (health === "executor_preparing") return "Đang khởi MT5 và đăng nhập broker...";
-    if (health === "executor_ready") return "EA đã sẵn sàng, chờ MT5 nhận tín hiệu...";
-    if (health === "starting") return "Runner đã nhận lệnh bật, đang dựng MT5...";
-    return "Đang khởi bot...";
+    if (health === "executor_preparing") return "Đang mở terminal và kết nối sàn...";
+    if (health === "executor_ready") return "Bot đã sẵn sàng, đang chờ tín hiệu...";
+    if (health === "starting") return "Đang bật bot, vui lòng đợi thêm chút...";
+    return "Đang khởi động bot...";
   }
 
   if (status === "stop_requested") {
-    if (health === "executor_stopping") return "EA đang đóng vị thế và dừng listener...";
-    if (health === "config_update_restart_requested") return "Đang dừng để áp cấu hình mới...";
-    if (health === "replacement_stop_requested") return "Đang dừng phiên cũ để bật phiên mới...";
-    if (health === "stop_requested") return "Runner đã nhận lệnh tắt, đang đóng MT5...";
+    if (health === "executor_stopping") return "Đang đóng lệnh và tắt bot...";
+    if (health === "config_update_restart_requested") return "Đang tắt để cập nhật cài đặt...";
+    if (health === "replacement_stop_requested") return "Đang chuyển sang phiên mới...";
+    if (health === "stop_requested") return "Đang tắt bot, vui lòng đợi thêm chút...";
     return "Đang tắt bot...";
   }
 
   if (status === "running") {
     if (health === "running") return "Bot đang chạy";
-    if (health === "degraded") return "Bot đang chạy (slot đang xuống cấp)";
-    if (health === "executor_ready") return "Bot đã sẵn sàng nhận tín hiệu";
+    if (health === "degraded") return "Bot đang chạy — kết nối chưa ổn định";
+    if (health === "executor_ready") return "Sẵn sàng nhận tín hiệu";
     return "Bot đang chạy";
   }
 

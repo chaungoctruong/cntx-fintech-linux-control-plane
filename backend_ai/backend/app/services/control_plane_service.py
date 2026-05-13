@@ -19,6 +19,7 @@ from app.bot_catalog.mt5_repository_loader import (
     disabled_mt5_bot_identities,
     is_disabled_mt5_bot_catalog_entry,
 )
+from app.events.command_router import CommandRouterService
 from app.events.runner_event_ingest import RunnerEventIngestService
 from app.models.control_plane import ACTIVE_DEPLOYMENT_STATUSES, CommandType
 from app.monitoring.control_plane_metrics import ControlPlaneMetricsService
@@ -361,6 +362,20 @@ def _is_admin_telegram_id(telegram_id: Any) -> bool:
 
 def _norm_verification_error_code(value: Any) -> str:
     return _norm_text(value).upper().replace("-", "_").replace(" ", "_")
+
+
+def _is_trade_disabled_start_error(value: Any) -> bool:
+    text = _norm_text(value).lower().replace("-", "_")
+    readable = text.replace("_", " ")
+    return any(
+        marker in text or marker in readable
+        for marker in (
+            "fatal_trading_disabled_on_server",
+            "trading_disabled_on_server",
+            "trading has been disabled",
+            "disabled on server",
+        )
+    )
 
 
 def _canonical_slot_id(value: Any) -> str:
@@ -863,6 +878,7 @@ class MT5ControlPlaneService:
         self._store = store or get_process_store()
         self._repo = repo or ControlPlaneRepository(self._store)
         self._loader = loader or MT5BotCatalogLoader(repo=self._repo)
+        self._command_router = CommandRouterService(self._repo)
         self._deployment_manager = deployment_manager or DeploymentManagerService(self._repo, catalog_loader=self._loader)
         self._verification_manager = verification_manager or AccountVerificationManagerService(self._repo)
         self._event_ingest = event_ingest or RunnerEventIngestService(self._repo)
@@ -910,6 +926,64 @@ class MT5ControlPlaneService:
                 self._dashboard_cache.clear()
             else:
                 self._dashboard_cache.pop(int(user_id), None)
+
+    @staticmethod
+    def _positive_float(value: Any) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return parsed if parsed > 0 else 0.0
+
+    @classmethod
+    def _lot_size_from_config(cls, raw_config: Any) -> float:
+        cfg = cls._json_object(raw_config)
+        trading = cfg.get("trading")
+        if not isinstance(trading, dict):
+            return 0.0
+        return cls._positive_float(trading.get("lot_size"))
+
+    @classmethod
+    def _optional_positive_body_float(cls, body: dict[str, Any], *keys: str) -> float | None:
+        for key in keys:
+            if key not in body or body.get(key) in (None, ""):
+                continue
+            value = cls._positive_float(body.get(key))
+            if value <= 0:
+                raise ValueError(f"tradingview_{key}_invalid")
+            return value
+        return None
+
+    @staticmethod
+    def _tradingview_signal_id_for_bot(bot: dict[str, Any]) -> str:
+        hints = dict((bot or {}).get("resource_hints") or {})
+        owner = str((bot or {}).get("tradingview_webhook_owner") or hints.get("tradingview_webhook_owner") or "").strip().lower()
+        bot_type = str((bot or {}).get("bot_type") or hints.get("bot_type") or "").strip().lower()
+        if owner != "linux" or bot_type != "backend_webhook_signal":
+            return ""
+        bot_code = str((bot or {}).get("bot_code") or (bot or {}).get("bot_id") or "").strip().lower()
+        symbols = hints.get("default_symbols") if isinstance(hints.get("default_symbols"), list) else []
+        symbol = str(symbols[0] if symbols else "XAUUSD").strip().lower()
+        symbol = "".join(ch for ch in symbol if ch.isalnum())
+        bot_code = "".join(ch for ch in bot_code if ch.isalnum() or ch in {"_", "-"})
+        return f"{bot_code}-{symbol}" if bot_code and symbol else ""
+
+    def _ensure_tradingview_subscription_for_start(self, *, account_id: int, bot: dict[str, Any]) -> None:
+        signal_id = self._tradingview_signal_id_for_bot(bot)
+        if not signal_id:
+            return
+        self._repo.upsert_signal_subscription(
+            account_id=int(account_id),
+            signal_id=signal_id,
+            bot_code=str(bot.get("bot_code") or bot.get("bot_id") or ""),
+            volume_override=None,
+            priority=60,
+            enabled=True,
+            metadata={
+                "source": "deployment_start",
+                "volume_source": "bot_deployments.config_json.trading.lot_size",
+            },
+        )
 
     def _stored_runner_bot_catalog(self, *, runner_id: str) -> dict[str, Any]:
         if not hasattr(self._repo, "get_runner"):
@@ -1625,6 +1699,7 @@ class MT5ControlPlaneService:
                 active_deployment_count=active_count,
             )
         self._raise_if_bot_control_cooldown_active(user_id=int(user["id"]), telegram_id=telegram_id)
+        self._ensure_tradingview_subscription_for_start(account_id=int(account_id), bot=bot)
         result = await self._deployment_manager.start_deployment(
             user_id=int(user["id"]),
             account=account,
@@ -1965,6 +2040,18 @@ class MT5ControlPlaneService:
                         merged[src.lower()] = dst
         return merged
 
+    @staticmethod
+    def _broker_default_symbol_config(*, broker: Any, server: Any) -> dict[str, Any]:
+        broker_s = str(broker or "").strip().lower()
+        server_s = str(server or "").strip().lower()
+        text = f"{broker_s} {server_s}"
+        symbol_map: dict[str, str] = {}
+        if "exness" in text:
+            symbol_map["XAUUSD"] = "XAUUSDm"
+        elif "dbg" in text:
+            symbol_map["XAUUSD"] = "XAUUSD.G"
+        return {"symbols": {"symbol_map": symbol_map}} if symbol_map else {}
+
     @classmethod
     def _map_tradingview_symbol(cls, symbol: str, *sources: Any) -> str:
         symbol_s = str(symbol or "").strip()
@@ -2105,22 +2192,23 @@ class MT5ControlPlaneService:
 
             trading = self._deployment_trading_config(dep)
             symbol = self._map_tradingview_symbol(symbol, dep.get("config_json"))
-            vol_raw = body.get("volume") if body.get("volume") is not None else body.get("lot")
-            if vol_raw is not None and str(vol_raw).strip():
-                try:
-                    volume = float(vol_raw)
-                except (TypeError, ValueError):
-                    raise ValueError("tradingview_volume_invalid")
-            else:
-                try:
-                    volume = float(trading.get("lot_size") or 0.0)
-                except (TypeError, ValueError):
-                    volume = 0.0
+            volume = self._positive_float(trading.get("lot_size"))
+            if volume <= 0:
+                vol_raw = body.get("volume") if body.get("volume") is not None else body.get("lot")
+                if vol_raw is not None and str(vol_raw).strip():
+                    try:
+                        volume = float(vol_raw)
+                    except (TypeError, ValueError):
+                        raise ValueError("tradingview_volume_invalid")
             if volume <= 0:
                 raise ValueError("tradingview_volume_required")
 
-            sl = trading.get("stop_loss")
-            tp = trading.get("take_profit")
+            sl = self._optional_positive_body_float(body, "sl", "stop_loss")
+            tp = self._optional_positive_body_float(body, "tp", "take_profit")
+            if sl is None:
+                raise ValueError("tradingview_sl_required")
+            if tp is None:
+                raise ValueError("tradingview_tp_required")
             magic = self._stable_order_magic(
                 account_id=account_id_i,
                 deployment_id=deployment_id_i,
@@ -2163,6 +2251,9 @@ class MT5ControlPlaneService:
             if symbol != source_symbol:
                 payload["source_symbol"] = source_symbol
                 payload["mapped_symbol"] = symbol
+            for key in ("signal_role", "dca_price", "tv_symbol", "timeframe"):
+                if body.get(key) not in (None, ""):
+                    payload[key] = body.get(key)
             result = await self._deployment_manager.dispatch_runtime_command(
                 deployment=dep,
                 command_type=CommandType.PLACE_ORDER,
@@ -2274,7 +2365,8 @@ class MT5ControlPlaneService:
 
         Optional:
           - bot_code (str): optional bot guard for multi-bot signal routing.
-          - default_volume (float): fallback if subscriber has no volume_override.
+          - default_volume (float): legacy fallback only if deployment lot is missing.
+          - sl/tp or stop_loss/take_profit: required for PLACE_ORDER.
           - max_subscribers (int, default 5000): safety cap.
           - secret: shared secret if TRADINGVIEW_WEBHOOK_SECRET is set.
 
@@ -2329,6 +2421,13 @@ class MT5ControlPlaneService:
                 default_volume = float(default_volume_raw)
             except (TypeError, ValueError):
                 raise ValueError("tradingview_volume_invalid")
+        body_sl = self._optional_positive_body_float(body, "sl", "stop_loss")
+        body_tp = self._optional_positive_body_float(body, "tp", "take_profit")
+        if kind == "PLACE_ORDER":
+            if body_sl is None:
+                raise ValueError("tradingview_sl_required")
+            if body_tp is None:
+                raise ValueError("tradingview_tp_required")
 
         max_subs = body.get("max_subscribers")
         try:
@@ -2367,23 +2466,13 @@ class MT5ControlPlaneService:
             slot_id = str(sub["slot_id"])
             bot_code = str(sub.get("bot_code") or "")
 
-            # Per-subscriber volume: override -> default -> deployment trading.lot_size
-            if sub.get("volume_override") is not None:
+            # Product rule: Mini App deployment lot is authoritative. Legacy
+            # per-subscriber/default volumes are fallback only for old rows.
+            vol = self._lot_size_from_config(sub.get("deployment_config_json"))
+            if vol <= 0 and sub.get("volume_override") is not None:
                 vol = float(sub["volume_override"])
-            elif default_volume is not None:
+            elif vol <= 0 and default_volume is not None:
                 vol = default_volume
-            else:
-                trading_cfg_raw = sub.get("deployment_config_json") or {}
-                if isinstance(trading_cfg_raw, str):
-                    try:
-                        trading_cfg_raw = json.loads(trading_cfg_raw)
-                    except Exception:
-                        trading_cfg_raw = {}
-                trading = (trading_cfg_raw or {}).get("trading") or {}
-                try:
-                    vol = float(trading.get("lot_size") or 0.0)
-                except (TypeError, ValueError):
-                    vol = 0.0
 
             if kind == "PLACE_ORDER" and vol <= 0:
                 # Per-subscriber skip; record failure rather than abort whole broadcast.
@@ -2398,6 +2487,11 @@ class MT5ControlPlaneService:
             trace_id = f"tv_bcast:{alert_id}:{account_id}:{kind.lower()}"
             order_symbol = self._map_tradingview_symbol(
                 symbol,
+                self._broker_default_symbol_config(
+                    broker=sub.get("broker"),
+                    server=sub.get("server"),
+                ),
+                sub.get("account_risk_policy_json"),
                 sub.get("subscription_metadata"),
                 sub.get("deployment_config_json"),
             )
@@ -2407,6 +2501,8 @@ class MT5ControlPlaneService:
                     "symbol": order_symbol,
                     "side": side,
                     "volume": vol,
+                    "sl": body_sl,
+                    "tp": body_tp,
                     "magic": magic,
                 }
                 cmd_type = CommandType.PLACE_ORDER
@@ -2415,9 +2511,21 @@ class MT5ControlPlaneService:
                     "close_kind": meta.get("close_kind") or "CLOSE",
                     "magic": magic,
                 }
-                if symbol:
-                    request["symbol"] = symbol
+                if order_symbol:
+                    request["symbol"] = order_symbol
                 cmd_type = CommandType.CLOSE_ORDER
+
+            payload = {
+                "request": request,
+                "broadcast_signal_id": signal_id,
+                "broadcast_alert_id": alert_id,
+                "broadcast_bot_code": requested_bot_code,
+                "broadcast_source_symbol": symbol,
+                "broadcast_mapped_symbol": order_symbol,
+            }
+            for key in ("signal_role", "dca_price", "tv_symbol", "timeframe"):
+                if body.get(key) not in (None, ""):
+                    payload[key] = body.get(key)
 
             items.append({
                 "command_type": cmd_type,
@@ -2428,14 +2536,7 @@ class MT5ControlPlaneService:
                 "slot_id": slot_id,
                 "priority": int(sub.get("subscription_priority") or 60),
                 "trace_id": trace_id,
-                "payload": {
-                    "request": request,
-                    "broadcast_signal_id": signal_id,
-                    "broadcast_alert_id": alert_id,
-                    "broadcast_bot_code": requested_bot_code,
-                    "broadcast_source_symbol": symbol,
-                    "broadcast_mapped_symbol": order_symbol,
-                },
+                "payload": payload,
                 "_subscription_id": sub.get("subscription_id"),
             })
 
@@ -3174,8 +3275,31 @@ class MT5ControlPlaneService:
         user = self.ensure_user(telegram_id=telegram_id, username=username)
         user_id = int(user["id"])
         base = self._metrics.user_dashboard(user_id=user_id)
-        base["accounts"] = self._repo.list_accounts_for_user(user_id=user_id)
-        base["deployments"] = self._repo.list_deployments(user_id=user_id)
+        accounts = self._repo.list_accounts_for_user(user_id=user_id)
+        deployments = self._repo.list_deployments(user_id=user_id)
+        latest_deployment_by_account: dict[int, dict[str, Any]] = {}
+        for deployment in deployments:
+            try:
+                account_id = int(deployment.get("account_id") or 0)
+            except Exception:
+                account_id = 0
+            if account_id > 0 and account_id not in latest_deployment_by_account:
+                latest_deployment_by_account[account_id] = deployment
+        for account in accounts:
+            try:
+                account_id = int(account.get("id") or 0)
+            except Exception:
+                account_id = 0
+            status = _norm_text(account.get("status")).lower()
+            verification_state = _norm_text(account.get("verification_state")).upper()
+            account["login_valid"] = bool(status == "connected" or verification_state == "VERIFIED")
+            latest_deployment = latest_deployment_by_account.get(account_id)
+            trade_disabled = _is_trade_disabled_start_error((latest_deployment or {}).get("last_error"))
+            latest_deployment_status = _norm_text((latest_deployment or {}).get("status")).lower()
+            account["trade_ready"] = False if trade_disabled else (True if latest_deployment_status == "running" else None)
+            account["trade_block_reason"] = "trading_disabled_on_server" if trade_disabled else None
+        base["accounts"] = accounts
+        base["deployments"] = deployments
         base["cache"] = {"hit": False, "ttl_sec": 0, "fresh": True}
         return base
 

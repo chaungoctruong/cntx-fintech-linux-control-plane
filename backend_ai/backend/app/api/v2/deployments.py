@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
@@ -19,6 +20,7 @@ from app.services.miniapp_access import has_miniapp_full_access
 from app.services.store_service import get_store
 
 router = APIRouter(prefix="/deployments", tags=["mt5-deployments"])
+log = logging.getLogger(__name__)
 
 
 def bot_token_license_dep(request: Request) -> BotTokenLicenseService:
@@ -91,7 +93,19 @@ async def start_deployment(
             mode=payload.mode,
         )
     except Exception as exc:
-        raise translate_control_plane_error(exc) from exc
+        http_exc = translate_control_plane_error(exc)
+        log.warning(
+            "deployment_start_rejected telegram_id=%s account_id=%s bot_name=%s lot_size=%s mode=%s status=%s detail=%s exc_type=%s",
+            user.get("telegram_id"),
+            payload.account_id,
+            payload.bot_name,
+            payload.lot_size,
+            payload.mode,
+            http_exc.status_code,
+            http_exc.detail,
+            type(exc).__name__,
+        )
+        raise http_exc from exc
     deployment = result.get("deployment") or {}
     deployment_id = deployment.get("id")
     if deployment_id is not None and not full_access:
