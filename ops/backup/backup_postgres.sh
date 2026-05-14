@@ -13,7 +13,7 @@ BACKUP_DIR="ops/artifacts/backups/postgres"
 mkdir -p "$BACKUP_DIR"
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-OUT="$BACKUP_DIR/${POSTGRES_DB:-spider_ai_saas}_${STAMP}.sql.gz"
+OUT="$BACKUP_DIR/${POSTGRES_DB:-cntxlabserver}_${STAMP}.sql.gz"
 
 docker compose exec -T \
   -e PGPASSWORD="${POSTGRES_PASSWORD:?POSTGRES_PASSWORD missing}" \

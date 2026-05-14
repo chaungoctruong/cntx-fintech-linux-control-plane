@@ -275,11 +275,11 @@ class Settings(BaseSettings):
     RUNTIME_RESTART_GRACE_SEC: int = 300
 
     DB_MODE: str = "postgres"
-    POSTGRES_USER: str = "spider_ai_app_test"
+    POSTGRES_USER: str = "cntxlabserver_app"
     POSTGRES_PASSWORD: str = ""
     POSTGRES_HOST: str = "127.0.0.1"
     POSTGRES_PORT: int = 5432
-    POSTGRES_DB: str = "spider_ai_saas"
+    POSTGRES_DB: str = "cntxlabserver"
     POSTGRES_POOL_MIN: int = 5
     POSTGRES_POOL_MAX: int = 50
     REDIS_URL: str = ""

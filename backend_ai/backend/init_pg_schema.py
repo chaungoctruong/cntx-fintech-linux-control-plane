@@ -390,34 +390,6 @@ def init_postgres_schema():
             CREATE INDEX IF NOT EXISTS idx_user_webhooks_user_id ON user_webhooks(user_id);
         """)
 
-        tracker.step("tradingview_signal_subscriptions")
-        # Subscription map: which broker_account follows which TradingView
-        # signal. Backend uses this for fan-out dispatch on /public/tradingview/
-        # broadcast — 1 signal → SELECT subscribers → batch publish.
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS tradingview_signal_subscriptions (
-                id BIGSERIAL PRIMARY KEY,
-                account_id BIGINT NOT NULL REFERENCES broker_accounts(id) ON DELETE CASCADE,
-                signal_id TEXT NOT NULL,
-                bot_code TEXT NULL,
-                volume_override DOUBLE PRECISION NULL,
-                priority INTEGER NOT NULL DEFAULT 50,
-                enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (account_id, signal_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_tv_sig_subs_signal_enabled
-                ON tradingview_signal_subscriptions(signal_id) WHERE enabled = TRUE;
-            CREATE INDEX IF NOT EXISTS idx_tv_sig_subs_account
-                ON tradingview_signal_subscriptions(account_id);
-            ALTER TABLE tradingview_signal_subscriptions
-                ADD COLUMN IF NOT EXISTS bot_code TEXT NULL;
-            CREATE INDEX IF NOT EXISTS idx_tv_sig_subs_bot_code
-                ON tradingview_signal_subscriptions(bot_code) WHERE bot_code IS NOT NULL;
-        """)
-
         tracker.step("audit_logs_extensions")
         cur.execute("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS user_id BIGINT NULL;")
         cur.execute("ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS account_id BIGINT NULL;")
@@ -746,6 +718,34 @@ def init_postgres_schema():
         cur.execute("ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS risk_policy_json JSONB NOT NULL DEFAULT '{}'::jsonb;")
         cur.execute("ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0;")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_broker_accounts_sort_order ON broker_accounts(user_id, sort_order, id);")
+
+        tracker.step("tradingview_signal_subscriptions")
+        # Subscription map: which broker_account follows which TradingView
+        # signal. Backend uses this for fan-out dispatch on /public/tradingview/
+        # broadcast: 1 signal -> SELECT subscribers -> batch publish.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS tradingview_signal_subscriptions (
+                id BIGSERIAL PRIMARY KEY,
+                account_id BIGINT NOT NULL REFERENCES broker_accounts(id) ON DELETE CASCADE,
+                signal_id TEXT NOT NULL,
+                bot_code TEXT NULL,
+                volume_override DOUBLE PRECISION NULL,
+                priority INTEGER NOT NULL DEFAULT 50,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                metadata_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (account_id, signal_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tv_sig_subs_signal_enabled
+                ON tradingview_signal_subscriptions(signal_id) WHERE enabled = TRUE;
+            CREATE INDEX IF NOT EXISTS idx_tv_sig_subs_account
+                ON tradingview_signal_subscriptions(account_id);
+            ALTER TABLE tradingview_signal_subscriptions
+                ADD COLUMN IF NOT EXISTS bot_code TEXT NULL;
+            CREATE INDEX IF NOT EXISTS idx_tv_sig_subs_bot_code
+                ON tradingview_signal_subscriptions(bot_code) WHERE bot_code IS NOT NULL;
+        """)
 
         tracker.step("account_credentials_encrypted")
         cur.execute("""

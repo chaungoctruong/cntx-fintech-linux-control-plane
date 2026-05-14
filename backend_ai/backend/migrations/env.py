@@ -27,7 +27,7 @@ def _database_url() -> str:
     password = str(settings.POSTGRES_PASSWORD or "")
     host = str(settings.POSTGRES_HOST or "127.0.0.1")
     port = int(settings.POSTGRES_PORT or 5432)
-    database = str(settings.POSTGRES_DB or "spider_ai_saas")
+    database = str(settings.POSTGRES_DB or "cntxlabserver")
     if host.startswith("/"):
         return URL.create(
             drivername="postgresql+psycopg2",
