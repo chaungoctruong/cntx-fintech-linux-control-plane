@@ -12,7 +12,7 @@ Exness co thong so phu thuoc server, loai tai khoan va symbol suffix.
 
 - Swap, spread, commission va leverage co the khac giua Standard, Raw/Zero/Pro va tung server.
 - Khi loi login, kiem tra dung server Exness-MT5 that va khong nham login MT5 voi email/Personal Area.
-- Neu vua doi password trading, can verify lai account.
+- Neu vua doi password trading, can dang nhap kiem tra lai account.
 
 ## IC Markets
 
@@ -29,7 +29,7 @@ XM co nhieu nhom tai khoan va symbol co the khac ten/suffix theo server.
 
 - Hoi dung server MT5, login va loai tai khoan.
 - Neu loi invalid volume hoac invalid stops, kiem tra lot step, min lot, stop level va freeze level trong Contract Specification.
-- Bot chi nen chay sau khi account da connected/verified.
+- Bot chi nen chay sau khi account da connected/login-ready.
 - Neu live khac demo, uu tien kiem tra spread/slippage/server truoc.
 
 ## Vantage

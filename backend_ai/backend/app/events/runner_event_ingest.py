@@ -46,6 +46,7 @@ _HEARTBEAT_STATE_KEYS = {
     "error_code",
     "health_status",
     "last_error",
+    "login_slot_status",
     "mt5_liveness_reason",
     "mt5_liveness_state",
     "reason",
@@ -53,7 +54,6 @@ _HEARTBEAT_STATE_KEYS = {
     "slot_inventory",
     "slot_state",
     "status",
-    "verification_status",
 }
 
 _HEARTBEAT_VOLATILE_KEYS = {
@@ -195,6 +195,19 @@ def _payload_command_id(payload: dict[str, Any]) -> str | None:
     return value or None
 
 
+def _payload_truthy(value: Any) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "ok", "ready", "healthy", "verified"}
+
+
+def _payload_login_slot_command_type(payload: dict[str, Any]) -> str:
+    return str(
+        payload.get("requested_cmd_type")
+        or payload.get("command_type")
+        or payload.get("cmd_type")
+        or ""
+    ).strip().upper()
+
+
 def _start_bootstrap_failure_reason(payload: dict[str, Any]) -> str | None:
     candidates = (
         payload.get("exact_exception"),
@@ -259,20 +272,20 @@ class RunnerEventIngestService:
         trace_id: str | None,
         event_type: str,
         payload: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
         if deployment_id is None:
-            return
+            return False
 
         deployment = self._repo.get_deployment(deployment_id=deployment_id)
         if _deployment_wants_stopped(deployment):
-            return
+            return False
 
         command = self._repo.get_execution_command(command_id=command_id or "") if command_id else None
         command_type = str((command or {}).get("command_type") or "").strip().upper()
         deployment_status = str((deployment or {}).get("status") or "").strip().lower()
         start_context = command_type == "START_BOT" or deployment_status in {"start_requested", "starting"}
         if not start_context:
-            return
+            return False
 
         if command_id and command_type in {"", "START_BOT"}:
             self._repo.update_execution_command_delivery(
@@ -336,6 +349,7 @@ class RunnerEventIngestService:
             alert_key=f"runner_start_bootstrap_failed:{deployment_id}:{runner_id}:{slot_id}",
             cooldown_sec=180,
         )
+        return True
 
     def _heartbeat_cache_key(
         self,
@@ -1260,6 +1274,100 @@ class RunnerEventIngestService:
             trace_id=event_model.trace_id,
         )
 
+        if (
+            event_type_value == EventType.RUNTIME_LOG.value
+            and _payload_login_slot_command_type(payload_map) == CommandType.RESERVE_OR_LOGIN_SLOT.value
+            and event_command_id
+        ):
+            runtime_status = str(payload_map.get("status") or "").strip().lower()
+            prepared = _payload_truthy(payload_map.get("prepared"))
+            if prepared or runtime_status in {"healthy", "verified", "ready"}:
+                result = self._repo.complete_login_reservation(
+                    command_id=event_command_id,
+                    ok=True,
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id or _canonical_slot_id(payload_map.get("slot_id")),
+                    error_text=None,
+                    payload={**payload_map, "compat_event_type": "RUNTIME_LOG_PREPARED"},
+                    ttl_sec=int(payload_map.get("login_slot_ttl_sec") or 300),
+                )
+                self._repo.update_execution_command_delivery(
+                    command_id=event_command_id,
+                    status="acknowledged",
+                    error_text=None,
+                    payload={
+                        "last_event_type": "RUNTIME_LOG_PREPARED",
+                        "runner_id": event_model.runner_id,
+                        "slot_id": event_model.slot_id,
+                    },
+                )
+                return {"event": event, "login_reservation": result, "ok": True, "compat": "runtime_log_prepared"}
+            if runtime_status in {"failed", "error", "broken"}:
+                result = self._repo.complete_login_reservation(
+                    command_id=event_command_id,
+                    ok=False,
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id or _canonical_slot_id(payload_map.get("slot_id")),
+                    error_text=_event_reason(payload_map) or "runtime_log_login_slot_failed",
+                    payload={**payload_map, "compat_event_type": "RUNTIME_LOG_FAILED"},
+                )
+                self._repo.update_execution_command_delivery(
+                    command_id=event_command_id,
+                    status="failed",
+                    error_text=_event_reason(payload_map) or "runtime_log_login_slot_failed",
+                    payload={
+                        "last_event_type": "RUNTIME_LOG_FAILED",
+                        "runner_id": event_model.runner_id,
+                        "slot_id": event_model.slot_id,
+                    },
+                )
+                return {"event": event, "login_reservation": result, "ok": False, "compat": "runtime_log_failed"}
+
+        if event_type_value in {
+            EventType.LOGIN_SLOT_VERIFIED.value,
+            EventType.LOGIN_SLOT_FAILED.value,
+            EventType.LOGIN_SLOT_RELEASED.value,
+        }:
+            reservation_id_raw = payload_map.get("login_reservation_id") or payload_map.get("reservation_id")
+            try:
+                reservation_id = int(reservation_id_raw) if reservation_id_raw not in (None, "") else None
+            except (TypeError, ValueError):
+                reservation_id = None
+            if event_type_value == EventType.LOGIN_SLOT_RELEASED.value:
+                if event_model.account_id is not None:
+                    self._repo.release_login_reservation(
+                        account_id=int(event_model.account_id),
+                        reason=_event_reason(payload_map) or "runner_login_slot_released",
+                    )
+                if event_command_id:
+                    self._repo.update_execution_command_delivery(
+                        command_id=event_command_id,
+                        status="acknowledged",
+                        error_text=None,
+                        payload={"last_event_type": event_type_value, "runner_id": event_model.runner_id, "slot_id": event_model.slot_id},
+                    )
+                return {"event": event, "login_slot_released": True}
+
+            ok = event_type_value == EventType.LOGIN_SLOT_VERIFIED.value
+            result = self._repo.complete_login_reservation(
+                reservation_id=reservation_id,
+                command_id=event_command_id,
+                ok=ok,
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+                error_text=str(payload_map.get("reason") or payload_map.get("error") or payload_map.get("message") or ""),
+                payload=payload_map,
+                ttl_sec=int(payload_map.get("login_slot_ttl_sec") or 300),
+            )
+            if event_command_id:
+                self._repo.update_execution_command_delivery(
+                    command_id=event_command_id,
+                    status="acknowledged" if ok else "failed",
+                    error_text=None if ok else str(payload_map.get("reason") or payload_map.get("error") or "login_slot_failed"),
+                    payload={"last_event_type": event_type_value, "runner_id": event_model.runner_id, "slot_id": event_model.slot_id},
+                )
+            return {"event": event, "login_reservation": result, "ok": ok}
+
         if event_command_id and event_type_value in {
             EventType.BOT_STARTED.value,
             EventType.BOT_STOPPED.value,
@@ -1283,6 +1391,19 @@ class RunnerEventIngestService:
                 error_text=str(payload_map.get("reason") or payload_map.get("message") or event_type_value.lower()),
                 payload={"last_event_type": event_type_value, "runner_id": event_model.runner_id, "slot_id": event_model.slot_id},
             )
+            if event_type_value == EventType.ORDER_REJECTED.value and event_model.deployment_id is not None:
+                command = self._repo.get_execution_command(command_id=event_command_id or "")
+                command_type = str((command or {}).get("command_type") or "").strip().upper()
+                if command_type in {"PLACE_ORDER", "MODIFY_ORDER", "CLOSE_ORDER", "SYNC_STATE"}:
+                    self._repo.update_deployment_status(
+                        deployment_id=event_model.deployment_id,
+                        status=DeploymentStatus.RUNNING.value,
+                        desired_state="running",
+                        is_active=True,
+                        health_status="running",
+                        runner_id=event_model.runner_id,
+                        slot_id=event_model.slot_id,
+                    )
 
         if event_type_value in {EventType.BOT_STARTED.value, EventType.BOT_LISTENING.value} and event_model.deployment_id is not None:
             deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
@@ -1367,7 +1488,14 @@ class RunnerEventIngestService:
             command = self._repo.get_execution_command(command_id=event_command_id or "")
             deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
             cleanup_done = str((deployment or {}).get("health_status") or "").strip().lower() == "terminal_cleanup_done"
-            if _command_requests_terminal_kill(command) and not cleanup_done:
+            stop_is_idempotent = _payload_truthy(payload_map.get("idempotent"))
+            stop_reason = str(payload_map.get("reason") or payload_map.get("error") or "").strip().lower()
+            terminal_already_stopped = (
+                _payload_confirms_terminal_stopped(payload_map)
+                or stop_is_idempotent
+                or stop_reason in {"account_not_active", "deployment_not_active", "slot_not_active"}
+            )
+            if _command_requests_terminal_kill(command) and not cleanup_done and not terminal_already_stopped:
                 self._repo.update_deployment_status(
                     deployment_id=event_model.deployment_id,
                     status=DeploymentStatus.STOP_REQUESTED.value,
@@ -1450,6 +1578,15 @@ class RunnerEventIngestService:
                 )
         elif event_type_value == EventType.COMMAND_REJECTED.value:
             command = self._repo.get_execution_command(command_id=event_command_id or "")
+            if command and str(command.get("command_type") or "").strip().upper() == CommandType.RESERVE_OR_LOGIN_SLOT.value:
+                self._repo.complete_login_reservation(
+                    command_id=event_command_id,
+                    ok=False,
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                    error_text=_event_reason(payload_map) or "login_slot_command_rejected",
+                    payload=payload_map,
+                )
             if command and event_model.deployment_id is not None:
                 command_type = str(command.get("command_type") or "").strip().upper()
                 command_payload = command.get("payload_json") if isinstance(command, dict) else {}
@@ -1649,7 +1786,8 @@ class RunnerEventIngestService:
                         desired_state="running",
                         is_active=True,
                         health_status="running",
-                        last_error=str(payload_map.get("reason") or "command_rejected"),
+                        runner_id=event_model.runner_id,
+                        slot_id=event_model.slot_id,
                     )
         elif event_type_value == EventType.RUNTIME_LOG.value:
             runtime_message = str(payload_map.get("message") or payload_map.get("log_message") or "runtime_log")
@@ -1692,17 +1830,44 @@ class RunnerEventIngestService:
                 )
             bootstrap_failure_reason = _start_bootstrap_failure_reason(payload_map)
             if bootstrap_failure_reason:
-                self._fail_start_deployment_after_bootstrap_failure(
+                failed_start = self._fail_start_deployment_after_bootstrap_failure(
                     deployment_id=event_model.deployment_id,
                     account_id=event_model.account_id,
                     command_id=event_command_id,
                     runner_id=event_model.runner_id,
                     slot_id=event_model.slot_id,
                     reason=bootstrap_failure_reason,
-                trace_id=event_model.trace_id,
-                event_type=event_type_value,
-                payload=payload_map,
-            )
+                    trace_id=event_model.trace_id,
+                    event_type=event_type_value,
+                    payload=payload_map,
+                )
+                if failed_start and event_command_id:
+                    command = self._repo.get_execution_command(command_id=event_command_id)
+                    if command:
+                        try:
+                            await self._auto_reroute_start_after_slot_failure(
+                                deployment_id=event_model.deployment_id,
+                                command=command,
+                                runner_id=event_model.runner_id,
+                                slot_id=event_model.slot_id,
+                                payload=payload_map,
+                                trace_id=event_model.trace_id,
+                            )
+                        except Exception as exc:
+                            schedule_error_alert(
+                                area="Tự chuyển slot",
+                                summary="Backend chưa tự chuyển được bot sau lỗi bootstrap.",
+                                severity="warning",
+                                account_id=event_model.account_id,
+                                deployment_id=event_model.deployment_id,
+                                runner_id=event_model.runner_id,
+                                slot_id=event_model.slot_id,
+                                impact="User có thể phải bật lại bot.",
+                                action="Kiểm tra slot còn trống và lỗi START gần nhất.",
+                                detail={"reason": bootstrap_failure_reason, "error": str(exc)[:200]},
+                                alert_key=f"start_bootstrap_auto_reroute_failed:{event_model.deployment_id}:{exc.__class__.__name__}",
+                                cooldown_sec=180,
+                            )
         if event_model.account_id is not None and payload_map:
             if any(key in payload_map for key in ("pnl", "balance", "equity", "free_margin", "connection_status")):
                 self._repo.upsert_account_state_snapshot(

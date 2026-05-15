@@ -369,9 +369,9 @@ def _public_account(row: dict[str, Any]) -> dict[str, Any]:
         "status": _clean_text(row.get("status")),
         "is_active": bool(row.get("is_active")),
         "last_error": _redact_sensitive_text(_clean_text(row.get("last_error")))[:200],
-        "verification_job_id": _safe_int(row.get("verification_job_id")),
-        "verification_status": _clean_text(row.get("verification_job_status")),
-        "verification_state": _clean_text(row.get("verification_state")),
+        "login_reservation_id": _safe_int(row.get("login_reservation_id")),
+        "login_reservation_status": _clean_text(row.get("login_reservation_status")),
+        "login_state": _clean_text(row.get("login_state")),
         "active_deployment_id": _safe_int(row.get("active_deployment_id")),
         "active_deployment_status": _clean_text(row.get("active_deployment_status")),
         "runner_id": _clean_text(row.get("runner_id")),
@@ -409,9 +409,9 @@ def _public_account_state(row: dict[str, Any]) -> dict[str, Any]:
         "runner_id": _clean_text(row.get("runner_id")),
         "slot_id": _clean_text(row.get("slot_id")),
         "binding_state": _clean_text(row.get("binding_state")),
-        "verification_job_id": _safe_int(row.get("verification_job_id")),
-        "verification_status": _clean_text(row.get("verification_job_status")),
-        "verification_state": _clean_text(row.get("verification_state")),
+        "login_reservation_id": _safe_int(row.get("login_reservation_id")),
+        "login_reservation_status": _clean_text(row.get("login_reservation_status")),
+        "login_state": _clean_text(row.get("login_state")),
         "deployment_id": _safe_int(row.get("deployment_id")),
         "bot_code": _clean_text(row.get("bot_code")),
         "bot_name": _clean_text(row.get("bot_name")),
@@ -498,7 +498,6 @@ def _public_runner(row: dict[str, Any]) -> dict[str, Any]:
         "queue_depth": {
             "commands": _safe_int(queue_depth.get("commands")),
             "commands_processing": _safe_int(queue_depth.get("commands_processing")),
-            "verification": _safe_int(queue_depth.get("verification")),
         },
     }
 

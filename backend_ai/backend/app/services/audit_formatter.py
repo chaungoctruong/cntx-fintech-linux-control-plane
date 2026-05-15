@@ -41,34 +41,18 @@ _ACTION_FORMATTERS: dict[str, dict[str, Any]] = {
         "severity": "info",
     },
     "account.credentials.update": {
-        "vi": lambda p: f"Đổi mật khẩu broker cho tài khoản {_account_label(p)} (cần xác thực lại)",
-        "en": lambda p: f"Rotated broker password for account {_account_label(p)} (re-verification required)",
+        "vi": lambda p: f"Đổi mật khẩu broker cho tài khoản {_account_label(p)} (cần đăng nhập lại)",
+        "en": lambda p: f"Rotated broker password for account {_account_label(p)} (runtime login required)",
         "severity": "warning",
     },
-    "account.verify": {
-        "vi": lambda p: f"Xác thực tài khoản #{p.get('account_id')} - kết quả: {'OK' if p.get('ok') else 'thất bại'}",
-        "en": lambda p: f"Verified account #{p.get('account_id')} - result: {'OK' if p.get('ok') else 'failed'}",
+    "account.login_slot.requested": {
+        "vi": lambda p: f"Giữ slot đăng nhập cho tài khoản #{p.get('account_id')}",
+        "en": lambda p: f"Reserved login slot for account #{p.get('account_id')}",
         "severity": "info",
     },
-    "account.verify.request": {
-        "vi": lambda p: f"Gửi yêu cầu xác thực tài khoản #{p.get('account_id')}",
-        "en": lambda p: f"Submitted verification request for account #{p.get('account_id')}",
-        "severity": "info",
-    },
-    "account.verify.cancel": {
-        "vi": lambda p: f"Hủy yêu cầu xác thực #{p.get('verification_job_id')}",
-        "en": lambda p: f"Cancelled verification job #{p.get('verification_job_id')}",
-        "severity": "info",
-    },
-    "account.verify.cancel_all": {
-        "vi": lambda p: (
-            f"Hủy {p.get('cancelled_count') or 0} yêu cầu xác thực kẹt "
-            f"cho tài khoản #{p.get('account_id')}"
-        ),
-        "en": lambda p: (
-            f"Cancelled {p.get('cancelled_count') or 0} pending verification jobs "
-            f"for account #{p.get('account_id')}"
-        ),
+    "account.login_slot.result": {
+        "vi": lambda p: f"Đăng nhập tài khoản #{p.get('account_id')} - kết quả: {'OK' if p.get('ok') else 'thất bại'}",
+        "en": lambda p: f"Runtime login for account #{p.get('account_id')} - result: {'OK' if p.get('ok') else 'failed'}",
         "severity": "info",
     },
     "bot.select": {
@@ -156,7 +140,7 @@ def format_audit_row(row: dict[str, Any]) -> dict[str, Any]:
         severity = str(formatter.get("severity") or "info")
 
     related: dict[str, Any] = {}
-    for key in ("account_id", "deployment_id", "verification_job_id", "bot_name"):
+    for key in ("account_id", "deployment_id", "login_reservation_id", "bot_name"):
         if key in payload and payload[key] is not None:
             related[key] = payload[key]
 

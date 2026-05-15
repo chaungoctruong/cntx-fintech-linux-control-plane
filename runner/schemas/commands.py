@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, model_validator
 
 
 class RunnerCommandType(str, Enum):
+    RESERVE_OR_LOGIN_SLOT = "RESERVE_OR_LOGIN_SLOT"
     START_BOT = "START_BOT"
     STOP_BOT = "STOP_BOT"
     UPDATE_BOT_CONFIG = "UPDATE_BOT_CONFIG"
@@ -23,7 +24,7 @@ class RunnerCommand(BaseModel):
     requested_cmd_type: str = Field(default="", min_length=0)
     account_id: int = Field(ge=1)
     profile_id: Optional[int] = Field(default=None, ge=1)
-    deployment_id: int = Field(ge=1)
+    deployment_id: Optional[int] = Field(default=None, ge=1)
     bot_id: str = Field(min_length=1)
     runner_id: str = Field(min_length=1)
     slot_id: str = Field(min_length=1)

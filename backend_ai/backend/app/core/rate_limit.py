@@ -126,12 +126,11 @@ DEFAULT_LIMITS_PER_MIN = {
     # Too small a bucket leaves the UI with stale active_deployment_id after STOP.
     "miniapp_read": 600,
     "public": 300,  # /public/status (cached)
-    # FE poll job verify mat 90s @ 500ms => max 180 calls. Cap 240/min cho
-    # endpoint duy nhat GET /api/v2/accounts/verifications/{job_id} de FE
+    # FE poll login slot mat 90s @ 500ms => max 180 calls. Cap 240/min cho
+    # endpoint GET /api/v2/accounts/login-slots/{reservation_id} de FE
     # khong an 429 trong khi van giu bucket "default" (60/min) cho moi GET
-    # khac. Khong noi sang DELETE/POST verifications -> cancel-verification
-    # van di policy "heavy".
-    "verification_poll": 240,
+    # khac.
+    "login_slot_poll": 240,
     "ai_chat": 20,
     "ai_job_poll": 120,
 }
@@ -141,17 +140,14 @@ ENDPOINT_POLICIES: tuple[tuple[str, str], ...] = (
     # heavy
     ("POST:/api/v2/accounts/", "heavy"),  # connect, cancel-all, evaluate
     ("PUT:/api/v2/accounts/", "heavy"),  # credentials rotate, risk-policy
-    ("DELETE:/api/v2/accounts/", "heavy"),  # cancel verification
+    ("DELETE:/api/v2/accounts/", "heavy"),
     ("POST:/api/v2/deployments/", "deployment_action"),  # start, stop, cancel, command
     ("DELETE:/api/v2/me", "heavy"),
     ("POST:/api/v2/me/webhooks", "heavy"),
     # mobile control-plane read model polling
     ("GET:/api/v2/miniapp/", "miniapp_read"),
     ("GET:/api/v2/mini/bots", "miniapp_read"),
-    # verification poll: chi GET /api/v2/accounts/verifications/{job_id}.
-    # Trailing slash co chu y - tranh match nham GET /api/v2/accounts/{id}/verifications
-    # (endpoint list theo account, ly tuong van phai bi rate-limit "default").
-    ("GET:/api/v2/accounts/verifications/", "verification_poll"),
+    ("GET:/api/v2/accounts/login-slots/", "login_slot_poll"),
     # public
     ("GET:/api/v2/public/", "public"),
     ("GET:/api/v2/system/healthz", "public"),

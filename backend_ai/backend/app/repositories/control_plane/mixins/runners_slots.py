@@ -7,10 +7,12 @@ from app.models.control_plane import ACTIVE_DEPLOYMENT_STATUSES
 from app.repositories.control_plane.query_loader import load_sql
 from app.repositories.control_plane.support import (
     RUNNER_ACTIVE_LIMIT_DEFAULT,
+    RUNNER_NODE_SLOT_LIMIT_DEFAULT,
     RUNNER_MIN_HEALTHY_SLOTS_DEFAULT,
     _ACTIVE_RUNNER_DEPLOYMENT_STATUSES,
     _TERMINAL_DEPLOYMENT_STATUSES,
     _build_runner_heartbeat_metadata,
+    _cap_runner_slots,
     _capacity_state_from_operational_status,
     _json_dict,
     _json_list,
@@ -29,6 +31,53 @@ from app.repositories.control_plane.support import (
     _slot_registration_should_update_projection,
     _slot_sequence_number,
 )
+
+
+def _slot_exceeds_node_slot_cap(slot_id: str | None) -> bool:
+    seq = _slot_sequence_number(slot_id)
+    return seq is not None and seq > RUNNER_NODE_SLOT_LIMIT_DEFAULT
+
+
+_STALE_SLOT_ACCOUNT_METADATA_KEYS = (
+    "account_id",
+    "active_account_id",
+    "deployment_id",
+    "login_reservation_id",
+    "login_reservation_status",
+    "login_reservation_account_id",
+    "login_slot_status",
+    "login_slot_account_id",
+    "reserved_account_id",
+    "sticky_account_id",
+)
+
+
+def _drop_stale_slot_account_metadata(payload: Optional[dict[str, Any]]) -> dict[str, Any]:
+    metadata = dict(payload or {})
+    for key in _STALE_SLOT_ACCOUNT_METADATA_KEYS:
+        metadata.pop(key, None)
+    inventory = metadata.get("slot_inventory_entry")
+    if isinstance(inventory, dict):
+        clean_inventory = dict(inventory)
+        for key in _STALE_SLOT_ACCOUNT_METADATA_KEYS:
+            clean_inventory.pop(key, None)
+        metadata["slot_inventory_entry"] = clean_inventory
+    return metadata
+
+
+def _slot_cap_disabled_metadata(extra: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    metadata = _drop_stale_slot_account_metadata(extra)
+    metadata.update(
+        {
+            "disabled_by_node_slot_cap": True,
+            "node_slot_cap": RUNNER_NODE_SLOT_LIMIT_DEFAULT,
+            "disabled_reason": "node_slot_cap_10",
+            "available_for_new_account": False,
+            "control_plane_state": "disabled",
+            "current_control_plane_state": "disabled",
+        }
+    )
+    return metadata
 
 
 class ControlPlaneRunnersSlotsMixin:
@@ -124,12 +173,14 @@ class ControlPlaneRunnersSlotsMixin:
                 runner_id_s,
                 slot_id_s,
                 int(account_id),
+                RUNNER_NODE_SLOT_LIMIT_DEFAULT,
                 RUNNER_ACTIVE_LIMIT_DEFAULT,
                 int(account_id),
                 str(int(account_id)),
                 str(int(account_id)),
                 str(int(account_id)),
                 str(int(account_id)),
+                int(account_id),
             ),
         )
         reserved_row = cur.fetchone()
@@ -179,7 +230,7 @@ class ControlPlaneRunnersSlotsMixin:
         status_s = _normalize_runner_status_for_db(status)
         profiles = [str(item).strip().lower() for item in supported_profiles if str(item).strip()]
         tags = [str(item).strip().lower() for item in capability_tags if str(item).strip()]
-        max_slots_i = max(1, int(max_slots))
+        max_slots_i = _cap_runner_slots(max_slots)
         slot_payload = slots or [
             {
                 "slot_id": f"slot-{idx:03d}",
@@ -212,7 +263,11 @@ class ControlPlaneRunnersSlotsMixin:
                     continue
                 allowed = [str(item).strip().lower() for item in (slot.get("allowed_profile_classes") or []) if str(item).strip()]
                 slot_status = _norm(slot.get("status")) or "ready"
-                slot_metadata = slot.get("metadata") if isinstance(slot.get("metadata"), dict) else {}
+                slot_metadata = dict(slot.get("metadata") if isinstance(slot.get("metadata"), dict) else {})
+                slot_over_cap = _slot_exceeds_node_slot_cap(slot_id)
+                if slot_over_cap:
+                    slot_status = "disabled"
+                    slot_metadata = _slot_cap_disabled_metadata(slot_metadata)
                 cur.execute(
                     self._SQL_SELECT_RUNNER_SLOT_METADATA_FOR_UPDATE,
                     (runner_id_s, slot_id),
@@ -236,7 +291,7 @@ class ControlPlaneRunnersSlotsMixin:
                     if isinstance(existing_slot.get("metadata_json"), dict)
                     else {}
                 )
-                if _slot_registration_should_update_projection(
+                if slot_over_cap or _slot_registration_should_update_projection(
                     existing_metadata=existing_metadata,
                     incoming_metadata=slot_metadata,
                 ):
@@ -259,6 +314,42 @@ class ControlPlaneRunnersSlotsMixin:
                             slot_id,
                         ),
                     )
+            cur.execute(
+                """
+                UPDATE runner_slots
+                SET status = 'disabled',
+                    current_account_id = NULL,
+                    metadata_json = jsonb_strip_nulls(
+                        (
+                            COALESCE(metadata_json, '{}'::jsonb)
+                                - 'account_id'
+                                - 'active_account_id'
+                                - 'deployment_id'
+                                - 'login_reservation_id'
+                                - 'login_reservation_status'
+                                - 'login_reservation_account_id'
+                                - 'login_slot_status'
+                                - 'login_slot_account_id'
+                                - 'reserved_account_id'
+                                - 'sticky_account_id'
+                                - 'slot_inventory_entry'
+                        )
+                        || jsonb_build_object(
+                            'disabled_by_node_slot_cap', TRUE,
+                            'node_slot_cap', %s,
+                            'disabled_reason', 'node_slot_cap_10',
+                            'available_for_new_account', FALSE,
+                            'control_plane_state', 'disabled',
+                            'current_control_plane_state', 'disabled'
+                        )
+                    ),
+                    updated_at = NOW()
+                WHERE runner_id = %s
+                  AND COALESCE(NULLIF(SUBSTRING(slot_id FROM '([0-9]+)$'), ''), '') <> ''
+                  AND CAST(SUBSTRING(slot_id FROM '([0-9]+)$') AS INTEGER) > %s
+                """,
+                (RUNNER_NODE_SLOT_LIMIT_DEFAULT, runner_id_s, max_slots_i),
+            )
 
             return runner
 
@@ -280,13 +371,13 @@ class ControlPlaneRunnersSlotsMixin:
                 (runner_id_s,),
             )
             runner_row = cur.fetchone() or {}
-            current_max_slots = _safe_int(runner_row.get("max_slots"), 1) or 1
+            current_max_slots = _cap_runner_slots(_safe_int(runner_row.get("max_slots"), 1) or 1)
             metadata = _build_runner_heartbeat_metadata(
                 current_max_slots=current_max_slots,
                 existing_metadata=runner_row.get("metadata_json") if isinstance(runner_row.get("metadata_json"), dict) else {},
                 payload=payload,
             )
-            effective_slots = _safe_int(metadata.get("effective_slots"), current_max_slots) or current_max_slots
+            effective_slots = _cap_runner_slots(_safe_int(metadata.get("effective_slots"), current_max_slots) or current_max_slots)
             slot_inventory = []
             if isinstance(payload, dict) and isinstance(payload.get("slot_inventory"), list):
                 slot_inventory = [item for item in payload.get("slot_inventory") or [] if isinstance(item, dict)]
@@ -301,7 +392,34 @@ class ControlPlaneRunnersSlotsMixin:
                 if slot_status != "ready":
                     continue
                 incoming_metadata = dict(entry)
-                incoming_metadata["slot_inventory_entry"] = dict(entry)
+                for stale_key in (
+                    "account_id",
+                    "active_account_id",
+                    "deployment_id",
+                    "login_reservation_id",
+                    "login_reservation_status",
+                    "login_reservation_account_id",
+                    "login_slot_status",
+                    "login_slot_account_id",
+                    "reserved_account_id",
+                    "sticky_account_id",
+                ):
+                    incoming_metadata.pop(stale_key, None)
+                incoming_inventory_entry = dict(entry)
+                for stale_key in (
+                    "account_id",
+                    "active_account_id",
+                    "deployment_id",
+                    "login_reservation_id",
+                    "login_reservation_status",
+                    "login_reservation_account_id",
+                    "login_slot_status",
+                    "login_slot_account_id",
+                    "reserved_account_id",
+                    "sticky_account_id",
+                ):
+                    incoming_inventory_entry.pop(stale_key, None)
+                incoming_metadata["slot_inventory_entry"] = incoming_inventory_entry
                 incoming_metadata["control_plane_state"] = "ready"
                 incoming_metadata["current_control_plane_state"] = "ready"
                 incoming_metadata["heartbeat_projection"] = True
@@ -327,15 +445,43 @@ class ControlPlaneRunnersSlotsMixin:
                 )
             cur.execute(
                 self._SQL_COUNT_RUNNER_SLOTS_BY_STATUS_FOR_HEARTBEAT,
-                (runner_id_s, effective_slots),
+                (runner_id_s, runner_id_s, effective_slots),
             )
             metadata = _overlay_runner_slot_projection_metadata(metadata, dict(cur.fetchone() or {}))
             heartbeat_allows_online = _runner_heartbeat_allows_online_status(metadata)
             cur.execute(
                 self._SQL_UPDATE_RUNNER_NODE_HEARTBEAT,
-                (_json_payload(metadata), bool(heartbeat_allows_online), runner_id_s),
+                (effective_slots, _json_payload(metadata), bool(heartbeat_allows_online), runner_id_s),
             )
-            if slot_id_s:
+            if slot_id_s and _slot_exceeds_node_slot_cap(slot_id_s):
+                cur.execute(
+                    """
+                    UPDATE runner_slots
+                    SET status = 'disabled',
+                        current_account_id = NULL,
+                        metadata_json = jsonb_strip_nulls(
+                            (
+                                COALESCE(metadata_json, '{}'::jsonb)
+                                    - 'account_id'
+                                    - 'active_account_id'
+                                    - 'deployment_id'
+                                    - 'login_reservation_id'
+                                    - 'login_reservation_status'
+                                    - 'login_reservation_account_id'
+                                    - 'login_slot_status'
+                                    - 'login_slot_account_id'
+                                    - 'reserved_account_id'
+                                    - 'sticky_account_id'
+                                    - 'slot_inventory_entry'
+                            )
+                            || %s::jsonb
+                        ),
+                        updated_at = NOW()
+                    WHERE runner_id = %s AND slot_id = %s
+                    """,
+                    (_json_payload(_slot_cap_disabled_metadata()), runner_id_s, slot_id_s),
+                )
+            elif slot_id_s:
                 cur.execute(
                     self._SQL_UPDATE_RUNNER_SLOT_TOUCH_HEARTBEAT,
                     (runner_id_s, slot_id_s),
@@ -388,7 +534,9 @@ class ControlPlaneRunnersSlotsMixin:
                 operational_status = _runner_operational_status(row)
                 row["operational_status"] = operational_status
                 row["capacity_state"] = _capacity_state_from_operational_status(operational_status)
-                row["active_limit"] = _safe_int(metadata.get("active_limit"), RUNNER_ACTIVE_LIMIT_DEFAULT) or RUNNER_ACTIVE_LIMIT_DEFAULT
+                row["active_limit"] = _cap_runner_slots(
+                    _safe_int(metadata.get("active_limit"), RUNNER_ACTIVE_LIMIT_DEFAULT) or RUNNER_ACTIVE_LIMIT_DEFAULT
+                )
                 row["min_healthy_slots"] = _safe_int(metadata.get("min_healthy_slots"), RUNNER_MIN_HEALTHY_SLOTS_DEFAULT) or RUNNER_MIN_HEALTHY_SLOTS_DEFAULT
                 row["maintenance_mode"] = operational_status == "MAINTENANCE"
                 row["paused"] = _metadata_flag(
@@ -398,7 +546,7 @@ class ControlPlaneRunnersSlotsMixin:
                     "frozen",
                     "freeze",
                     "dispatch_paused",
-                    "verification_paused",
+                    "login_paused",
                     "warm_guard_paused",
                     "warm_guard_pause",
                     "warm_pool_paused",
@@ -407,12 +555,12 @@ class ControlPlaneRunnersSlotsMixin:
                     operational_status in {"ONLINE_AVAILABLE", "ONLINE_NEAR_FULL"}
                     and int(row.get("available_slots") or 0) > 0
                 )
-                row["last_error"] = metadata.get("last_error") or metadata.get("runtime_error") or row.get("last_verification_error")
-                row["last_verification_result"] = {
-                    "job_id": row.pop("last_verification_job_id", None),
-                    "status": row.pop("last_verification_status", None),
-                    "error": row.pop("last_verification_error", None),
-                    "completed_at": row.pop("last_verification_completed_at", None),
+                row["last_error"] = metadata.get("last_error") or metadata.get("runtime_error") or row.get("last_login_reservation_error")
+                row["last_login_reservation"] = {
+                    "reservation_id": row.pop("last_login_reservation_id", None),
+                    "status": row.pop("last_login_reservation_status", None),
+                    "error": row.pop("last_login_reservation_error", None),
+                    "completed_at": row.pop("last_login_reservation_completed_at", None),
                 }
                 out.append(row)
             return out
@@ -439,7 +587,9 @@ class ControlPlaneRunnersSlotsMixin:
             operational_status = _runner_operational_status(runner)
             runner["operational_status"] = operational_status
             runner["capacity_state"] = _capacity_state_from_operational_status(operational_status)
-            runner["active_limit"] = _safe_int(metadata.get("active_limit"), RUNNER_ACTIVE_LIMIT_DEFAULT) or RUNNER_ACTIVE_LIMIT_DEFAULT
+            runner["active_limit"] = _cap_runner_slots(
+                _safe_int(metadata.get("active_limit"), RUNNER_ACTIVE_LIMIT_DEFAULT) or RUNNER_ACTIVE_LIMIT_DEFAULT
+            )
             runner["min_healthy_slots"] = _safe_int(metadata.get("min_healthy_slots"), RUNNER_MIN_HEALTHY_SLOTS_DEFAULT) or RUNNER_MIN_HEALTHY_SLOTS_DEFAULT
             runner["maintenance_mode"] = operational_status == "MAINTENANCE"
             runner["paused"] = _metadata_flag(
@@ -449,7 +599,7 @@ class ControlPlaneRunnersSlotsMixin:
                 "frozen",
                 "freeze",
                 "dispatch_paused",
-                "verification_paused",
+                "login_paused",
                 "warm_guard_paused",
                 "warm_guard_pause",
                 "warm_pool_paused",
@@ -458,12 +608,12 @@ class ControlPlaneRunnersSlotsMixin:
                 operational_status in {"ONLINE_AVAILABLE", "ONLINE_NEAR_FULL"}
                 and int(runner.get("available_slots") or 0) > 0
             )
-            runner["last_error"] = metadata.get("last_error") or metadata.get("runtime_error") or runner.get("last_verification_error")
-            runner["last_verification_result"] = {
-                "job_id": runner.pop("last_verification_job_id", None),
-                "status": runner.pop("last_verification_status", None),
-                "error": runner.pop("last_verification_error", None),
-                "completed_at": runner.pop("last_verification_completed_at", None),
+            runner["last_error"] = metadata.get("last_error") or metadata.get("runtime_error") or runner.get("last_login_reservation_error")
+            runner["last_login_reservation"] = {
+                "reservation_id": runner.pop("last_login_reservation_id", None),
+                "status": runner.pop("last_login_reservation_status", None),
+                "error": runner.pop("last_login_reservation_error", None),
+                "completed_at": runner.pop("last_login_reservation_completed_at", None),
             }
 
             cur.execute(
@@ -675,7 +825,7 @@ class ControlPlaneRunnersSlotsMixin:
                     WHERE rs.runner_id = n.runner_id
                       AND (
                           COALESCE(NULLIF(SUBSTRING(rs.slot_id FROM '([0-9]+)$'), ''), '') = ''
-                          OR CAST(SUBSTRING(rs.slot_id FROM '([0-9]+)$') AS INTEGER) <= GREATEST(1, n.max_slots)
+                          OR CAST(SUBSTRING(rs.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(10, GREATEST(1, n.max_slots))
                       )
                 ) slot_stats ON TRUE
                 LEFT JOIN LATERAL (
@@ -704,7 +854,7 @@ class ControlPlaneRunnersSlotsMixin:
                  AND b.binding_state = 'active'
                 WHERE (
                     COALESCE(NULLIF(SUBSTRING(s.slot_id FROM '([0-9]+)$'), ''), '') = ''
-                    OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= GREATEST(1, n.max_slots)
+                    OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(10, GREATEST(1, n.max_slots))
                 )
                 ORDER BY s.runner_id ASC, s.slot_id ASC
                 """
@@ -764,14 +914,14 @@ class ControlPlaneRunnersSlotsMixin:
                             NOT IN ('true', '1', 'yes', 'y', 'on')
                         AND COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'dispatch_paused'), '')), 'false')
                             NOT IN ('true', '1', 'yes', 'y', 'on')
-                        AND COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'verification_paused'), '')), 'false')
+                        AND COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'login_paused'), '')), 'false')
                             NOT IN ('true', '1', 'yes', 'y', 'on')
                         AND COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'warm_guard_paused'), '')), 'false')
                             NOT IN ('true', '1', 'yes', 'y', 'on')
                         AND COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'warm_pool_paused'), '')), 'false')
                             NOT IN ('true', '1', 'yes', 'y', 'on')
                         AND COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'runner_state'), '')), 'online')
-                            NOT IN ('draining', 'frozen', 'maintenance', 'paused', 'verification_paused', 'warm_guard_paused')
+                            NOT IN ('draining', 'frozen', 'maintenance', 'paused', 'login_paused', 'warm_guard_paused')
                         AND (
                             COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'accepting_new_accounts'), '')), 'false')
                                 IN ('true', '1', 'yes', 'y', 'on')
@@ -790,7 +940,7 @@ class ControlPlaneRunnersSlotsMixin:
                               AND d.status IN ('start_requested', 'starting', 'running', 'stop_requested')
                         ) < CASE
                             WHEN COALESCE(n.metadata_json->>'active_limit', '') ~ '^[0-9]+$'
-                                THEN GREATEST(1, (n.metadata_json->>'active_limit')::INTEGER)
+                                THEN LEAST(%s, GREATEST(1, (n.metadata_json->>'active_limit')::INTEGER))
                             ELSE %s
                         END
                         AND EXISTS (
@@ -827,17 +977,30 @@ class ControlPlaneRunnersSlotsMixin:
 	                          AND LOWER(NULLIF(BTRIM(COALESCE(s.metadata_json->>'sticky_account_id', '')), '')) NOT IN ('null', 'none', '0')
 	                      )
 	                  )
-                  AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'control_plane_state'), '')), 'ready')
-                        NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
-                  AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'current_control_plane_state'), '')), 'ready')
-                        NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
-                  AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'runner_state'), '')), 'ready')
-                        NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
-                  AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'current_runner_state'), '')), 'ready')
-                        NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
+                  AND (
+                      EXISTS (
+                          SELECT 1
+                          FROM account_login_reservations v
+                          WHERE v.account_id = %s
+                            AND v.runner_id = s.runner_id
+                            AND v.slot_id = s.slot_id
+                            AND v.status = 'claimed'
+                            AND (v.expires_at IS NULL OR v.expires_at > NOW())
+                      )
+                      OR (
+                          COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'control_plane_state'), '')), 'ready')
+                              NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
+                          AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'current_control_plane_state'), '')), 'ready')
+                              NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
+                          AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'runner_state'), '')), 'ready')
+                              NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
+                          AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'current_runner_state'), '')), 'ready')
+                              NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
+                      )
+                  )
                   AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'mt5_liveness_state'), '')), 'ready')
                         NOT IN ('broken', 'dead', 'degraded', 'disabled', 'failed', 'offline', 'stale')
-                  AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'verification_status'), '')), '')
+                  AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'login_slot_status'), '')), '')
                         NOT IN ('dispatched', 'pending', 'queued', 'running', 'verifying')
                 RETURNING runner_id, slot_id, status, current_account_id
                 """,
@@ -846,12 +1009,14 @@ class ControlPlaneRunnersSlotsMixin:
                     runner_id_s,
                     slot_id_s,
                     int(account_id),
+                    RUNNER_NODE_SLOT_LIMIT_DEFAULT,
                     RUNNER_ACTIVE_LIMIT_DEFAULT,
                     int(account_id),
                     str(int(account_id)),
                     str(int(account_id)),
                     str(int(account_id)),
                     str(int(account_id)),
+                    int(account_id),
                 ),
             )
             if not cur.fetchone():
@@ -896,7 +1061,7 @@ class ControlPlaneRunnersSlotsMixin:
                 WHERE account_id = %s
                   AND runner_id = %s
                   AND slot_id = %s
-                ORDER BY id DESC
+                ORDER BY is_current DESC, updated_at DESC, id DESC
                 LIMIT 1
                 """,
                 (int(account_id), runner_id_s, slot_id_s),
@@ -959,10 +1124,9 @@ class ControlPlaneRunnersSlotsMixin:
                                 - 'account_id'
                                 - 'active_account_id'
                                 - 'deployment_id'
-                                - 'verification_job_id'
-                                - 'verification_status'
-                                - 'verification_account_id'
-                                - 'verification_attempt'
+                                - 'login_reservation_id'
+                                - 'login_slot_status'
+                                - 'login_slot_account_id'
                                 - 'sticky_account_id'
                                 - 'reserved_account_id'
                                 - 'current_control_plane_state'
@@ -1068,8 +1232,9 @@ class ControlPlaneRunnersSlotsMixin:
                       )
                       AND NOT EXISTS (
                           SELECT 1
-                          FROM account_verification_jobs v
-                          WHERE v.status IN ('pending', 'dispatched')
+                          FROM account_login_reservations v
+                          WHERE v.status IN ('pending', 'dispatched', 'verified')
+                            AND (v.expires_at IS NULL OR v.expires_at > NOW())
                             AND (
                                 v.account_id = b.account_id
                                 OR (v.runner_id = b.runner_id AND v.slot_id = b.slot_id)
@@ -1142,7 +1307,7 @@ class ControlPlaneRunnersSlotsMixin:
 
         This is intentionally narrow: it only touches the current binding for
         the requested account, and only when DB state proves there is no active
-        deployment, active verification job, or in-flight START/STOP command.
+        deployment, active login-slot reservation, or in-flight START/STOP command.
         Foreign sticky slots and unhealthy slots are left untouched.
         """
 
@@ -1170,9 +1335,10 @@ class ControlPlaneRunnersSlotsMixin:
                       )
                       AND NOT EXISTS (
                           SELECT 1
-                          FROM account_verification_jobs v
+                          FROM account_login_reservations v
                           WHERE v.account_id = a.id
-                            AND v.status IN ('pending', 'dispatched')
+                            AND v.status IN ('pending', 'dispatched', 'verified')
+                            AND (v.expires_at IS NULL OR v.expires_at > NOW())
                       )
                       AND NOT EXISTS (
                           SELECT 1
@@ -1224,7 +1390,7 @@ class ControlPlaneRunnersSlotsMixin:
                       )
                       AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'mt5_liveness_state'), '')), 'ready')
                             NOT IN ('broken', 'dead', 'degraded', 'disabled', 'failed', 'offline', 'stale')
-                      AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'verification_status'), '')), '')
+                      AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'login_slot_status'), '')), '')
                             NOT IN ('dispatched', 'pending', 'queued', 'running', 'verifying')
                       AND NOT EXISTS (
                           SELECT 1
@@ -1284,7 +1450,7 @@ class ControlPlaneRunnersSlotsMixin:
                       )
                       AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'mt5_liveness_state'), '')), 'ready')
                             NOT IN ('broken', 'dead', 'degraded', 'disabled', 'failed', 'offline', 'stale')
-                      AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'verification_status'), '')), '')
+                      AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'login_slot_status'), '')), '')
                             NOT IN ('dispatched', 'pending', 'queued', 'running', 'verifying')
                       AND NOT EXISTS (
                           SELECT 1
@@ -1297,9 +1463,10 @@ class ControlPlaneRunnersSlotsMixin:
                       )
                       AND NOT EXISTS (
                           SELECT 1
-                          FROM account_verification_jobs v
+                          FROM account_login_reservations v
                           WHERE v.account_id = b.account_id
-                            AND v.status IN ('pending', 'dispatched')
+                            AND v.status IN ('pending', 'dispatched', 'verified')
+                            AND (v.expires_at IS NULL OR v.expires_at > NOW())
                       )
                       AND NOT EXISTS (
                           SELECT 1
@@ -1334,9 +1501,9 @@ class ControlPlaneRunnersSlotsMixin:
                                 - 'account_id'
                                 - 'active_account_id'
                                 - 'deployment_id'
-                                - 'verification_job_id'
-                                - 'verification_account_id'
-                                - 'verification_status'
+                                - 'login_reservation_id'
+                                - 'login_slot_account_id'
+                                - 'login_slot_status'
                                 - 'current_state'
                                 - 'previous_state'
                                 - 'runner_state'
@@ -1398,18 +1565,20 @@ class ControlPlaneRunnersSlotsMixin:
 
     def mark_slot_health(self, *, runner_id: str, slot_id: str, status: str) -> None:
         slot_id_s = _norm_slot_id(slot_id)
+        status_s = "disabled" if _slot_exceeds_node_slot_cap(slot_id_s) else _norm(status)
 
         def _do(con: Any, cur: Any) -> None:
             cur.execute(
                 """
                 UPDATE runner_slots
                 SET status = %s,
+                    current_account_id = CASE WHEN %s = 'disabled' THEN NULL ELSE current_account_id END,
                     updated_at = NOW()
                 WHERE runner_id = %s AND slot_id = %s
                 """,
-                (_norm(status), _norm(runner_id), slot_id_s),
+                (status_s, status_s, _norm(runner_id), slot_id_s),
             )
-            if _norm(status) in {"degraded", "broken"}:
+            if status_s in {"degraded", "broken"}:
                 cur.execute(
                     """
                     UPDATE runner_nodes
@@ -1419,7 +1588,7 @@ class ControlPlaneRunnersSlotsMixin:
                     """,
                     (_norm(runner_id),),
                 )
-            if _norm(status) == "broken":
+            if status_s == "broken":
                 cur.execute(
                     """
                     UPDATE account_slot_bindings
@@ -1436,10 +1605,17 @@ class ControlPlaneRunnersSlotsMixin:
     def update_runner_slot_state(self, *, runner_id: str, slot_id: str, status: str, metadata: Optional[dict[str, Any]] = None) -> None:
         status_s = _normalize_runner_slot_projection_status(status)
         slot_id_s = _norm_slot_id(slot_id)
-        metadata_json = _json_payload(metadata)
+        if not slot_id_s:
+            return
+        metadata_payload = dict(metadata or {})
+        force_slot_cap_disabled = _slot_exceeds_node_slot_cap(slot_id_s)
+        if force_slot_cap_disabled:
+            status_s = "disabled"
+            metadata_payload = _slot_cap_disabled_metadata(metadata_payload)
+        metadata_json = _json_payload(metadata_payload)
 
         def _do(con: Any, cur: Any) -> None:
-            if isinstance(metadata, dict) and metadata:
+            if metadata_payload and not force_slot_cap_disabled:
                 cur.execute(
                     """
                     SELECT metadata_json
@@ -1457,7 +1633,7 @@ class ControlPlaneRunnersSlotsMixin:
                 )
                 if existing is not None and not _slot_registration_should_update_projection(
                     existing_metadata=existing_metadata,
-                    incoming_metadata=metadata,
+                    incoming_metadata=metadata_payload,
                 ):
                     return
             cur.execute(
@@ -1465,7 +1641,7 @@ class ControlPlaneRunnersSlotsMixin:
                 UPDATE runner_slots
                 SET status = %s,
                     current_account_id = CASE
-                        WHEN %s = 'ready' THEN NULL
+                        WHEN %s IN ('ready', 'disabled') THEN NULL
                         ELSE current_account_id
                     END,
                     metadata_json = CASE
@@ -1474,19 +1650,53 @@ class ControlPlaneRunnersSlotsMixin:
                                 (
                                     COALESCE(metadata_json, '{}'::jsonb)
                                         - 'account_id'
-                                        - 'verification_job_id'
-                                        - 'verification_status'
-                                        - 'verification_account_id'
-                                        - 'verification_attempt'
+                                        - 'active_account_id'
+                                        - 'deployment_id'
+                                        - 'login_reservation_id'
+                                        - 'login_reservation_status'
+                                        - 'login_reservation_account_id'
+                                        - 'login_slot_status'
+                                        - 'login_slot_account_id'
+                                        - 'reserved_account_id'
+                                        - 'sticky_account_id'
                                         - 'current_control_plane_state'
                                         - 'previous_control_plane_state'
                                 ) || CASE
                                         WHEN %s::jsonb = '{}'::jsonb THEN '{}'::jsonb
-                                        ELSE %s::jsonb
+                                        ELSE (
+                                            %s::jsonb
+                                                - 'account_id'
+                                                - 'active_account_id'
+                                                - 'deployment_id'
+                                                - 'login_reservation_id'
+                                                - 'login_reservation_status'
+                                                - 'login_reservation_account_id'
+                                                - 'login_slot_status'
+                                                - 'login_slot_account_id'
+                                                - 'reserved_account_id'
+                                                - 'sticky_account_id'
+                                        )
                                      END || jsonb_build_object(
                                         'control_plane_state', 'ready',
                                         'available_for_new_account', TRUE
                                      )
+                            )
+                        WHEN %s = 'disabled' THEN
+                            jsonb_strip_nulls(
+                                (
+                                    COALESCE(metadata_json, '{}'::jsonb)
+                                        - 'account_id'
+                                        - 'active_account_id'
+                                        - 'deployment_id'
+                                        - 'login_reservation_id'
+                                        - 'login_reservation_status'
+                                        - 'login_reservation_account_id'
+                                        - 'login_slot_status'
+                                        - 'login_slot_account_id'
+                                        - 'reserved_account_id'
+                                        - 'sticky_account_id'
+                                        - 'slot_inventory_entry'
+                                ) || %s::jsonb
                             )
                         WHEN %s::jsonb = '{}'::jsonb THEN metadata_json
                         ELSE metadata_json || %s::jsonb
@@ -1499,6 +1709,8 @@ class ControlPlaneRunnersSlotsMixin:
                     status_s,
                     status_s,
                     metadata_json,
+                    metadata_json,
+                    status_s,
                     metadata_json,
                     metadata_json,
                     metadata_json,
@@ -1678,14 +1890,14 @@ class ControlPlaneRunnersSlotsMixin:
             )
             cur.execute(
                 """
-                UPDATE account_verification_jobs
-                SET status = 'cancelled',
+                UPDATE account_login_reservations
+                SET status = 'released',
                     last_error = 'runner_reported_slot_ready',
                     completed_at = COALESCE(completed_at, NOW()),
                     updated_at = NOW()
                 WHERE runner_id = %s
                   AND slot_id = %s
-                  AND status IN ('pending', 'queued', 'dispatched', 'running', 'verifying')
+                  AND status IN ('pending', 'dispatched', 'verified')
                 """,
                 (runner_id_s, slot_id_s),
             )
@@ -1699,7 +1911,7 @@ class ControlPlaneRunnersSlotsMixin:
                         - 'active_account_id'
                         - 'deployment_id'
                         - 'active_deployment_id'
-                        - 'verification_account_id'
+                        - 'login_slot_account_id'
                         || jsonb_build_object(
                             'start_eligible', true,
                             'available_for_new_account', true,
@@ -1783,10 +1995,6 @@ class ControlPlaneRunnersSlotsMixin:
                                     - 'account_id'
                                     - 'active_account_id'
                                     - 'deployment_id'
-                                    - 'verification_job_id'
-                                    - 'verification_status'
-                                    - 'verification_account_id'
-                                    - 'verification_attempt'
                                     - 'sticky_account_id'
                                     - 'reserved_account_id'
                                     - 'current_control_plane_state'
@@ -1882,7 +2090,7 @@ class ControlPlaneRunnersSlotsMixin:
             "start_eligible": 0,
             "start_available": 0,
             "active": 0,
-            "verifying": 0,
+            "login_reserved": 0,
             "reserved": 0,
             "degraded": 0,
             "broken": 0,
@@ -1929,7 +2137,7 @@ class ControlPlaneRunnersSlotsMixin:
                 }
 
             runner = dict(runner_row)
-            max_slot_number_i = max(1, _safe_int(runner.get("max_slots"), 1))
+            max_slot_number_i = _cap_runner_slots(_safe_int(runner.get("max_slots"), 1))
             runner_metadata = _json_dict(runner.get("metadata_json"))
             expected_slots_i = max(
                 1,
@@ -1945,10 +2153,10 @@ class ControlPlaneRunnersSlotsMixin:
             )
             cur.execute(
                 """
-                WITH active_verifications AS (
+                WITH active_login_reservations AS (
                     SELECT runner_id, slot_id, COUNT(*) AS active_count
-                    FROM account_verification_jobs
-                    WHERE status IN ('pending', 'dispatched')
+                    FROM account_login_reservations
+                    WHERE status IN ('pending', 'dispatched', 'verified')
                       AND runner_id = %s
                       AND slot_id IS NOT NULL
                     GROUP BY runner_id, slot_id
@@ -1994,9 +2202,8 @@ class ControlPlaneRunnersSlotsMixin:
                            OR COALESCE(b.active_count, 0) > 0
                     ) AS active,
                     COUNT(*) FILTER (
-                        WHERE s.status = 'verifying'
-                           OR COALESCE(v.active_count, 0) > 0
-                    ) AS verifying,
+                        WHERE COALESCE(v.active_count, 0) > 0
+                    ) AS login_reserved,
                     COUNT(*) FILTER (WHERE COALESCE(b.current_count, 0) > 0) AS reserved,
                     COUNT(*) FILTER (WHERE s.status = 'degraded') AS degraded,
                     COUNT(*) FILTER (WHERE s.status = 'broken') AS broken,
@@ -2025,7 +2232,7 @@ class ControlPlaneRunnersSlotsMixin:
                               IN ('true', '1', 'yes', 'y', 'on')
                     ) AS start_available
                 FROM counted_slots s
-                LEFT JOIN active_verifications v
+                LEFT JOIN active_login_reservations v
                   ON v.runner_id = s.runner_id
                  AND v.slot_id = s.slot_id
                 LEFT JOIN current_bindings b

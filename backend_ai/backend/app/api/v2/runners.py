@@ -9,7 +9,6 @@ from pydantic import ValidationError
 from app.api.v2.control_plane_deps import service_dep, translate_control_plane_error
 from app.core.internal_auth import require_backend_api_key
 from app.schemas.control_plane import (
-    AccountVerificationResultRequest,
     CommandDeliveryUpdateRequest,
     GsAlgoBotStateRequest,
     RunnerDrainRequest,
@@ -197,35 +196,6 @@ async def get_runner_deployment_package(
         return service.get_runner_deployment_package(deployment_id=deployment_id)
     except Exception as exc:
         raise translate_control_plane_error(exc) from exc
-
-
-@router.post("/runner/account-verifications/result")
-async def record_account_verification_result(
-    payload: AccountVerificationResultRequest,
-    _: dict = Depends(require_backend_api_key),
-    service: MT5ControlPlaneService = Depends(service_dep),
-) -> dict:
-    try:
-        result = service.record_account_verification_result(**payload.model_dump(mode="json"))
-    except Exception as exc:
-        raise translate_control_plane_error(exc) from exc
-    return {
-        "verification_job_id": result.get("id"),
-        "status": result.get("status"),
-        "verification_state": result.get("verification_state"),
-        "verification_ui_state": result.get("verification_ui_state"),
-        "error_code": result.get("error_code"),
-        "retryable": result.get("retryable"),
-        "failure_kind": result.get("failure_kind"),
-        "failure_category": result.get("failure_category"),
-        "user_message_key": result.get("user_message_key"),
-        "verification_failure": result.get("verification_failure"),
-        "trace_id": result.get("trace_id"),
-        "runner_id": result.get("runner_id"),
-        "slot_id": result.get("slot_id"),
-        "account": result.get("account"),
-        "job": result,
-    }
 
 
 @router.get("/runner/bootstrap")

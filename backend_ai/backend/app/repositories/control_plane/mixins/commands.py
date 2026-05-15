@@ -90,7 +90,7 @@ class ControlPlaneCommandsMixin:
         self,
         *,
         account_id: int,
-        deployment_id: int,
+        deployment_id: int | None,
         command_type: str,
         trace_id: str,
     ) -> Optional[dict[str, Any]]:
@@ -101,7 +101,7 @@ class ControlPlaneCommandsMixin:
         def _do(con: Any, cur: Any) -> Optional[dict[str, Any]]:
             cur.execute(
                 self._SQL_GET_EXECUTION_COMMAND_BY_TRACE_IDENTITY,
-                (int(account_id), int(deployment_id), _norm(command_type), trace_s),
+                (int(account_id), deployment_id, _norm(command_type), trace_s),
             )
             row = cur.fetchone()
             return dict(row) if row else None
@@ -138,7 +138,7 @@ class ControlPlaneCommandsMixin:
         command_id: str,
         command_type: str,
         account_id: int,
-        deployment_id: int,
+        deployment_id: int | None,
         bot_id: str,
         runner_id: str,
         slot_id: str,
@@ -147,11 +147,15 @@ class ControlPlaneCommandsMixin:
         trace_id: str,
         queue_name: str,
     ) -> dict[str, Any]:
-        existing = self.get_execution_command_by_trace_identity(
-            account_id=account_id,
-            deployment_id=deployment_id,
-            command_type=command_type,
-            trace_id=trace_id,
+        existing = (
+            self.get_execution_command_by_trace_identity(
+                account_id=account_id,
+                deployment_id=deployment_id,
+                command_type=command_type,
+                trace_id=trace_id,
+            )
+            if deployment_id is not None
+            else None
         )
         if existing:
             return existing
@@ -163,7 +167,7 @@ class ControlPlaneCommandsMixin:
                     _norm(command_id),
                     _norm(command_type),
                     int(account_id),
-                    int(deployment_id),
+                    int(deployment_id) if deployment_id is not None else None,
                     _norm(bot_id),
                     _norm(runner_id),
                     _norm_slot_id(slot_id),
@@ -310,6 +314,118 @@ class ControlPlaneCommandsMixin:
                 (reason_s, int(account_id)),
             )
             return int(cur.rowcount or 0)
+
+        return self._store._with_retry_locked(_do)
+
+    def fail_stale_acknowledged_start_commands(self, *, timeout_sec: int, reason: str) -> int:
+        timeout_i = max(30, int(timeout_sec or 120))
+        reason_s = (_norm(reason) or "start_bot_ack_timeout_no_runtime_event")[:200]
+
+        def _do(con: Any, cur: Any) -> int:
+            cur.execute(
+                """
+                WITH stale AS (
+                    SELECT
+                        c.command_id,
+                        c.deployment_id,
+                        c.account_id,
+                        c.runner_id,
+                        c.slot_id,
+                        d.binding_id
+                    FROM execution_commands c
+                    JOIN bot_deployments d ON d.id = c.deployment_id
+                    WHERE c.command_type = 'START_BOT'
+                      AND c.delivery_status = 'acknowledged'
+                      AND COALESCE(c.acknowledged_at, c.created_at) < (NOW() - (%s * INTERVAL '1 second'))
+                      AND d.status IN ('start_requested', 'starting')
+                      AND d.desired_state = 'running'
+                      AND COALESCE(d.is_active, FALSE) = TRUE
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM execution_events e
+                          WHERE e.command_id = c.command_id
+                            AND e.event_type IN ('BOT_STARTED', 'BOT_LISTENING', 'COMMAND_REJECTED', 'BOT_STOPPED')
+                      )
+                    FOR UPDATE OF c, d
+                ),
+                failed_commands AS (
+                    UPDATE execution_commands c
+                    SET delivery_status = 'failed',
+                        last_error = COALESCE(NULLIF(c.last_error, ''), %s),
+                        updated_at = NOW()
+                    FROM stale s
+                    WHERE c.command_id = s.command_id
+                    RETURNING c.command_id
+                ),
+                failed_deployments AS (
+                    UPDATE bot_deployments d
+                    SET status = 'failed',
+                        desired_state = 'stopped',
+                        is_active = FALSE,
+                        health_status = 'start_timeout',
+                        last_error = COALESCE(NULLIF(d.last_error, ''), %s),
+                        stopped_at = COALESCE(d.stopped_at, NOW()),
+                        updated_at = NOW()
+                    FROM stale s
+                    WHERE d.id = s.deployment_id
+                    RETURNING d.id, d.account_id, d.runner_id, d.slot_id, d.binding_id
+                ),
+                released_bindings AS (
+                    UPDATE account_slot_bindings b
+                    SET binding_state = CASE WHEN b.binding_state = 'broken' THEN b.binding_state ELSE 'released' END,
+                        is_current = FALSE,
+                        is_sticky = FALSE,
+                        updated_at = NOW()
+                    FROM failed_deployments d
+                    WHERE (
+                            b.id = d.binding_id
+                            OR (
+                                b.account_id = d.account_id
+                                AND b.runner_id = d.runner_id
+                                AND b.slot_id = d.slot_id
+                                AND b.is_current = TRUE
+                            )
+                          )
+                    RETURNING 1
+                ),
+                released_slots AS (
+                    UPDATE runner_slots s
+                    SET current_account_id = NULL,
+                        status = CASE WHEN s.status = 'broken' THEN s.status ELSE 'ready' END,
+                        metadata_json = jsonb_strip_nulls(
+                            (
+                                COALESCE(s.metadata_json, '{}'::jsonb)
+                                - 'account_id'
+                                - 'active_account_id'
+                                - 'deployment_id'
+                                - 'current_control_plane_state'
+                                - 'control_plane_state'
+                                - 'runner_state'
+                                - 'current_runner_state'
+                                - 'last_error'
+                            ) || jsonb_build_object(
+                                'available_for_new_account', TRUE,
+                                'control_plane_state', 'ready',
+                                'current_control_plane_state', 'ready',
+                                'runner_state', 'ready',
+                                'current_runner_state', 'ready',
+                                'last_reason', %s,
+                                'last_error', ''
+                            )
+                        ),
+                        updated_at = NOW()
+                    FROM failed_deployments d
+                    WHERE s.runner_id = d.runner_id
+                      AND s.slot_id = d.slot_id
+                      AND (s.current_account_id IS NULL OR s.current_account_id = d.account_id)
+                    RETURNING 1
+                )
+                SELECT COUNT(*) AS failed_count FROM failed_commands
+                """,
+                (timeout_i, reason_s, reason_s, reason_s),
+            )
+            row = dict(cur.fetchone() or {})
+            return _safe_int(row.get("failed_count"), 0)
 
         return self._store._with_retry_locked(_do)
 
@@ -632,4 +748,3 @@ class ControlPlaneCommandsMixin:
             )
 
         self._store._with_retry_locked(_do)
-

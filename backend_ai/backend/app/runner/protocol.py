@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from app.orchestration.runner_payload_identity import normalize_runner_command_payload
 from runner.schemas.commands import RunnerCommand
@@ -14,22 +14,12 @@ class CommandQueueItem(RunnerCommand):
     pass
 
 
-class VerificationQueueItem(BaseModel):
-    job_id: int
-    account_id: int
-    runner_id: str
-    slot_id: str
-    trace_id: str = ""
-    payload: dict[str, Any] = Field(default_factory=dict)
-
-
 class QueueEnvelope(BaseModel):
     queue_kind: str
     queue_name: str
     raw: str
     processing_queue_name: Optional[str] = None
     command: Optional[CommandQueueItem] = None
-    verification: Optional[VerificationQueueItem] = None
 
 
 def decode_queue_payload(queue_name: str, raw: str) -> QueueEnvelope:
@@ -42,13 +32,6 @@ def decode_queue_payload(queue_name: str, raw: str) -> QueueEnvelope:
             raw=text,
             command=CommandQueueItem.model_validate(parsed),
         )
-    if queue_name.endswith(":verification"):
-        return QueueEnvelope(
-            queue_kind="verification",
-            queue_name=queue_name,
-            raw=text,
-            verification=VerificationQueueItem.model_validate(parsed),
-        )
     return QueueEnvelope(queue_kind="unknown", queue_name=queue_name, raw=text)
 
 
@@ -57,6 +40,14 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _safe_optional_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _normalize_payload(value: Any) -> dict[str, Any]:
@@ -82,7 +73,7 @@ def _iso_timestamp(value: Any) -> str:
 def build_runner_command_from_row(row: dict[str, Any]) -> RunnerCommand:
     command_type = str(row.get("command_type") or "").strip()
     account_id = _safe_int(row.get("account_id"))
-    deployment_id = _safe_int(row.get("deployment_id"))
+    deployment_id = _safe_optional_int(row.get("deployment_id"))
     runner_id = str(row.get("runner_id") or "").strip()
     slot_id = str(row.get("slot_id") or "").strip()
     payload = normalize_runner_command_payload(

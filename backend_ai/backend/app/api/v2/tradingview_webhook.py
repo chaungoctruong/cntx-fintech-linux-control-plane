@@ -23,6 +23,24 @@ def _tradingview_secret_header(*, x_secret: str | None, authorization: str | Non
     return raw
 
 
+def _safe_rejection_reason(exc: Exception) -> str:
+    reason = str(exc or "").replace("\n", " ").strip()
+    return (reason or type(exc).__name__)[:240]
+
+
+def _safe_tradingview_context(body: dict[str, Any], *, path_signal_id: str = "") -> dict[str, Any]:
+    signal_id = str(path_signal_id or body.get("signal_id") or "").strip()
+    return {
+        "body_keys": sorted(str(key) for key in body.keys()),
+        "signal_id": signal_id,
+        "action": str(body.get("action") or body.get("signal") or body.get("side") or "").strip()[:40],
+        "symbol_present": bool(str(body.get("symbol") or body.get("ticker") or "").strip()),
+        "deployment_present": bool(str(body.get("deployment_id") or "").strip()),
+        "account_present": bool(str(body.get("account_id") or "").strip()),
+        "secret_present": bool(str(body.get("secret") or "").strip()),
+    }
+
+
 async def _json_object_body(request: Request) -> dict[str, Any]:
     try:
         body = await request.json()
@@ -59,7 +77,12 @@ async def _dispatch_broadcast_request(
             ),
         )
     except Exception as exc:
-        log.warning("tradingview_broadcast_rejected error=%s", type(exc).__name__)
+        log.warning(
+            "tradingview_broadcast_rejected error=%s reason=%s context=%s",
+            type(exc).__name__,
+            _safe_rejection_reason(exc),
+            _safe_tradingview_context(body, path_signal_id=path_signal_id),
+        )
         raise translate_control_plane_error(exc) from exc
 
 
@@ -83,7 +106,12 @@ async def tradingview_alert(
             ),
         )
     except Exception as exc:
-        log.warning("tradingview_alert_rejected error=%s", type(exc).__name__)
+        log.warning(
+            "tradingview_alert_rejected error=%s reason=%s context=%s",
+            type(exc).__name__,
+            _safe_rejection_reason(exc),
+            _safe_tradingview_context(body),
+        )
         raise translate_control_plane_error(exc) from exc
 
 

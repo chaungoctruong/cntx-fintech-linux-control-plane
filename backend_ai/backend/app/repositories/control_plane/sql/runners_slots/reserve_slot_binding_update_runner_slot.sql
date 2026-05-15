@@ -15,7 +15,7 @@ WHERE s.runner_id = %s
       WHERE n.runner_id = s.runner_id
         AND (
             COALESCE(NULLIF(SUBSTRING(s.slot_id FROM '([0-9]+)$'), ''), '') = ''
-            OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= GREATEST(1, n.max_slots)
+            OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(10, GREATEST(1, n.max_slots))
         )
         AND n.status = 'online'
         AND COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'maintenance_mode'), '')), 'false')
@@ -28,14 +28,14 @@ WHERE s.runner_id = %s
             NOT IN ('true', '1', 'yes', 'y', 'on')
         AND COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'dispatch_paused'), '')), 'false')
             NOT IN ('true', '1', 'yes', 'y', 'on')
-        AND COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'verification_paused'), '')), 'false')
+        AND COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'login_paused'), '')), 'false')
             NOT IN ('true', '1', 'yes', 'y', 'on')
         AND COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'warm_guard_paused'), '')), 'false')
             NOT IN ('true', '1', 'yes', 'y', 'on')
         AND COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'warm_pool_paused'), '')), 'false')
             NOT IN ('true', '1', 'yes', 'y', 'on')
         AND COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'runner_state'), '')), 'online')
-            NOT IN ('draining', 'frozen', 'maintenance', 'paused', 'verification_paused', 'warm_guard_paused')
+            NOT IN ('draining', 'frozen', 'maintenance', 'paused', 'login_paused', 'warm_guard_paused')
         AND (
             COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'accepting_new_accounts'), '')), 'false')
                 IN ('true', '1', 'yes', 'y', 'on')
@@ -54,7 +54,7 @@ WHERE s.runner_id = %s
               AND d.status IN ('start_requested', 'starting', 'running', 'stop_requested')
         ) < CASE
             WHEN COALESCE(n.metadata_json->>'active_limit', '') ~ '^[0-9]+$'
-                THEN GREATEST(1, (n.metadata_json->>'active_limit')::INTEGER)
+                THEN LEAST(%s, GREATEST(1, (n.metadata_json->>'active_limit')::INTEGER))
             ELSE %s
         END
         AND EXISTS (
@@ -63,7 +63,7 @@ WHERE s.runner_id = %s
             WHERE hs.runner_id = n.runner_id
               AND (
                   COALESCE(NULLIF(SUBSTRING(hs.slot_id FROM '([0-9]+)$'), ''), '') = ''
-                  OR CAST(SUBSTRING(hs.slot_id FROM '([0-9]+)$') AS INTEGER) <= GREATEST(1, n.max_slots)
+                  OR CAST(SUBSTRING(hs.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(10, GREATEST(1, n.max_slots))
               )
               AND hs.status IN ('ready', 'allocated')
         )
@@ -95,16 +95,29 @@ WHERE s.runner_id = %s
                       AND LOWER(NULLIF(BTRIM(COALESCE(s.metadata_json->>'sticky_account_id', '')), '')) NOT IN ('null', 'none', '0')
                   )
               )
-  AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'control_plane_state'), '')), 'ready')
-        NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
-  AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'current_control_plane_state'), '')), 'ready')
-        NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
-  AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'runner_state'), '')), 'ready')
-        NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
-  AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'current_runner_state'), '')), 'ready')
-        NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
+  AND (
+      EXISTS (
+          SELECT 1
+          FROM account_login_reservations v
+          WHERE v.account_id = %s
+            AND v.runner_id = s.runner_id
+            AND v.slot_id = s.slot_id
+            AND v.status = 'claimed'
+            AND (v.expires_at IS NULL OR v.expires_at > NOW())
+      )
+      OR (
+          COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'control_plane_state'), '')), 'ready')
+              NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
+          AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'current_control_plane_state'), '')), 'ready')
+              NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
+          AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'runner_state'), '')), 'ready')
+              NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
+          AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'current_runner_state'), '')), 'ready')
+              NOT IN ('allocated', 'broken', 'degraded', 'disabled', 'offline', 'running', 'starting', 'stopping', 'verifying')
+      )
+  )
   AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'mt5_liveness_state'), '')), 'ready')
         NOT IN ('broken', 'dead', 'degraded', 'disabled', 'failed', 'offline', 'stale')
-  AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'verification_status'), '')), '')
+  AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'login_slot_status'), '')), '')
         NOT IN ('dispatched', 'pending', 'queued', 'running', 'verifying')
 RETURNING runner_id, slot_id, status, current_account_id

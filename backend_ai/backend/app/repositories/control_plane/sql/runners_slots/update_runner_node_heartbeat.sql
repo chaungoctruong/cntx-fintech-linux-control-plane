@@ -1,5 +1,6 @@
 UPDATE runner_nodes
 SET last_heartbeat_at = NOW(),
+    max_slots = %s,
     metadata_json = %s::jsonb,
     updated_at = NOW(),
     status = CASE

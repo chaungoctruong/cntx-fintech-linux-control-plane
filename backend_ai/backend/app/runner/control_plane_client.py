@@ -134,9 +134,6 @@ class MT5RunnerControlPlaneClient:
     async def fetch_deployment_package(self, deployment_id: int) -> dict[str, Any]:
         return await self._request("GET", f"/api/v2/runner/deployments/{int(deployment_id)}/package")
 
-    async def submit_verification_result(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return await self._request("POST", "/api/v2/runner/account-verifications/result", json_payload=payload)
-
     async def get_command(self, command_id: str) -> dict[str, Any]:
         return await self._request("GET", f"/api/v2/runner/commands/{command_id}")
 

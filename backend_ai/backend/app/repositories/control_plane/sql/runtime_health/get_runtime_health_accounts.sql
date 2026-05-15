@@ -4,5 +4,5 @@ SELECT
         WHERE verified_at IS NOT NULL
            OR status = 'connected'
     ) AS connected_accounts,
-    COUNT(*) FILTER (WHERE status = 'pending_verification') AS pending_accounts
+    COUNT(*) FILTER (WHERE status = 'pending_login') AS pending_accounts
 FROM broker_accounts

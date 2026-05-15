@@ -31,8 +31,8 @@ _KNOWN_EVENTS = (
     "SLOT_DEGRADED",
     "SLOT_BROKEN",
     "circuit_breaker.trigger",
-    "verification.completed",
-    "verification.failed",
+    "login_slot.completed",
+    "login_slot.failed",
 )
 
 

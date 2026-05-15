@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 
 from app.api.v2.control_plane_deps import service_dep, user_dep
 from app.core.internal_auth import require_backend_api_key
+from app.events.command_delivery_observability import CommandDeliveryObservabilityService
 from app.infra.redis_streams import EVENT_STREAM_KEY
 from app.repositories.control_plane_repository import ControlPlaneRepository
 from app.services.control_plane_service import MT5ControlPlaneService
@@ -31,8 +32,8 @@ _HEALTHZ_SCHEDULER_STALE_DOWN_SEC = 1800  # 30 min
 
 
 # Threshold mac dinh; co the override bang settings sau khi thu nghiem voi user thuc.
-_DEFAULT_VERIFICATION_QUEUE_PER_RUNNER_DEGRADED = 10
 _DEFAULT_COMMAND_QUEUE_PER_RUNNER_DEGRADED = 20
+_DEFAULT_LOGIN_SLOT_BACKLOG_PER_RUNNER_DEGRADED = 20
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -55,7 +56,7 @@ def _safe_optional_int(value: Any) -> int | None:
 
 def _ops_thresholds() -> dict[str, int]:
     return {
-        "verification_backlog": max(1, int(getattr(settings, "OPS_VERIFICATION_BACKLOG_THRESHOLD", 20) or 20)),
+        "login_slot_backlog": max(1, int(getattr(settings, "OPS_LOGIN_SLOT_BACKLOG_THRESHOLD", 20) or 20)),
         "command_backlog": max(1, int(getattr(settings, "OPS_COMMAND_BACKLOG_THRESHOLD", 40) or 40)),
         "event_backlog": max(1, int(getattr(settings, "OPS_EVENT_BACKLOG_THRESHOLD", 100) or 100)),
     }
@@ -78,7 +79,7 @@ async def _collect_ops_redis_queues(runner_ids: list[str]) -> dict[str, Any]:
     ids = sorted({str(item or "").strip() for item in runner_ids if str(item or "").strip()})
     out: dict[str, Any] = {
         "redis_available": False,
-        "redis_verification_depth": 0,
+        "redis_login_slot_depth": 0,
         "redis_command_depth": 0,
         "redis_event_pending": 0,
         "redis_event_stream_length": 0,
@@ -96,13 +97,10 @@ async def _collect_ops_redis_queues(runner_ids: list[str]) -> dict[str, Any]:
         for runner_id in ids:
             depths = {
                 "runner_id": runner_id,
-                "verification": _safe_int(await redis.llen(f"mt5:runner:{runner_id}:verification")),
-                "verification_processing": _safe_int(await redis.llen(f"mt5:runner:{runner_id}:verification:processing")),
                 "commands": _safe_int(await redis.llen(f"mt5:runner:{runner_id}:commands")),
                 "commands_processing": _safe_int(await redis.llen(f"mt5:runner:{runner_id}:commands:processing")),
             }
             out["runner_queue_depths"].append(depths)
-            out["redis_verification_depth"] += depths["verification"]
             out["redis_command_depth"] += depths["commands"]
         out["redis_event_stream_length"] = _safe_int(await redis.xlen(EVENT_STREAM_KEY))
         out["redis_event_pending"] = await _safe_xpending_count(
@@ -126,16 +124,12 @@ def _runner_queue_depths_for(queues: dict[str, Any], runner_id: str) -> dict[str
         if isinstance(item, dict) and str(item.get("runner_id") or "").strip() == runner_id_s:
             return {
                 "redis_available": bool(queues.get("redis_available")),
-                "verification": _safe_int(item.get("verification")),
-                "verification_processing": _safe_int(item.get("verification_processing")),
                 "commands": _safe_int(item.get("commands")),
                 "commands_processing": _safe_int(item.get("commands_processing")),
                 "error": queues.get("error"),
             }
     return {
         "redis_available": bool(queues.get("redis_available")),
-        "verification": 0,
-        "verification_processing": 0,
         "commands": 0,
         "commands_processing": 0,
         "error": queues.get("error"),
@@ -244,15 +238,13 @@ def _build_runner_readiness(
             or slots_raw.get("ready")
         ),
         "active": _safe_int(slots_raw.get("active")),
-        "verifying": _safe_int(slots_raw.get("verifying")),
+        "login_reserved": _safe_int(slots_raw.get("login_reserved") or slots_raw.get("verifying")),
         "reserved": _safe_int(slots_raw.get("reserved")),
         "degraded": _safe_int(slots_raw.get("degraded")),
         "broken": _safe_int(slots_raw.get("broken")),
     }
     queue_summary = {
         "redis_available": bool(queues.get("redis_available")),
-        "verification": _safe_int(queues.get("verification")),
-        "verification_processing": _safe_int(queues.get("verification_processing")),
         "commands": _safe_int(queues.get("commands")),
         "commands_processing": _safe_int(queues.get("commands_processing")),
     }
@@ -264,7 +256,6 @@ def _build_runner_readiness(
 
     blockers: list[str] = []
     warnings: list[str] = []
-    verification_queue_depth = queue_summary["verification"] + queue_summary["verification_processing"]
     command_queue_depth = queue_summary["commands"] + queue_summary["commands_processing"]
     queue_thresholds = _ops_thresholds()
     if not registered:
@@ -294,14 +285,10 @@ def _build_runner_readiness(
         (warnings if has_start_capacity else blockers).append("broken_slots")
     if slots["active"] > 0:
         (warnings if has_start_capacity else blockers).append("active_slots")
-    if slots["verifying"] > 0:
-        (warnings if has_start_capacity else blockers).append("verifying_slots")
+    if slots["login_reserved"] > 0:
+        (warnings if has_start_capacity else blockers).append("login_reserved_slots")
     if not queue_summary["redis_available"]:
         blockers.append("redis_unavailable")
-    if verification_queue_depth > _safe_int(queue_thresholds.get("verification_backlog"), 20):
-        blockers.append("verification_queue_backlog")
-    elif verification_queue_depth > 0:
-        (warnings if has_start_capacity else blockers).append("verification_queue_backlog")
     if command_queue_depth > _safe_int(queue_thresholds.get("command_backlog"), 40):
         blockers.append("command_queue_backlog")
     elif command_queue_depth > 0:
@@ -343,12 +330,11 @@ def _build_ops_summary(
     runner_queue_depths = list(queues.get("runner_queue_depths") or [])
     runners_raw = dict(snapshot.get("runners") or {})
     slots_raw = dict(snapshot.get("slots") or {})
-    verification_raw = dict(snapshot.get("verification") or {})
+    login_slots_raw = dict(snapshot.get("login_slots") or {})
     commands_raw = dict(snapshot.get("commands") or {})
     deployments_raw = dict(snapshot.get("deployments") or {})
     bindings_raw = dict(snapshot.get("bindings") or {})
 
-    verification_processing = _sum_runner_queue_depths(runner_queue_depths, "verification_processing")
     command_processing_queue = _sum_runner_queue_depths(runner_queue_depths, "commands_processing")
 
     runners = {
@@ -361,18 +347,18 @@ def _build_ops_summary(
         "total": _safe_int(slots_raw.get("total")),
         "ready": _safe_int(slots_raw.get("ready")),
         "active": _safe_int(slots_raw.get("active")),
-        "verifying": _safe_int(slots_raw.get("verifying")),
+        "login_reserved": _safe_int(slots_raw.get("login_reserved") or slots_raw.get("verifying")),
         "degraded": _safe_int(slots_raw.get("degraded")),
         "broken": _safe_int(slots_raw.get("broken")),
         "available": _safe_int(slots_raw.get("available")),
     }
-    verification = {
-        "pending": _safe_int(verification_raw.get("pending")),
-        "dispatched": _safe_int(verification_raw.get("dispatched")),
-        "processing": verification_processing,
-        "failed_recent_1h": _safe_int(verification_raw.get("failed_recent_1h")),
-        "p50_ms": _safe_optional_int(verification_raw.get("p50_ms")),
-        "p95_ms": _safe_optional_int(verification_raw.get("p95_ms")),
+    login_slots = {
+        "pending": _safe_int(login_slots_raw.get("pending")),
+        "dispatched": _safe_int(login_slots_raw.get("dispatched")),
+        "verified": _safe_int(login_slots_raw.get("verified")),
+        "failed_recent_1h": _safe_int(login_slots_raw.get("failed_recent_1h")),
+        "p50_ms": _safe_optional_int(login_slots_raw.get("p50_ms")),
+        "p95_ms": _safe_optional_int(login_slots_raw.get("p95_ms")),
     }
     commands = {
         "pending": _safe_int(commands_raw.get("pending")),
@@ -388,7 +374,7 @@ def _build_ops_summary(
     }
     queue_summary = {
         "redis_available": bool(queues.get("redis_available")),
-        "redis_verification_depth": _safe_int(queues.get("redis_verification_depth")),
+        "redis_login_slot_depth": _safe_int(queues.get("redis_login_slot_depth")),
         "redis_command_depth": _safe_int(queues.get("redis_command_depth")),
         "redis_event_pending": _safe_int(queues.get("redis_event_pending")),
         "redis_event_stream_length": _safe_int(queues.get("redis_event_stream_length")),
@@ -401,21 +387,20 @@ def _build_ops_summary(
     alerts: list[str] = []
     warnings: list[str] = []
     cluster_capacity_available = bool(runners["online"] > 0 and slots["available"] > 0)
-    verification_backlog = max(
-        verification["pending"] + verification["dispatched"] + verification["processing"],
-        queue_summary["redis_verification_depth"] + verification_processing,
+    login_slot_backlog = max(
+        login_slots["pending"] + login_slots["dispatched"] + login_slots["verified"],
+        queue_summary["redis_login_slot_depth"],
     )
     command_backlog = max(
         commands["pending"] + commands["processing"],
         queue_summary["redis_command_depth"] + command_processing_queue,
     )
-    if verification_backlog > _safe_int(thresholds.get("verification_backlog"), 20):
-        alerts.append("verification_backlog")
+    if login_slot_backlog > _safe_int(thresholds.get("login_slot_backlog"), 20):
+        alerts.append("login_slot_backlog")
     if command_backlog > _safe_int(thresholds.get("command_backlog"), 40):
         alerts.append("command_backlog")
     if any(
-        _safe_int(item.get("verification")) > _safe_int(thresholds.get("verification_backlog"), 20)
-        or _safe_int(item.get("commands")) > _safe_int(thresholds.get("command_backlog"), 40)
+        _safe_int(item.get("commands")) > _safe_int(thresholds.get("command_backlog"), 40)
         for item in runner_queue_depths
         if isinstance(item, dict)
     ):
@@ -432,7 +417,7 @@ def _build_ops_summary(
         (warnings if cluster_capacity_available else alerts).append("stale_deployments")
     if runners["online"] > 0 and slots["total"] > 0 and slots["available"] <= 0:
         alerts.append("no_cluster_capacity")
-        if slots["degraded"] <= 0 and slots["broken"] <= 0 and slots["active"] + slots["verifying"] >= slots["total"]:
+        if slots["degraded"] <= 0 and slots["broken"] <= 0 and slots["active"] + slots["login_reserved"] >= slots["total"]:
             alerts.append("runner_full")
     if bindings["sticky_mismatch"] > 0:
         alerts.append("sticky_mismatch")
@@ -442,7 +427,7 @@ def _build_ops_summary(
         "updated_at": int(now or time.time()),
         "runners": runners,
         "slots": slots,
-        "verification": verification,
+        "login_slots": login_slots,
         "commands": commands,
         "queues": queue_summary,
         "deployments": deployments,
@@ -472,10 +457,10 @@ def _build_health_badge(dashboard: dict[str, Any]) -> dict[str, Any]:
     degraded_runners = int(summary.get("degraded_runners") or 0)
     full_runners = int(summary.get("full_runners") or 0)
     stale_runners = int(summary.get("stale_runners") or 0)
-    verification_q = int(summary.get("verification_queue_depth") or 0)
+    login_slot_q = int(summary.get("login_slot_queue_depth") or 0)
     command_q = int(summary.get("command_queue_depth") or 0)
 
-    avg_verif = _avg_per_runner(verification_q, max(total_runners, 1))
+    avg_login_slot = _avg_per_runner(login_slot_q, max(total_runners, 1))
     avg_cmd = _avg_per_runner(command_q, max(total_runners, 1))
 
     if total_runners == 0:
@@ -498,14 +483,14 @@ def _build_health_badge(dashboard: dict[str, Any]) -> dict[str, Any]:
         or stale_runners > 0
         or degraded_runners > 0
         or full_runners > 0
-        or avg_verif > _DEFAULT_VERIFICATION_QUEUE_PER_RUNNER_DEGRADED
+        or avg_login_slot > _DEFAULT_LOGIN_SLOT_BACKLOG_PER_RUNNER_DEGRADED
         or avg_cmd > _DEFAULT_COMMAND_QUEUE_PER_RUNNER_DEGRADED
     ):
         level = "degraded"
-        if avg_verif > _DEFAULT_VERIFICATION_QUEUE_PER_RUNNER_DEGRADED:
-            message_vi = "Hệ thống đang xử lý nhiều yêu cầu xác thực. Vui lòng đợi một lát."
-            message_en = "System is processing many verification requests. Please wait a moment."
-            reason = "verification_backlog"
+        if avg_login_slot > _DEFAULT_LOGIN_SLOT_BACKLOG_PER_RUNNER_DEGRADED:
+            message_vi = "Hệ thống đang xử lý nhiều phiên đăng nhập MT5. Vui lòng đợi một lát."
+            message_en = "System is processing many MT5 login slots. Please wait a moment."
+            reason = "login_slot_backlog"
         elif avg_cmd > _DEFAULT_COMMAND_QUEUE_PER_RUNNER_DEGRADED:
             message_vi = "Hàng lệnh đang đông. Bot vẫn chạy nhưng phản hồi có thể chậm hơn bình thường."
             message_en = "Command queue is busy. Bots still run but responses may be slower than usual."
@@ -541,14 +526,14 @@ def _build_health_badge(dashboard: dict[str, Any]) -> dict[str, Any]:
             "degraded_runners": degraded_runners,
             "full_runners": full_runners,
             "stale_runners": stale_runners,
-            "verification_queue_depth": verification_q,
+            "login_slot_queue_depth": login_slot_q,
             "command_queue_depth": command_q,
-            "avg_verification_queue_per_runner": round(avg_verif, 2),
+            "avg_login_slot_queue_per_runner": round(avg_login_slot, 2),
             "avg_command_queue_per_runner": round(avg_cmd, 2),
             "capacity_available": bool(summary.get("capacity_available")),
         },
         "thresholds": {
-            "verification_queue_per_runner_degraded": _DEFAULT_VERIFICATION_QUEUE_PER_RUNNER_DEGRADED,
+            "login_slot_queue_per_runner_degraded": _DEFAULT_LOGIN_SLOT_BACKLOG_PER_RUNNER_DEGRADED,
             "command_queue_per_runner_degraded": _DEFAULT_COMMAND_QUEUE_PER_RUNNER_DEGRADED,
         },
         "generated_at": int(time.time()),
@@ -944,6 +929,29 @@ async def system_ops_summary(
     return _build_ops_summary(snapshot, queues)
 
 
+@router.get("/command-delivery-observability")
+async def system_command_delivery_observability(
+    window_sec: int = Query(default=3600, ge=60, le=86400),
+    stale_sec: int = Query(default=300, ge=10, le=86400),
+    limit: int = Query(default=50, ge=1, le=500),
+    _: dict = Depends(require_backend_api_key),
+    service: MT5ControlPlaneService = Depends(service_dep),
+) -> dict[str, Any]:
+    """Internal DLQ/retry view for runner command delivery.
+
+    Read-only: Postgres SELECT + Redis LLEN/XLEN/XPENDING only. This powers
+    ops checks so commands cannot get stuck silently between Linux and Windows.
+    """
+    snapshot = service.ops_summary_snapshot()
+    observer = CommandDeliveryObservabilityService()
+    return await observer.snapshot(
+        runner_ids=list(snapshot.get("runner_ids") or []),
+        window_sec=window_sec,
+        stale_sec=stale_sec,
+        limit=limit,
+    )
+
+
 @router.get("/runner-readiness/{runner_id}")
 async def system_runner_readiness(
     runner_id: str,
@@ -990,7 +998,7 @@ async def system_health_badge(
             "message_en": "Could not retrieve system status. Please retry.",
             "summary": {},
             "thresholds": {
-                "verification_queue_per_runner_degraded": _DEFAULT_VERIFICATION_QUEUE_PER_RUNNER_DEGRADED,
+                "login_slot_queue_per_runner_degraded": _DEFAULT_LOGIN_SLOT_BACKLOG_PER_RUNNER_DEGRADED,
                 "command_queue_per_runner_degraded": _DEFAULT_COMMAND_QUEUE_PER_RUNNER_DEGRADED,
             },
             "generated_at": int(time.time()),

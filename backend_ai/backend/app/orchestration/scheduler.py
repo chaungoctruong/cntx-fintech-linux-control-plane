@@ -9,6 +9,7 @@ from typing import Any, Optional
 from app.risk.orchestration_policy import requires_dedicated_runner
 
 RUNNER_ACTIVE_LIMIT_DEFAULT = 10
+RUNNER_NODE_SLOT_LIMIT_DEFAULT = RUNNER_ACTIVE_LIMIT_DEFAULT
 IPC_READY_FRESHNESS_SEC_DEFAULT = 3600
 RESIDENT_WORKER_FRESHNESS_SEC_DEFAULT = 120
 
@@ -20,7 +21,7 @@ _MAINTENANCE_BOOL_KEYS = {
     "frozen",
     "freeze",
     "dispatch_paused",
-    "verification_paused",
+    "login_paused",
     "warm_guard_paused",
     "warm_guard_pause",
     "warm_pool_paused",
@@ -35,7 +36,7 @@ _MAINTENANCE_STATE_VALUES = {
     "mt5_runtime_maintenance",
     "paused",
     "pause",
-    "verification_paused",
+    "login_paused",
     "warm_guard_paused",
 }
 
@@ -369,8 +370,8 @@ def _runner_queue_block_reason(slot: dict[str, Any]) -> Optional[str]:
                 "command_queue_depth",
                 "commands_queue_depth",
                 "runner_commands_queue_depth",
-                "runner_verification_queue_depth",
-                "verification_queue_depth",
+                "runner_login_slot_queue_depth",
+                "login_slot_queue_depth",
             ),
         )
         if depth is not None and depth > max(0, threshold):
@@ -419,6 +420,7 @@ def _runner_capacity_block_reason(slot: dict[str, Any]) -> Optional[str]:
         "running_deployments",
     )
     active_limit = _first_int(slot, metadata, "runner_active_limit", "active_limit") or RUNNER_ACTIVE_LIMIT_DEFAULT
+    active_limit = max(1, min(active_limit, RUNNER_NODE_SLOT_LIMIT_DEFAULT))
     degraded_count = _first_int(slot, metadata, "runner_degraded_slots", "degraded_slots")
     broken_count = _first_int(slot, metadata, "runner_broken_slots", "broken_slots") or 0
     healthy_slots = _first_int(slot, metadata, "runner_healthy_slots", "healthy_slots")
@@ -458,7 +460,7 @@ def _slot_within_effective_capacity(slot: dict[str, Any]) -> bool:
         registered_max_slots = _first_int(slot, metadata, "max_slots", "runner_max_slots") if runner_total_slots is not None else None
     runtime_effective_slots = _first_int(slot, metadata, "requested_slots", "effective_slots")
     phase10_effective_slots = _parse_int(metadata.get("phase10_effective_slots"))
-    limits = []
+    limits = [RUNNER_NODE_SLOT_LIMIT_DEFAULT]
     if registered_max_slots is not None and registered_max_slots > 0:
         limits.append(registered_max_slots)
     if phase10_effective_slots is not None and phase10_effective_slots > 0:
@@ -549,16 +551,19 @@ def _slot_metadata_marks_unavailable(
     ):
         return True
 
-    verification_status = str(
-        metadata.get("verification_status") or inventory.get("verification_status") or slot.get("verification_status") or ""
+    login_slot_status = str(
+        metadata.get("login_slot_status")
+        or inventory.get("login_slot_status")
+        or slot.get("login_slot_status")
+        or ""
     ).strip().lower()
-    verification_account_id = _parse_account_id(
-        metadata.get("verification_account_id")
-        or inventory.get("verification_account_id")
-        or slot.get("verification_account_id")
+    login_slot_account_id = _parse_account_id(
+        metadata.get("login_slot_account_id")
+        or inventory.get("login_slot_account_id")
+        or slot.get("login_slot_account_id")
     )
-    if verification_status in {"pending", "queued", "running", "verifying", "dispatched"}:
-        return verification_account_id is None or verification_account_id != int(account_id)
+    if login_slot_status in {"pending", "queued", "running", "verifying", "dispatched", "verified"}:
+        return login_slot_account_id is None or login_slot_account_id != int(account_id)
 
     return False
 
@@ -707,17 +712,20 @@ def _slot_retry_penalty(slot: dict[str, Any]) -> int:
     metadata = _slot_metadata(slot)
     inventory = _slot_inventory_metadata(slot)
     failure_count = (
-        _first_int_from_dicts(metadata, inventory, slot, keys=("verification_failure_count", "failure_count"))
+        _first_int_from_dicts(metadata, inventory, slot, keys=("login_failure_count", "failure_count"))
         or 0
     )
-    verification_status = str(
-        metadata.get("verification_status") or inventory.get("verification_status") or slot.get("verification_status") or ""
+    login_slot_status = str(
+        metadata.get("login_slot_status")
+        or inventory.get("login_slot_status")
+        or slot.get("login_slot_status")
+        or ""
     ).strip().lower()
     last_reason = str(metadata.get("last_reason") or inventory.get("last_reason") or slot.get("last_reason") or "").strip().lower()
     last_error = str(metadata.get("last_error") or inventory.get("last_error") or slot.get("last_error") or "").strip().lower()
-    if verification_status in {"failed", "timeout"}:
+    if login_slot_status in {"failed", "timeout"}:
         failure_count = max(1, failure_count)
-    if "verification_failed" in last_reason or "verification" in last_error:
+    if "login_slot_failed" in last_reason or "login" in last_error:
         failure_count = max(1, failure_count)
     return max(0, failure_count)
 
@@ -991,7 +999,7 @@ def rank_slots_for_account(
     candidates: list[tuple[int, float, int, int, str, str]] = []
     for slot in candidate_slots:
         runner_id = str(slot.get("runner_id") or "")
-        total_slots = max(1, int(slot.get("max_slots") or 1))
+        total_slots = max(1, min(int(slot.get("max_slots") or 1), RUNNER_NODE_SLOT_LIMIT_DEFAULT))
         active_count = _parse_int(slot.get("runner_active_count"))
         if active_count is None:
             active_count = 1 if slot.get("current_account_id") is not None else 0

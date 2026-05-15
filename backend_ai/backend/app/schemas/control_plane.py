@@ -99,19 +99,6 @@ class AccountConnectRequest(BaseModel):
     label: Optional[str] = None
 
 
-class AccountVerifyRequest(BaseModel):
-    account_id: int
-
-
-class AccountVerificationResultRequest(BaseModel):
-    job_id: int
-    ok: bool
-    error_text: Optional[str] = None
-    runner_id: Optional[str] = None
-    slot_id: Optional[str] = None
-    payload: dict[str, Any] = Field(default_factory=dict)
-
-
 class CommandDeliveryUpdateRequest(BaseModel):
     runner_id: Optional[str] = None
     slot_id: Optional[str] = None

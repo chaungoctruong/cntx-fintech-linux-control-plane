@@ -23,7 +23,7 @@ LEFT JOIN LATERAL (
     WHERE s.runner_id = n.runner_id
       AND (
           COALESCE(NULLIF(SUBSTRING(s.slot_id FROM '([0-9]+)$'), ''), '') = ''
-          OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= GREATEST(1, n.max_slots)
+          OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(10, GREATEST(1, n.max_slots))
       )
 ) slot_stats ON TRUE
 ORDER BY n.runner_id ASC

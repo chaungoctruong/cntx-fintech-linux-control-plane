@@ -27,13 +27,13 @@ SELECT
         ) < (NOW() - (%s * INTERVAL '1 second'))
     ) AS is_stale,
     bind.account_id AS sticky_account_id,
-    ver.id AS verification_job_id,
-    ver.account_id AS verification_account_id,
-    ver.status AS verification_job_status,
-    ver.trace_id AS verification_trace_id,
-    ver.requested_at AS verification_requested_at,
-    ver.dispatched_at AS verification_dispatched_at,
-    ver.updated_at AS verification_updated_at,
+    login_hold.id AS login_reservation_id,
+    login_hold.account_id AS login_reservation_account_id,
+    login_hold.status AS login_reservation_status,
+    login_hold.trace_id AS login_reservation_trace_id,
+    login_hold.requested_at AS login_reservation_requested_at,
+    login_hold.dispatched_at AS login_reservation_dispatched_at,
+    login_hold.updated_at AS login_reservation_updated_at,
     dep.id AS active_deployment_id,
     dep.status AS active_deployment_status,
     dep.health_status AS active_deployment_health_status
@@ -52,13 +52,13 @@ LEFT JOIN LATERAL (
         v.requested_at,
         v.dispatched_at,
         v.updated_at
-    FROM account_verification_jobs v
+    FROM account_login_reservations v
     WHERE v.runner_id = s.runner_id
       AND v.slot_id = s.slot_id
-      AND v.status IN ('pending', 'dispatched')
+      AND v.status IN ('pending', 'dispatched', 'verified')
     ORDER BY v.updated_at DESC, v.id DESC
     LIMIT 1
-) ver ON TRUE
+) login_hold ON TRUE
 LEFT JOIN LATERAL (
     SELECT
         d.id,
@@ -75,6 +75,6 @@ LEFT JOIN LATERAL (
 WHERE s.runner_id = %s
   AND (
       COALESCE(NULLIF(SUBSTRING(s.slot_id FROM '([0-9]+)$'), ''), '') = ''
-      OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= GREATEST(1, n.max_slots)
+      OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(10, GREATEST(1, n.max_slots))
   )
 ORDER BY s.slot_id ASC

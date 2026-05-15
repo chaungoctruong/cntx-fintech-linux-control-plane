@@ -44,7 +44,6 @@ class ControlPlaneAccessLogNoiseFilter(logging.Filter):
         ("GET", "/api/v2/system/runner-readiness"),
         ("POST", "/api/v2/runner/heartbeat"),
         ("POST", "/api/v2/runner/events"),
-        ("POST", "/api/v2/runner/account-verifications/result"),
     }
 
     @staticmethod
@@ -71,7 +70,7 @@ class ControlPlaneAccessLogNoiseFilter(logging.Filter):
         if (method, path) in cls._NOISY_SUCCESS_ENDPOINTS:
             return True
 
-        if method == "GET" and path.startswith("/api/v2/accounts/verifications/"):
+        if method == "GET" and path.startswith("/api/v2/accounts/login-slots/"):
             return True
 
         if method == "POST" and path.startswith("/api/v2/runner/commands/") and path.endswith("/delivery"):

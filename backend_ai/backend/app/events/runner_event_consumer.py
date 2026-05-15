@@ -19,6 +19,29 @@ from app.services.store_service import get_process_store
 log = logging.getLogger("runner_event_consumer")
 
 
+def _clean(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _canonical_slot_id(value: Any) -> str:
+    raw = _clean(value)
+    if raw.lower().startswith("slot_"):
+        return f"slot-{raw[5:]}"
+    return raw
+
+
+def _truthy(value: Any) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "ok", "ready", "healthy", "verified"}
+
+
+def _login_slot_command_type(payload: dict[str, Any]) -> str:
+    return (
+        _clean(payload.get("requested_cmd_type"))
+        or _clean(payload.get("command_type"))
+        or _clean(payload.get("cmd_type"))
+    ).upper()
+
+
 class RunnerEventConsumerService:
     def __init__(
         self,
@@ -56,16 +79,48 @@ class RunnerEventConsumerService:
             payload = json.loads(payload_raw)
         except Exception:
             payload = {"_raw_payload_json": payload_raw}
+        event_type = _clean(fields.get("event_type")).upper()
+        command_id = _clean(fields.get("command_id")) or _clean(payload.get("command_id")) or None
+        runner_id = _clean(fields.get("runner_id")) or _clean(payload.get("runner_id")) or None
+        slot_id = _canonical_slot_id(fields.get("slot_id") or payload.get("slot_id")) or None
+        account_id = int(fields["account_id"]) if _clean(fields.get("account_id")) else None
+        deployment_id = int(fields["deployment_id"]) if _clean(fields.get("deployment_id")) else None
+        trace_id = _clean(fields.get("trace_id")) or _clean(payload.get("trace_id")) or None
+        severity = _clean(fields.get("severity")) or "info"
+
+        if event_type == "RUNTIME_LOG" and _login_slot_command_type(payload) == "RESERVE_OR_LOGIN_SLOT":
+            prepared = _truthy(payload.get("prepared"))
+            status = _clean(payload.get("status")).lower()
+            error_text = _clean(payload.get("error") or payload.get("reason") or payload.get("message"))
+            if command_id and (prepared or status in {"healthy", "verified", "ready"}):
+                self._repo.complete_login_reservation(
+                    command_id=command_id,
+                    ok=True,
+                    runner_id=runner_id,
+                    slot_id=slot_id,
+                    error_text=None,
+                    payload={**payload, "stream_id": stream_id, "compat_event_type": "RUNTIME_LOG_PREPARED"},
+                    ttl_sec=int(payload.get("login_slot_ttl_sec") or 300),
+                )
+            elif command_id and status in {"failed", "error", "broken"}:
+                self._repo.complete_login_reservation(
+                    command_id=command_id,
+                    ok=False,
+                    runner_id=runner_id,
+                    slot_id=slot_id,
+                    error_text=error_text or "runtime_log_login_slot_failed",
+                    payload={**payload, "stream_id": stream_id, "compat_event_type": "RUNTIME_LOG_FAILED"},
+                )
         self._repo.upsert_execution_audit(
             event_id=str(fields.get("event_id") or "").strip(),
-            command_id=str(fields.get("command_id") or "").strip() or None,
-            trace_id=str(fields.get("trace_id") or "").strip() or None,
-            account_id=int(fields["account_id"]) if str(fields.get("account_id") or "").strip() else None,
-            deployment_id=int(fields["deployment_id"]) if str(fields.get("deployment_id") or "").strip() else None,
-            runner_id=str(fields.get("runner_id") or "").strip() or None,
-            slot_id=str(fields.get("slot_id") or "").strip() or None,
-            event_type=str(fields.get("event_type") or "").strip(),
-            severity=str(fields.get("severity") or "info").strip() or "info",
+            command_id=command_id,
+            trace_id=trace_id,
+            account_id=account_id,
+            deployment_id=deployment_id,
+            runner_id=runner_id,
+            slot_id=slot_id,
+            event_type=event_type,
+            severity=severity,
             audit_status="stream_projected",
             payload=payload,
             source_stream_id=stream_id,

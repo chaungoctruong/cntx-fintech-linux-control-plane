@@ -194,7 +194,7 @@ async def delete_my_account(
     """GDPR right-to-erasure: soft-delete user.
 
     - Stop tat ca running deployment.
-    - Cancel tat ca verification job kep.
+    - Release tat ca login-slot reservation kep.
     - Mark accounts.status='disconnected', clear credentials encrypted blob.
     - Audit log + return summary.
 

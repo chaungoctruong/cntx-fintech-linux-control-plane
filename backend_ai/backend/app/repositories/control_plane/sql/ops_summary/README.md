@@ -1,12 +1,12 @@
 # `ops_summary/` — SQL snapshot vận hành
 
-Một lần query gom **số liệu** runners, slots, verification, commands, deployments, events, binding — phục vụ endpoint ops/monitor.
+Một lần query gom **số liệu** runners, slots, login slots, commands, deployments, events, binding — phục vụ endpoint ops/monitor.
 
 ## File `.sql` (inventory)
 
 - `get_ops_summary_runners.sql`
 - `get_ops_summary_slots.sql`
-- `get_ops_summary_verification.sql`
+- `get_ops_summary_login_slots.sql`
 - `get_ops_summary_commands.sql`
 - `get_ops_summary_deployments.sql`
 - `get_ops_summary_events.sql`

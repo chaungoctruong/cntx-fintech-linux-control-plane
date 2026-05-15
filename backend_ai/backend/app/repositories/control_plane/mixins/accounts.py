@@ -6,7 +6,7 @@ from app.models.control_plane import ACTIVE_DEPLOYMENT_STATUSES
 from app.repositories.control_plane.query_loader import load_sql
 from app.repositories.control_plane.support import (
     _TERMINAL_DEPLOYMENT_STATUSES,
-    _decorate_account_verification_projection,
+    _decorate_account_login_projection,
     _json_payload,
     _norm,
 )
@@ -39,19 +39,19 @@ class ControlPlaneAccountsMixin:
                 """
                 INSERT INTO broker_accounts(
                     user_id, broker, server, login, status, label, is_active,
-                    verification_requested_at, verified_at, created_at, updated_at
+                    login_requested_at, verified_at, created_at, updated_at
                 )
-                VALUES(%s, %s, %s, %s, 'pending_verification', %s, TRUE, NOW(), NULL, NOW(), NOW())
+                VALUES(%s, %s, %s, %s, 'pending_login', %s, TRUE, NOW(), NULL, NOW(), NOW())
                 ON CONFLICT(user_id, broker, server, login) DO UPDATE SET
-                    status = 'pending_verification',
+                    status = 'pending_login',
                     label = COALESCE(EXCLUDED.label, broker_accounts.label),
                     last_error = NULL,
-                    verification_requested_at = NOW(),
+                    login_requested_at = NOW(),
                     verified_at = NULL,
                     is_active = TRUE,
                     updated_at = NOW()
                 RETURNING id, user_id, broker, server, login, status, label, is_active,
-                          last_error, verification_requested_at, verified_at, created_at, updated_at
+                          last_error, login_requested_at, verified_at, created_at, updated_at
                 """,
                 (int(user_id), broker_s, server_s, login_s, label_s),
             )
@@ -198,15 +198,15 @@ class ControlPlaneAccountsMixin:
             cur.execute(
                 """
                 UPDATE broker_accounts
-                SET status = 'pending_verification',
+                SET status = 'pending_login',
                     last_error = NULL,
-                    verification_requested_at = NOW(),
+                    login_requested_at = NOW(),
                     verified_at = NULL,
                     is_active = TRUE,
                     updated_at = NOW()
                 WHERE id = %s AND user_id = %s
                 RETURNING id, user_id, broker, server, login, status, label, is_active,
-                         last_error, verification_requested_at, verified_at, created_at, updated_at
+                         last_error, login_requested_at, verified_at, created_at, updated_at
                 """,
                 (int(account_id), int(user_id)),
             )
@@ -226,7 +226,7 @@ class ControlPlaneAccountsMixin:
 
         Keeps execution/audit history, scrubs the encrypted credential blob, and
         blocks deletion while a bot is active or a START/STOP command is in
-        flight. Slot release is handled by service layer after verification
+        flight. Slot release is handled by service layer after login-slot
         cancellation so this write stays tightly scoped to account data.
         """
         clean_reason = (reason or "account_deleted_by_user")[:200]
@@ -315,30 +315,6 @@ class ControlPlaneAccountsMixin:
 
         return self._store._with_retry_locked(_do)
 
-    def verify_account(self, *, account_id: int, user_id: int, ok: bool = True, error_text: Optional[str] = None) -> dict[str, Any]:
-        status = "connected" if ok else "verification_failed"
-        is_active = bool(ok)
-        error_s = _norm(error_text) or None
-
-        def _do(con: Any, cur: Any) -> dict[str, Any]:
-            cur.execute(
-                """
-                UPDATE broker_accounts
-                SET status = %s,
-                    last_error = %s,
-                    is_active = %s,
-                    verified_at = CASE WHEN %s = 'connected' THEN NOW() ELSE NULL END,
-                    updated_at = NOW()
-                WHERE id = %s AND user_id = %s
-                RETURNING id, user_id, broker, server, login, status, label, is_active, last_error, verified_at, created_at, updated_at
-                """,
-                (status, error_s, is_active, status, int(account_id), int(user_id)),
-            )
-            row = cur.fetchone()
-            return dict(row or {})
-
-        return self._store._with_retry_locked(_do)
-
     def mark_account_runtime_login_result(
         self,
         *,
@@ -346,7 +322,7 @@ class ControlPlaneAccountsMixin:
         ok: bool,
         error_text: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
-        status = "connected" if ok else "verification_failed"
+        status = "connected" if ok else "login_failed"
         error_s = _norm(error_text) or None
 
         def _do(con: Any, cur: Any) -> Optional[dict[str, Any]]:
@@ -357,15 +333,15 @@ class ControlPlaneAccountsMixin:
                     last_error = %s,
                     is_active = TRUE,
                     verified_at = CASE WHEN %s = 'connected' THEN NOW() ELSE NULL END,
-                    verification_requested_at = CASE
+                    login_requested_at = CASE
                         WHEN %s = 'connected' THEN NULL
-                        ELSE COALESCE(verification_requested_at, NOW())
+                        ELSE COALESCE(login_requested_at, NOW())
                     END,
                     updated_at = NOW()
                 WHERE id = %s
                   AND status <> 'disconnected'
                 RETURNING id, user_id, broker, server, login, status, label, is_active,
-                          last_error, verified_at, verification_requested_at, created_at, updated_at
+                          last_error, verified_at, login_requested_at, created_at, updated_at
                 """,
                 (status, error_s, status, status, int(account_id)),
             )
@@ -381,7 +357,7 @@ class ControlPlaneAccountsMixin:
                 (int(account_id), int(user_id)),
             )
             row = cur.fetchone()
-            return _decorate_account_verification_projection(dict(row), account_status_key="status") if row else None
+            return _decorate_account_login_projection(dict(row), account_status_key="status") if row else None
 
         return self._store._with_retry_read(_do)
 
@@ -398,20 +374,21 @@ class ControlPlaneAccountsMixin:
                     a.status AS account_status,
                     a.label,
                     a.last_error,
-                    a.verification_requested_at AS account_verification_requested_at,
+                    a.login_requested_at,
                     c.password_encrypted,
                     bind.runner_id AS sticky_runner_id,
                     bind.slot_id AS sticky_slot_id,
                     bind.binding_state,
-                    ver.id AS verification_job_id,
-                    ver.status AS verification_job_status,
-                    ver.payload_json AS verification_payload_json,
-                    ver.runner_id AS verification_runner_id,
-                    ver.slot_id AS verification_slot_id,
-                    ver.trace_id AS verification_trace_id,
-                    ver.requested_at AS verification_requested_at,
-                    ver.dispatched_at AS verification_dispatched_at,
-                    ver.completed_at AS verification_completed_at,
+                    login_hold.id AS login_reservation_id,
+                    login_hold.status AS login_reservation_status,
+                    login_hold.payload_json AS login_reservation_payload_json,
+                    login_hold.runner_id AS login_reservation_runner_id,
+                    login_hold.slot_id AS login_reservation_slot_id,
+                    login_hold.trace_id AS login_reservation_trace_id,
+                    login_hold.requested_at AS login_reservation_requested_at,
+                    login_hold.dispatched_at AS login_reservation_dispatched_at,
+                    login_hold.completed_at AS login_reservation_completed_at,
+                    login_hold.expires_at AS login_reservation_expires_at,
                     dep.id AS deployment_id,
                     dep.bot_code,
                     dep.bot_name,
@@ -437,13 +414,13 @@ class ControlPlaneAccountsMixin:
                 LEFT JOIN LATERAL (
                     SELECT
                         id, status, payload_json, runner_id, slot_id, trace_id,
-                        requested_at, dispatched_at, completed_at
-                    FROM account_verification_jobs
+                        requested_at, dispatched_at, completed_at, expires_at
+                    FROM account_login_reservations
                     WHERE account_id = a.id
-                      AND requested_at >= COALESCE(a.verification_requested_at, a.created_at)
+                      AND status IN ('pending', 'dispatched', 'verified', 'claimed')
                     ORDER BY requested_at DESC, id DESC
                     LIMIT 1
-                ) ver ON TRUE
+                ) login_hold ON TRUE
                 LEFT JOIN LATERAL (
                     SELECT
                         id, bot_code, bot_name, profile_class, status, desired_state,
@@ -458,11 +435,7 @@ class ControlPlaneAccountsMixin:
                 (int(account_id),),
             )
             row = cur.fetchone()
-            return _decorate_account_verification_projection(
-                dict(row),
-                account_status_key="account_status",
-                job_status_key="verification_job_status",
-            ) if row else None
+            return dict(row) if row else None
 
         return self._store._with_retry_read(_do)
 
@@ -545,7 +518,7 @@ class ControlPlaneAccountsMixin:
                 (list(ACTIVE_DEPLOYMENT_STATUSES), int(user_id)),
             )
             return [
-                _decorate_account_verification_projection(dict(row), account_status_key="status")
+                _decorate_account_login_projection(dict(row), account_status_key="status")
                 for row in (cur.fetchall() or [])
             ]
 

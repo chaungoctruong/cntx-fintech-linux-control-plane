@@ -8,11 +8,16 @@ SELECT
     bind.runner_id,
     bind.slot_id,
     bind.binding_state,
-    ver.id AS verification_job_id,
-    ver.status AS verification_job_status,
-    ver.payload_json AS verification_payload_json,
-    ver.requested_at AS verification_requested_at,
-    ver.completed_at AS verification_completed_at,
+    login_hold.id AS login_reservation_id,
+    login_hold.status AS login_reservation_status,
+    login_hold.payload_json AS login_reservation_payload_json,
+    login_hold.runner_id AS login_reservation_runner_id,
+    login_hold.slot_id AS login_reservation_slot_id,
+    login_hold.trace_id AS login_reservation_trace_id,
+    login_hold.requested_at AS login_reservation_requested_at,
+    login_hold.dispatched_at AS login_reservation_dispatched_at,
+    login_hold.completed_at AS login_reservation_completed_at,
+    login_hold.expires_at AS login_reservation_expires_at,
     dep.id AS deployment_id,
     dep.bot_code,
     dep.bot_name,
@@ -34,12 +39,13 @@ LEFT JOIN LATERAL (
     LIMIT 1
 ) bind ON TRUE
 LEFT JOIN LATERAL (
-    SELECT id, status, payload_json, requested_at, completed_at
-    FROM account_verification_jobs
+    SELECT id, status, payload_json, runner_id, slot_id, trace_id,
+           requested_at, dispatched_at, completed_at, expires_at
+    FROM account_login_reservations
     WHERE account_id = a.id
     ORDER BY requested_at DESC, id DESC
     LIMIT 1
-) ver ON TRUE
+) login_hold ON TRUE
 LEFT JOIN LATERAL (
     SELECT id, bot_code, bot_name, status, health_status, last_heartbeat_at
     FROM bot_deployments

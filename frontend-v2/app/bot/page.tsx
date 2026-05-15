@@ -32,9 +32,9 @@ import {
   fetchMt5BotCatalog,
   fetchMiniappAccess,
   getBackendErrorCode,
-  pollMt5AccountVerificationJob,
+  pollMt5AccountLoginSlot,
   refreshCTraderConnection,
-  requestMt5AccountVerification,
+  requestMt5AccountLoginSlot,
   selectDefaultCTraderAccount,
   startCTraderDeployment,
   stopCTraderDeployment,
@@ -47,6 +47,7 @@ import {
   type ConnectMt5AccountRequest,
   type MT5AccountItem,
   type MT5BotCatalogItem,
+  type Mt5AccountLoginSlotResponse,
 } from "@/lib/api";
 import { readStoredMt5Broker, writeStoredMt5Broker } from "@/lib/mt5-preferences";
 import { getTelegramTenantUserId, waitForTelegramTenantUserId } from "@/lib/telegram";
@@ -144,15 +145,15 @@ type Notice = {
   message: string;
 };
 
-type Mt5VerificationPhase = "SUBMITTED" | "ASSIGNED" | "VERIFYING_MT5" | "VERIFIED" | "FAILED";
+type Mt5LoginSlotPhase = "SUBMITTED" | "ASSIGNED" | "LOGIN_IN_PROGRESS" | "READY" | "FAILED";
 
 type CTraderOnboardingTarget = "account_list" | "selection" | "control";
 
-const MT5_VERIFICATION_PHASE_LABEL: Record<Mt5VerificationPhase, string> = {
+const MT5_LOGIN_SLOT_PHASE_LABEL: Record<Mt5LoginSlotPhase, string> = {
   SUBMITTED: "Đang lưu thông tin...",
   ASSIGNED: "Đang chuẩn bị account...",
-  VERIFYING_MT5: "Đang chuẩn bị account...",
-  VERIFIED: "Đã lưu account thành công.",
+  LOGIN_IN_PROGRESS: "Đang đăng nhập MT5...",
+  READY: "Đã lưu account thành công.",
   FAILED: "MT5 báo lỗi đăng nhập.",
 };
 
@@ -581,7 +582,7 @@ function isReservedMt5ServerValue(server?: string | null): boolean {
 
 function isReadyMt5Account(account: MT5AccountItem): boolean {
   const status = String(account.status || "").trim().toLowerCase();
-  return status === "connected" || Boolean(account.verified_at) || (status === "pending_verification" && Boolean(account.has_credentials));
+  return status === "connected" || Boolean(account.verified_at);
 }
 
 function sortCTraderConnections(
@@ -661,7 +662,7 @@ export default function BotPage() {
   });
   const [telegramTenantUserId, setTelegramTenantUserId] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [mt5VerificationPhase, setMt5VerificationPhase] = useState<Mt5VerificationPhase | null>(null);
+  const [mt5LoginSlotPhase, setMt5LoginSlotPhase] = useState<Mt5LoginSlotPhase | null>(null);
   const [connectingCTrader, setConnectingCTrader] = useState(false);
   const [loadingCTraderState, setLoadingCTraderState] = useState(false);
   const [syncingCTraderAccounts, setSyncingCTraderAccounts] = useState(false);
@@ -1389,32 +1390,38 @@ export default function BotPage() {
     }
 
     setSubmitting(true);
-    setMt5VerificationPhase("SUBMITTED");
+    setMt5LoginSlotPhase("SUBMITTED");
 
     try {
       const connected = await connectMt5Account(payload);
-      setMt5VerificationPhase("SUBMITTED");
+      setMt5LoginSlotPhase("SUBMITTED");
 
-      const verifyStarted = await requestMt5AccountVerification({ account_id: connected.account_id });
-      const verifyJobId = Number(verifyStarted.job_id ?? verifyStarted.verification_job_id ?? verifyStarted.id ?? 0);
-      if (!verifyJobId) {
-        throw new BackendAPIError("Backend không trả verification_job_id sau khi tạo job xác minh.", {
+      const loginSlotStarted: Mt5AccountLoginSlotResponse = connected.login_reservation_id
+        ? connected.login_slot ?? {
+            ...connected,
+            id: connected.login_reservation_id,
+            login_reservation_id: connected.login_reservation_id,
+          }
+        : await requestMt5AccountLoginSlot({ account_id: connected.account_id });
+      const loginReservationId = Number(loginSlotStarted.login_reservation_id ?? loginSlotStarted.id ?? 0);
+      if (!loginReservationId) {
+        throw new BackendAPIError("Backend không trả login_reservation_id sau khi giữ slot đăng nhập.", {
           status: 502,
-          code: "verification_job_id_missing",
+          code: "login_reservation_id_missing",
         });
       }
-      setMt5VerificationPhase("VERIFYING_MT5");
-      const finalVerify = await pollMt5AccountVerificationJob(verifyJobId, { intervalMs: 2000, maxAttempts: 90 });
-      const terminal = String(finalVerify.job_status ?? finalVerify.status ?? "").toLowerCase();
-      if (terminal === "failed" || terminal === "cancelled") {
+      setMt5LoginSlotPhase("LOGIN_IN_PROGRESS");
+      const finalLoginSlot = await pollMt5AccountLoginSlot(loginReservationId);
+      const terminal = String(finalLoginSlot.status ?? "").toLowerCase();
+      if (terminal === "failed" || terminal === "expired" || terminal === "released") {
         const hint =
-          (typeof finalVerify.last_error === "string" && finalVerify.last_error) ||
-          (typeof finalVerify.user_message_key === "string" && finalVerify.user_message_key) ||
-          "Xác minh MT5 thất bại.";
-        throw new BackendAPIError(hint, { status: 409, code: "mt5_verification_failed" });
+          (typeof finalLoginSlot.last_error === "string" && finalLoginSlot.last_error) ||
+          (typeof finalLoginSlot.user_message_key === "string" && finalLoginSlot.user_message_key) ||
+          "Đăng nhập MT5 thất bại.";
+        throw new BackendAPIError(hint, { status: 409, code: "mt5_login_failed" });
       }
 
-      setMt5VerificationPhase("ASSIGNED");
+      setMt5LoginSlotPhase("ASSIGNED");
 
       let claimedEntitlementId: string | undefined;
       if (mt5BotTokenRequired) {
@@ -1448,7 +1455,7 @@ export default function BotPage() {
         label: "",
       }));
       setMt5BotTokenInput("");
-      setMt5VerificationPhase("VERIFIED");
+      setMt5LoginSlotPhase("READY");
       setNotice({
         tone: "success",
         message: `Đã đăng nhập thành công. Bạn có thể bật bot ${selectedMt5Bot.display_name}`,
@@ -1462,7 +1469,7 @@ export default function BotPage() {
       });
     } finally {
       setSubmitting(false);
-      setMt5VerificationPhase(null);
+      setMt5LoginSlotPhase(null);
     }
   }
 
@@ -2135,8 +2142,8 @@ export default function BotPage() {
                               {submitting ? (
                                 <>
                                   <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.9} />
-                                  {mt5VerificationPhase
-                                    ? MT5_VERIFICATION_PHASE_LABEL[mt5VerificationPhase]
+                                  {mt5LoginSlotPhase
+                                    ? MT5_LOGIN_SLOT_PHASE_LABEL[mt5LoginSlotPhase]
                                     : "Đang đăng nhập..."}
                                 </>
                               ) : (

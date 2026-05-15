@@ -21,6 +21,11 @@ _SLOT_RUNTIME_FAILURE_FRAGMENTS = (
     "worker not ready",
     "start_worker_not_running",
     "interactive_start_worker_not_running",
+    "interactive_handoff",
+    "handoff_resume",
+    "resume_failed",
+    "command_execution_timeout",
+    "execution_timeout",
     "slot_not_ready",
     "slot_not_available",
     "slot_not_ipc_ready",
@@ -49,8 +54,8 @@ _NON_REROUTE_FRAGMENTS = (
     "invalid account",
     "invalid password",
     "login_returned_false",
-    "verify_login_mismatch",
-    "verify_server_mismatch",
+    "login_mismatch",
+    "server_mismatch",
     "account_has_active_deployment",
     "account_not_active",
     "bot_not_available",
@@ -80,8 +85,8 @@ _CREDENTIAL_FAILURE_FRAGMENTS = (
     "invalid_server",
     "invalid server",
     "server not found",
-    "verify_login_mismatch",
-    "verify_server_mismatch",
+    "login_mismatch",
+    "server_mismatch",
 )
 
 _CREDENTIAL_FAILURE_CODES = {

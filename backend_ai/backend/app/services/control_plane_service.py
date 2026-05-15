@@ -24,10 +24,6 @@ from app.events.runner_event_ingest import RunnerEventIngestService
 from app.models.control_plane import ACTIVE_DEPLOYMENT_STATUSES, CommandType
 from app.monitoring.control_plane_metrics import ControlPlaneMetricsService
 from app.monitoring.control_plane_reconciler import ControlPlaneReconcilerService
-from app.orchestration.account_verification_manager import (
-    AccountVerificationManagerService,
-    _verification_job_stale_for_retry,
-)
 from app.orchestration.deployment_config import (
     TRADING_CONFIG_SCHEMA_VERSION,
     TRADING_CONFIG_KEY,
@@ -55,13 +51,6 @@ from app.services.store_service import get_process_store
 from app.settings import settings
 
 log = logging.getLogger(__name__)
-
-_VERIFICATION_CREDENTIAL_ERROR_CODES = {
-    "INVALID_CREDENTIALS",
-    "INVALID_PASSWORD",
-    "INVALID_SERVER",
-    "ACCOUNT_NOT_FOUND",
-}
 
 _SINGLE_TELEGRAM_BOT_LIMITS = {
     "free": {"max_active_deployments": 1},
@@ -127,16 +116,23 @@ def _risk_policy_tz_offset(value: Any) -> int:
 
 def _runner_risk_policy_contract(*, policy: Any, user_id: int, account_id: int, deployment_id: int) -> dict[str, Any]:
     raw = policy if isinstance(policy, dict) else {}
+    daily_loss_limit_usd = _risk_policy_number(raw.get("daily_loss_limit_usd"))
+    daily_loss_limit_percent = _risk_policy_number(raw.get("daily_loss_limit_percent"))
+    configured = bool(raw)
+    auto_stop_on_breach = bool(raw.get("auto_stop_on_breach"))
     return {
         "schema_version": "account_risk_policy.v1",
         "source": "broker_accounts.risk_policy_json",
+        "policy_source": "tenant_account" if configured else "system_default",
         "scope": "account",
+        "configured": configured,
+        "enforcement_enabled": bool(auto_stop_on_breach and (daily_loss_limit_usd or daily_loss_limit_percent)),
         "user_id": int(user_id),
         "account_id": int(account_id),
         "deployment_id": int(deployment_id),
-        "daily_loss_limit_usd": _risk_policy_number(raw.get("daily_loss_limit_usd")),
-        "daily_loss_limit_percent": _risk_policy_number(raw.get("daily_loss_limit_percent")),
-        "auto_stop_on_breach": bool(raw.get("auto_stop_on_breach")),
+        "daily_loss_limit_usd": daily_loss_limit_usd,
+        "daily_loss_limit_percent": daily_loss_limit_percent,
+        "auto_stop_on_breach": auto_stop_on_breach,
         "timezone_offset_minutes": _risk_policy_tz_offset(raw.get("timezone_offset_minutes")),
         "updated_at": raw.get("updated_at"),
         "updated_by": raw.get("updated_by"),
@@ -360,10 +356,6 @@ def _is_admin_telegram_id(telegram_id: Any) -> bool:
     return bool(value and value in _admin_telegram_ids())
 
 
-def _norm_verification_error_code(value: Any) -> str:
-    return _norm_text(value).upper().replace("-", "_").replace(" ", "_")
-
-
 def _is_trade_disabled_start_error(value: Any) -> bool:
     text = _norm_text(value).lower().replace("-", "_")
     readable = text.replace("_", " ")
@@ -388,106 +380,6 @@ def _canonical_slot_id(value: Any) -> str:
     return raw
 
 
-def _verification_result_slot_matches(expected_slot_id: str, incoming_slot_id: str, current_job: dict[str, Any]) -> bool:
-    if not expected_slot_id or not incoming_slot_id or expected_slot_id == incoming_slot_id:
-        return True
-    payload = current_job.get("payload_json") if isinstance(current_job, dict) else {}
-    if not isinstance(payload, dict):
-        payload = {}
-    is_verification_lane = (
-        _norm_text(payload.get("mode")) == "verify_account"
-        or _norm_text(payload.get("verification_lane_contract")) == "session0_lane"
-    )
-    if is_verification_lane and "template" in {expected_slot_id.strip().lower(), incoming_slot_id.strip().lower()}:
-        return True
-    return False
-
-
-def _verification_failure_is_auth_only_with_healthy_mt5(error_text: str, payload: dict[str, Any]) -> bool:
-    payload_map = payload if isinstance(payload, dict) else {}
-    error_code = _norm_verification_error_code(payload_map.get("error_code"))
-    if error_code in _VERIFICATION_CREDENTIAL_ERROR_CODES:
-        return True
-    if error_code:
-        return False
-    normalized_error = _norm_text(error_text).lower()
-    mt5_last_error = _norm_text(payload_map.get("mt5_last_error")).lower()
-    phase = _norm_text(payload_map.get("phase")).lower()
-    reason = _norm_text(payload_map.get("reason")).lower()
-    terminal_log_line = _norm_text(payload_map.get("terminal_log_line")).lower()
-    liveness_state = _norm_text(payload_map.get("mt5_liveness_state")).lower()
-    terminal_info = payload_map.get("terminal_info") if isinstance(payload_map.get("terminal_info"), dict) else {}
-    terminal_connected = str((terminal_info or {}).get("connected") or "").strip().lower()
-
-    auth_text = " ".join([normalized_error, reason, phase, mt5_last_error, terminal_log_line])
-    normalized_auth_text = auth_text.replace("_", " ").replace("-", " ")
-    transient_tokens = (
-        "transient_mt5",
-        "template_verification_worker_timeout",
-        "terminal_log_verification_timeout",
-        "template_terminal_lock_timeout",
-        "mt5_initialize_failed",
-        "verification_subprocess_timeout",
-        "verification_hard_timeout",
-        "interactive_verification_timeout",
-        "interactive_verification_worker_timeout",
-        "terminal_initialize_failed",
-        "verification_mt5_init_lock_timeout",
-        "warm_attach_failed",
-        "warm_attach_direct_credentials_failed",
-        "broker_connection_timeout",
-    )
-    if any(token in auth_text for token in transient_tokens) or "ipc" in auth_text:
-        return False
-
-    auth_failure_tokens = (
-        "authorization failed",
-        "authorization_failed",
-        "auth failed",
-        "auth_failed",
-        "login failed",
-        "invalid account",
-        "unknown account",
-        "account_not_found",
-        "account not found",
-        "wrong password",
-        "bad credentials",
-    )
-    has_auth_failure_token = any(
-        token in auth_text or token in normalized_auth_text for token in auth_failure_tokens
-    )
-    terminal_log_auth_failure = any(
-        token in terminal_log_line or token in terminal_log_line.replace("_", " ").replace("-", " ")
-        for token in ("authorization failed", "authorization_failed", "invalid account", "login failed")
-    )
-    login_returned_false_with_auth_log = "login_returned_false" in auth_text and terminal_log_auth_failure
-    mt5_login_failed_with_auth_error = phase == "mt5_login_failed" and (
-        has_auth_failure_token
-        or any(
-            token in mt5_last_error or token in mt5_last_error.replace("_", " ").replace("-", " ")
-            for token in ("auth", "login", "password", "invalid server", "server not found", "unknown server")
-        )
-    )
-    verify_identity_mismatch = "verify_login_mismatch" in auth_text or "verify_server_mismatch" in auth_text
-    explicit_auth_failure = (
-        has_auth_failure_token
-        or login_returned_false_with_auth_log
-        or mt5_login_failed_with_auth_error
-        or verify_identity_mismatch
-    )
-    if explicit_auth_failure:
-        return True
-
-    auth_failure = (
-        "login_returned_false" in auth_text
-        or phase == "mt5_login_failed"
-        or mt5_last_error.startswith("-6")
-        or "authorization failed" in mt5_last_error
-    )
-    mt5_healthy = liveness_state == "healthy" or terminal_connected == "true"
-    return bool(auth_failure and mt5_healthy)
-
-
 def _runner_queue_depths(runner_ids: list[str]) -> dict[str, dict[str, int]]:
     ids = [str(item or "").strip() for item in runner_ids if str(item or "").strip()]
     if not ids:
@@ -507,8 +399,6 @@ def _runner_queue_depths(runner_ids: list[str]) -> dict[str, dict[str, int]]:
         keys: list[tuple[str, str]] = []
         for runner_id in ids:
             for name, key in (
-                ("verification", f"mt5:runner:{runner_id}:verification"),
-                ("verification_processing", f"mt5:runner:{runner_id}:verification:processing"),
                 ("commands", f"mt5:runner:{runner_id}:commands"),
                 ("commands_processing", f"mt5:runner:{runner_id}:commands:processing"),
             ):
@@ -520,8 +410,6 @@ def _runner_queue_depths(runner_ids: list[str]) -> dict[str, dict[str, int]]:
 
     out: dict[str, dict[str, int]] = {
         runner_id: {
-            "verification": 0,
-            "verification_processing": 0,
             "commands": 0,
             "commands_processing": 0,
         }
@@ -870,7 +758,6 @@ class MT5ControlPlaneService:
         repo: ControlPlaneRepository | None = None,
         loader: MT5BotCatalogLoader | None = None,
         deployment_manager: DeploymentManagerService | None = None,
-        verification_manager: AccountVerificationManagerService | None = None,
         event_ingest: RunnerEventIngestService | None = None,
         metrics: ControlPlaneMetricsService | None = None,
         crypto: CryptoBox | None = None,
@@ -880,7 +767,6 @@ class MT5ControlPlaneService:
         self._loader = loader or MT5BotCatalogLoader(repo=self._repo)
         self._command_router = CommandRouterService(self._repo)
         self._deployment_manager = deployment_manager or DeploymentManagerService(self._repo, catalog_loader=self._loader)
-        self._verification_manager = verification_manager or AccountVerificationManagerService(self._repo)
         self._event_ingest = event_ingest or RunnerEventIngestService(self._repo)
         self._metrics = metrics or ControlPlaneMetricsService(self._repo)
         self._reconciler = ControlPlaneReconcilerService(self._repo)
@@ -1096,10 +982,36 @@ class MT5ControlPlaneService:
             telegram_id=telegram_id,
             action="account.connect",
             payload={"account_id": account.get("id"), "broker": broker, "server": server, "login": login},
-            result=str(account.get("status") or "pending_verification"),
+            result=str(account.get("status") or "pending_login"),
         )
         self._invalidate_dashboard_cache(user_id=int(user["id"]))
         return account
+
+    def mark_account_login_request_failed(
+        self,
+        *,
+        telegram_id: str,
+        username: Optional[str],
+        account_id: int,
+        reason: str,
+    ) -> None:
+        user = self.ensure_user(telegram_id=telegram_id, username=username)
+        account = self._repo.get_account(account_id=int(account_id), user_id=int(user["id"]))
+        if not account:
+            return
+        reason_s = str(reason or "login_slot_request_failed").strip()[:240] or "login_slot_request_failed"
+        self._repo.mark_account_runtime_login_result(
+            account_id=int(account_id),
+            ok=False,
+            error=reason_s,
+        )
+        self._store.add_audit(
+            telegram_id=telegram_id,
+            action="account.login_slot.request_failed",
+            payload={"account_id": int(account_id), "reason": reason_s},
+            result="login_failed",
+        )
+        self._invalidate_dashboard_cache(user_id=int(user["id"]))
 
     def _find_mt5_account_identity_conflict(
         self,
@@ -1204,80 +1116,146 @@ class MT5ControlPlaneService:
         self._invalidate_dashboard_cache(user_id=int(user["id"]))
         return account
 
-    def verify_account(self, *, telegram_id: str, username: Optional[str], account_id: int, ok: bool = True, error_text: Optional[str] = None) -> dict[str, Any]:
-        user = self.ensure_user(telegram_id=telegram_id, username=username)
-        account = self._repo.verify_account(account_id=account_id, user_id=int(user["id"]), ok=ok, error_text=error_text)
-        if not account:
-            raise ValueError("account_not_found")
-        self._store.add_audit(
-            telegram_id=telegram_id,
-            action="account.verify",
-            payload={"account_id": account_id, "ok": ok},
-            result=str(account.get("status") or ("connected" if ok else "verification_failed")),
-        )
-        self._invalidate_dashboard_cache(user_id=int(user["id"]))
-        return account
+    def _login_slot_response(
+        self,
+        *,
+        reservation: dict[str, Any],
+        account: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        status = str((reservation or {}).get("status") or "").strip().lower()
+        if status == "verified":
+            state = "READY"
+            next_action = "START_BOT"
+        elif status in {"pending", "dispatched"}:
+            state = "LOGIN_IN_PROGRESS"
+            next_action = "POLL_LOGIN_SLOT"
+        elif status in {"failed", "expired", "released", "cancelled"}:
+            state = "FAILED"
+            next_action = "RETRY_LOGIN"
+        else:
+            state = "UNKNOWN"
+            next_action = "RETRY_LOGIN"
+        return {
+            "id": reservation.get("id"),
+            "login_reservation_id": reservation.get("id"),
+            "account_id": reservation.get("account_id"),
+            "status": status,
+            "login_state": state,
+            "connect_status": state,
+            "connection_state": state,
+            "next_action": next_action,
+            "runner_id": reservation.get("runner_id"),
+            "slot_id": reservation.get("slot_id"),
+            "trace_id": reservation.get("trace_id"),
+            "command_id": reservation.get("command_id"),
+            "redis_stream_id": reservation.get("redis_stream_id"),
+            "expires_at": reservation.get("expires_at"),
+            "last_error": reservation.get("last_error"),
+            "runtime_login_required": True,
+            "credential_check_policy": "reserve_or_login_slot",
+            "mt5_recovery_policy": "recover_or_launch",
+            "reservation": reservation,
+            "account": account,
+        }
 
-    async def request_account_verification(self, *, telegram_id: str, username: Optional[str], account_id: int) -> dict[str, Any]:
+    async def request_account_login_slot(self, *, telegram_id: str, username: Optional[str], account_id: int) -> dict[str, Any]:
         user = self.ensure_user(telegram_id=telegram_id, username=username)
         user_id = int(user["id"])
-        account = self._repo.get_account(account_id=account_id, user_id=user_id)
+        account = self._repo.get_account(account_id=int(account_id), user_id=user_id)
         if not account:
             raise ValueError("account_not_found")
+        active_deployment = self._repo.get_active_deployment_for_account(account_id=int(account_id))
+        if active_deployment:
+            raise OrchestrationPolicyError("account_has_active_deployment")
+        self._repo.release_expired_login_reservations()
+        active_reservation = self._repo.get_active_login_reservation(account_id=int(account_id), user_id=user_id)
+        if active_reservation:
+            return self._login_slot_response(reservation=active_reservation, account=account)
 
-        job = await self._verification_manager.request_verification(user_id=user_id, account=dict(account))
-        if not job:
-            raise ValueError("verification_job_not_found")
+        decision = self._deployment_manager._pick_slot(
+            account_id=int(account_id),
+            bot={"profile_class": "normal", "strategy_tags": [], "resource_hints": {}},
+        )
+        if not decision.ok:
+            raise OrchestrationPolicyError(decision.reason or "no_scheduler_candidate")
 
-        job_id = job.get("id")
-        job_status = str(job.get("status") or "").strip().lower()
-        account_row = self._repo.get_account(account_id=int(account_id), user_id=user_id) or dict(account)
+        binding = self._repo.allocate_slot_binding(
+            account_id=int(account_id),
+            runner_id=decision.runner_id,
+            slot_id=decision.slot_id,
+            sticky=True,
+        )
+        trace_id = uuid.uuid4().hex
+        login_attempt_timeout_sec = max(
+            15,
+            min(int(getattr(settings, "ACCOUNT_LOGIN_SLOT_ATTEMPT_TIMEOUT_SEC", 60) or 60), 300),
+        )
+        login_hold_ttl_sec = max(
+            60,
+            min(int(getattr(settings, "ACCOUNT_LOGIN_SLOT_HOLD_TTL_SEC", 300) or 300), 900),
+        )
+        payload = {
+            "mode": "reserve_or_login_slot",
+            "account_id": int(account_id),
+            "broker": account.get("broker"),
+            "server": account.get("server"),
+            "login": account.get("login"),
+            "runner_id": decision.runner_id,
+            "slot_id": decision.slot_id,
+            "binding_id": binding.get("id"),
+            "login_slot_ttl_sec": login_hold_ttl_sec,
+            "login_attempt_timeout_sec": login_attempt_timeout_sec,
+            "reuse_on_start": True,
+            "auto_release_if_not_claimed": True,
+        }
+        reservation = self._repo.create_login_reservation(
+            user_id=user_id,
+            account_id=int(account_id),
+            runner_id=decision.runner_id,
+            slot_id=decision.slot_id,
+            trace_id=trace_id,
+            ttl_sec=login_attempt_timeout_sec,
+            payload=payload,
+        )
+        payload = {
+            **payload,
+            "login_reservation_id": int(reservation["id"]),
+            "reservation_id": int(reservation["id"]),
+        }
+        command = await self._command_router.dispatch(
+            command_type=CommandType.RESERVE_OR_LOGIN_SLOT,
+            account_id=int(account_id),
+            deployment_id=None,
+            bot_id="mt5-login-slot",
+            runner_id=decision.runner_id,
+            slot_id=decision.slot_id,
+            priority=80,
+            payload=payload,
+            trace_id=trace_id,
+        )
+        dispatched = self._repo.mark_login_reservation_dispatched(
+            reservation_id=int(reservation["id"]),
+            command_id=str(command.get("command_id") or ""),
+            redis_stream_id=command.get("redis_stream_id"),
+            ttl_sec=login_attempt_timeout_sec,
+        ) or reservation
 
         self._store.add_audit(
             telegram_id=telegram_id,
-            action="account.verify.requested",
+            action="account.login_slot.requested",
             payload={
                 "account_id": int(account_id),
-                "verification_job_id": job_id,
-                "runner_id": job.get("runner_id"),
-                "slot_id": job.get("slot_id"),
-                "trace_id": job.get("trace_id"),
+                "login_reservation_id": dispatched.get("id"),
+                "command_id": command.get("command_id"),
+                "runner_id": dispatched.get("runner_id"),
+                "slot_id": dispatched.get("slot_id"),
+                "trace_id": dispatched.get("trace_id"),
             },
-            result=job_status or "dispatched",
+            result=str(dispatched.get("status") or "dispatched"),
         )
         self._invalidate_dashboard_cache(user_id=user_id)
-
-        verification_state = str(job.get("verification_state") or "").strip().upper()
-        verification_ui_state = str(job.get("verification_ui_state") or "").strip().upper()
-        if not verification_state:
-            verification_state = "VERIFYING" if job_status in {"pending", "dispatched"} else "UNKNOWN"
-        if not verification_ui_state:
-            verification_ui_state = "VERIFYING_MT5" if job_status == "dispatched" else "SUBMITTED"
-
-        next_action = "POLL_VERIFICATION" if job_status in {"pending", "dispatched"} else "START_BOT"
-
-        return {
-            "id": job_id,
-            "account_id": int(account_id),
-            "verification_job_id": job_id,
-            "job_id": job_id,
-            "status": job_status or "dispatched",
-            "job_status": job_status,
-            "verification_state": verification_state,
-            "verification_ui_state": verification_ui_state,
-            "connect_status": account_row.get("connect_status") or "PENDING_RUNTIME_LOGIN",
-            "connection_state": account_row.get("connection_state") or "PENDING_RUNTIME_LOGIN",
-            "next_action": next_action,
-            "runner_id": job.get("runner_id"),
-            "slot_id": job.get("slot_id"),
-            "trace_id": job.get("trace_id"),
-            "redis_stream_id": job.get("redis_stream_id"),
-            "job": job,
-            "account": account_row,
-            "runtime_login_required": True,
-            "credential_check_policy": "runner_verify_queue",
-            "mt5_recovery_policy": "recover_or_launch",
-        }
+        account_row = self._repo.get_account(account_id=int(account_id), user_id=user_id) or dict(account)
+        return self._login_slot_response(reservation=dispatched, account=account_row)
 
     def get_account(self, *, telegram_id: str, username: Optional[str], account_id: int) -> Optional[dict[str, Any]]:
         user = self.ensure_user(telegram_id=telegram_id, username=username)
@@ -1313,16 +1291,10 @@ class MT5ControlPlaneService:
                 raise OrchestrationPolicyError("start_transition_in_progress")
 
         clean_reason = (reason or "account_deleted_by_user").strip()[:200]
-        verification_cancelled_total = 0
-        try:
-            cancel_result = await self._verification_manager.cancel_all_verifications_for_account(
-                user_id=user_id,
-                account_id=int(account_id),
-                reason=clean_reason,
-            )
-            verification_cancelled_total = int(cancel_result.get("cancelled_count") or 0)
-        except Exception:
-            verification_cancelled_total = 0
+        login_reservations_released = self._repo.release_login_reservation(
+            account_id=int(account_id),
+            reason=clean_reason,
+        )
 
         binding = self._repo.get_current_binding(account_id=int(account_id))
         deleted_account = self._repo.soft_delete_account(
@@ -1356,7 +1328,7 @@ class MT5ControlPlaneService:
                 "broker": account.get("broker"),
                 "server": account.get("server"),
                 "login": account.get("login"),
-                "verification_cancelled_total": verification_cancelled_total,
+                "login_reservations_released": login_reservations_released,
                 "slot_released": slot_released,
                 "reason": clean_reason,
             },
@@ -1367,123 +1339,27 @@ class MT5ControlPlaneService:
             "account_id": int(account_id),
             "deleted": True,
             "status": deleted_account.get("status") or "disconnected",
-            "verification_cancelled_total": verification_cancelled_total,
+            "login_reservations_released": login_reservations_released,
             "slot_released": slot_released,
         }
 
-    def list_account_verifications(
+    def get_account_login_slot(
         self,
         *,
         telegram_id: str,
         username: Optional[str],
-        account_id: int,
-        limit: int = 50,
-    ) -> list[dict[str, Any]]:
-        user = self.ensure_user(telegram_id=telegram_id, username=username)
-        return self._repo.list_account_verification_jobs(
-            account_id=account_id,
-            user_id=int(user["id"]),
-            limit=limit,
-        )
-
-    def get_account_verification(
-        self,
-        *,
-        telegram_id: str,
-        username: Optional[str],
-        job_id: int,
-    ) -> Optional[dict[str, Any]]:
-        user = self.ensure_user(telegram_id=telegram_id, username=username)
-        job = self._repo.get_account_verification_job_for_user(
-            job_id=int(job_id),
-            user_id=int(user["id"]),
-        )
-        if not job or not _verification_job_stale_for_retry(job):
-            return job
-
-        canceller = getattr(self._repo, "cancel_account_verification_job", None)
-        if not callable(canceller):
-            return job
-        outcome = canceller(
-            job_id=int(job["id"]),
-            user_id=int(user["id"]),
-            reason="verification_callback_timeout",
-        )
-        if str((outcome or {}).get("status") or "").strip().lower() != "cancelled":
-            return job
-        recovered = dict((outcome or {}).get("job") or job)
-        recovered["stale_recovered"] = True
-        recovered["retryable"] = True
-        recovered["verification_state"] = "FAILED"
-        recovered["verification_ui_state"] = "FAILED"
-        return recovered
-
-    async def cancel_all_account_verifications(
-        self,
-        *,
-        telegram_id: str,
-        username: Optional[str],
-        account_id: int,
-        reason: Optional[str] = None,
-    ) -> dict[str, Any]:
-        """Bulk cancel moi verification job dang pending/dispatched cho 1 account.
-
-        Tra ve aggregated result + ghi audit log.
-        """
-        user = self.ensure_user(telegram_id=telegram_id, username=username)
-        # Validate ownership cua account TRUOC khi bulk cancel.
-        account = self._repo.get_account(account_id=int(account_id), user_id=int(user["id"]))
-        if not account:
-            raise ValueError("account_not_found")
-        result = await self._verification_manager.cancel_all_verifications_for_account(
-            user_id=int(user["id"]),
-            account_id=int(account_id),
-            reason=reason,
-        )
-        self._store.add_audit(
-            telegram_id=telegram_id,
-            action="account.verify.cancel_all",
-            payload={
-                "account_id": int(account_id),
-                "scanned_count": result.get("scanned_count"),
-                "cancelled_count": result.get("cancelled_count"),
-                "signal_emitted_count": result.get("signal_emitted_count"),
-                "skipped_count": len(result.get("skipped") or []),
-                "reason": reason or "cancelled_by_user",
-            },
-            result="cancelled" if (result.get("cancelled_count") or 0) > 0 else "noop",
-        )
-        self._invalidate_dashboard_cache(user_id=int(user["id"]))
-        return result
-
-    async def cancel_account_verification(
-        self,
-        *,
-        telegram_id: str,
-        username: Optional[str],
-        job_id: int,
-        reason: Optional[str] = None,
+        reservation_id: int,
     ) -> dict[str, Any]:
         user = self.ensure_user(telegram_id=telegram_id, username=username)
-        result = await self._verification_manager.cancel_verification(
+        self._repo.release_expired_login_reservations()
+        reservation = self._repo.get_login_reservation_for_user(
+            reservation_id=int(reservation_id),
             user_id=int(user["id"]),
-            job_id=int(job_id),
-            reason=reason,
         )
-        self._store.add_audit(
-            telegram_id=telegram_id,
-            action="account.verify.cancel",
-            payload={
-                "verification_job_id": result.get("id"),
-                "account_id": result.get("account_id"),
-                "previous_status": result.get("cancel_outcome"),
-                "reason": reason or "cancelled_by_user",
-                "cancel_signal_emitted": bool(result.get("cancel_signal_emitted")),
-            },
-            result=str(result.get("status") or "cancelled"),
-        )
-        self._invalidate_dashboard_cache(user_id=int(user["id"]))
-        return result
+        if not reservation:
+            raise ValueError("login_reservation_not_found")
+        account = self._repo.get_account(account_id=int(reservation["account_id"]), user_id=int(user["id"]))
+        return self._login_slot_response(reservation=reservation, account=account)
 
     def get_account_state(self, *, telegram_id: str, username: Optional[str], account_id: int) -> Optional[dict[str, Any]]:
         user = self.ensure_user(telegram_id=telegram_id, username=username)
@@ -1698,15 +1574,59 @@ class MT5ControlPlaneService:
                 subscription=subscription,
                 active_deployment_count=active_count,
             )
+        self._repo.release_expired_login_reservations()
+        login_reservation = self._repo.get_active_login_reservation(account_id=int(account_id), user_id=int(user["id"]))
+        login_reservation_status = str((login_reservation or {}).get("status") or "").strip().lower()
+        if login_reservation_status in {"pending", "dispatched"}:
+            raise OrchestrationPolicyError("account_login_in_progress")
+        claimed_login_reservation = None
+        if login_reservation_status == "verified":
+            claimed_login_reservation = self._repo.claim_verified_login_reservation(account_id=int(account_id))
+        account_status = str(account.get("raw_status") or account.get("status") or "").strip().lower()
+        if account_status in {"pending_login", "login_failed"} and not claimed_login_reservation:
+            raise OrchestrationPolicyError("account_login_required")
+        if claimed_login_reservation:
+            account = dict(account)
+            account["raw_status"] = account_status or account.get("status")
+            account["status"] = "connected"
+            account["login_state"] = "READY"
         self._raise_if_bot_control_cooldown_active(user_id=int(user["id"]), telegram_id=telegram_id)
         self._ensure_tradingview_subscription_for_start(account_id=int(account_id), bot=bot)
-        result = await self._deployment_manager.start_deployment(
-            user_id=int(user["id"]),
-            account=account,
-            bot_name=bot_name,
-            bot_config_overrides=effective_config,
-            mode=normalized_mode,
-        )
+        start_payload_extra = {}
+        if claimed_login_reservation:
+            completed_at = claimed_login_reservation.get("completed_at")
+            if hasattr(completed_at, "isoformat"):
+                completed_at = completed_at.isoformat()
+            start_payload_extra.update(
+                {
+                    "reuse_login_slot": True,
+                    "login_reservation_id": int(claimed_login_reservation["id"]),
+                    "login_slot_runner_id": claimed_login_reservation.get("runner_id"),
+                    "login_slot_slot_id": claimed_login_reservation.get("slot_id"),
+                    "runtime_login_already_verified": True,
+                    "login_slot_verified_at": completed_at,
+                }
+            )
+        try:
+            result = await self._deployment_manager.start_deployment(
+                user_id=int(user["id"]),
+                account=account,
+                bot_name=bot_name,
+                bot_config_overrides=effective_config,
+                mode=normalized_mode,
+                start_payload_extra=start_payload_extra,
+            )
+        except Exception:
+            if claimed_login_reservation:
+                try:
+                    self._repo.release_claimed_login_reservation(
+                        reservation_id=int(claimed_login_reservation["id"]),
+                        account_id=int(account_id),
+                        reason="start_request_failed_after_login_slot_claim",
+                    )
+                except Exception:
+                    pass
+            raise
         self._store.add_audit(
             telegram_id=telegram_id,
             action="deployment.start",
@@ -2800,88 +2720,6 @@ class MT5ControlPlaneService:
     def get_execution_command(self, *, command_id: str) -> Optional[dict[str, Any]]:
         return self._repo.get_execution_command(command_id=command_id)
 
-    def record_account_verification_result(
-        self,
-        *,
-        job_id: int,
-        ok: bool,
-        error_text: Optional[str],
-        runner_id: Optional[str],
-        slot_id: Optional[str],
-        payload: dict[str, Any],
-    ) -> dict[str, Any]:
-        current_job = self._repo.get_account_verification_job_by_id(job_id=job_id)
-        current_status = _norm_text((current_job or {}).get("status")).lower()
-        if current_job and current_status not in {"verified", "failed", "cancelled"}:
-            expected_runner_id = _norm_text(current_job.get("runner_id"))
-            incoming_runner_id = _norm_text(runner_id)
-            if expected_runner_id and incoming_runner_id and expected_runner_id != incoming_runner_id:
-                raise ValueError("verification_result_runner_mismatch")
-
-            expected_slot_id = _canonical_slot_id(current_job.get("slot_id"))
-            incoming_slot_id = _canonical_slot_id(slot_id)
-            if not _verification_result_slot_matches(expected_slot_id, incoming_slot_id, current_job):
-                raise ValueError("verification_result_slot_mismatch")
-
-            expected_trace_id = _norm_text(current_job.get("trace_id"))
-            incoming_trace_id = _norm_text((payload or {}).get("trace_id"))
-            if expected_trace_id and incoming_trace_id and expected_trace_id != incoming_trace_id:
-                raise ValueError("verification_result_trace_mismatch")
-
-        result = self._verification_manager.complete_verification(
-            job_id=job_id,
-            ok=ok,
-            error_text=error_text,
-            runner_id=runner_id,
-            slot_id=slot_id,
-            payload=payload,
-        )
-        normalized_error = _norm_text(error_text or (payload or {}).get("reason")).lower()
-        normalized_slot_id = _canonical_slot_id(slot_id) or _canonical_slot_id((current_job or {}).get("slot_id"))
-        normalized_runner_id = _norm_text(runner_id) or _norm_text((current_job or {}).get("runner_id"))
-        suppress_slot_health_mark = _verification_failure_is_auth_only_with_healthy_mt5(
-            normalized_error,
-            dict(payload or {}),
-        )
-        if (
-            not ok
-            and not suppress_slot_health_mark
-            and normalized_runner_id
-            and normalized_slot_id
-            and hasattr(self._repo, "mark_slot_health")
-        ):
-            if "slot_unhealthy:broken" in normalized_error or normalized_error.endswith(":broken"):
-                self._repo.mark_slot_health(runner_id=normalized_runner_id, slot_id=normalized_slot_id, status="broken")
-            elif "slot_unhealthy:degraded" in normalized_error or normalized_error.endswith(":degraded"):
-                self._repo.mark_slot_health(runner_id=normalized_runner_id, slot_id=normalized_slot_id, status="degraded")
-        self._store.add_audit(
-            telegram_id="internal_runner",
-            action="runner.account_verification.result",
-            payload={
-                "verification_job_id": job_id,
-                "account_id": (result.get("account") or {}).get("id"),
-                "ok": ok,
-                "runner_id": runner_id or result.get("runner_id"),
-                "slot_id": slot_id or result.get("slot_id"),
-                "trace_id": (payload or {}).get("trace_id") or result.get("trace_id") or (current_job or {}).get("trace_id"),
-                "job_status_before": current_job.get("status") if current_job else None,
-                "job_status_after": result.get("status"),
-                "verification_state": result.get("verification_state"),
-                "error_text": error_text,
-                "error_code": (payload or {}).get("error_code") or result.get("error_code"),
-                "retryable": (payload or {}).get("retryable") if "retryable" in (payload or {}) else result.get("retryable"),
-                "failure_kind": (payload or {}).get("failure_kind") or result.get("failure_kind"),
-                "failure_category": (payload or {}).get("failure_category") or result.get("failure_category"),
-                "user_message_key": (payload or {}).get("user_message_key") or result.get("user_message_key"),
-                "callback_payload": dict(payload or {}),
-            },
-            result=str(result.get("status") or ("verified" if ok else "failed")),
-        )
-        result_user_id = result.get("user_id") or (current_job or {}).get("user_id")
-        if result_user_id is not None:
-            self._invalidate_dashboard_cache(user_id=int(result_user_id))
-        return result
-
     def update_execution_command_delivery(
         self,
         *,
@@ -2946,8 +2784,6 @@ class MT5ControlPlaneService:
                 "redis_queue": {
                     "commands": f"mt5:runner:{runner_id_s or '<runner_id>'}:commands",
                     "commands_processing": f"mt5:runner:{runner_id_s or '<runner_id>'}:commands:processing",
-                    "verification": f"mt5:runner:{runner_id_s or '<runner_id>'}:verification",
-                    "verification_processing": f"mt5:runner:{runner_id_s or '<runner_id>'}:verification:processing",
                 },
             },
             "endpoints": {
@@ -2957,13 +2793,21 @@ class MT5ControlPlaneService:
                 "command_delivery": "/api/v2/runner/commands/{command_id}/delivery",
                 "deployment_package": "/api/v2/runner/deployments/{deployment_id}/package",
                 "account_bundle": "/api/v2/runner/accounts/{account_id}/bundle",
-                "verification_result": "/api/v2/runner/account-verifications/result",
             },
             "timing": {
                 "heartbeat_interval_sec": heartbeat_sec,
                 "runner_stale_sec": max(30, int(getattr(settings, "CONTROL_PLANE_RUNNER_STALE_SEC", 180) or 180)),
             },
             "contract": {
+                "reserve_or_login_slot": {
+                    "command_type": "RESERVE_OR_LOGIN_SLOT",
+                    "login_slot_ttl_sec": 300,
+                    "reuse_on_start": True,
+                    "auto_release_if_not_claimed": True,
+                    "success_event": "LOGIN_SLOT_VERIFIED",
+                    "failure_event": "LOGIN_SLOT_FAILED",
+                    "release_event": "LOGIN_SLOT_RELEASED",
+                },
                 "start_bot": {
                     "runtime_login_required": True,
                     "credential_check_policy": "login_before_start",
@@ -3123,12 +2967,11 @@ class MT5ControlPlaneService:
             action="runner.account_bundle.fetch",
             payload={
                 "account_id": int(bundle["account_id"]),
-                "verification_job_id": bundle.get("verification_job_id"),
-                "verification_status": bundle.get("verification_job_status"),
-                "verification_state": bundle.get("verification_state"),
-                "verification_runner_id": bundle.get("verification_runner_id"),
-                "verification_slot_id": bundle.get("verification_slot_id"),
-                "verification_trace_id": bundle.get("verification_trace_id"),
+                "login_reservation_id": bundle.get("login_reservation_id"),
+                "login_reservation_status": bundle.get("login_reservation_status"),
+                "login_reservation_runner_id": bundle.get("login_reservation_runner_id"),
+                "login_reservation_slot_id": bundle.get("login_reservation_slot_id"),
+                "login_reservation_trace_id": bundle.get("login_reservation_trace_id"),
             },
             result=str(bundle.get("account_status") or "unknown"),
         )
@@ -3291,8 +3134,8 @@ class MT5ControlPlaneService:
             except Exception:
                 account_id = 0
             status = _norm_text(account.get("status")).lower()
-            verification_state = _norm_text(account.get("verification_state")).upper()
-            account["login_valid"] = bool(status == "connected" or verification_state == "VERIFIED")
+            login_state = _norm_text(account.get("login_state")).upper()
+            account["login_valid"] = bool(status == "connected" or login_state == "READY")
             latest_deployment = latest_deployment_by_account.get(account_id)
             trade_disabled = _is_trade_disabled_start_error((latest_deployment or {}).get("last_error"))
             latest_deployment_status = _norm_text((latest_deployment or {}).get("status")).lower()
@@ -3325,8 +3168,6 @@ class MT5ControlPlaneService:
         for runner in runners:
             runner_id = str(runner.get("runner_id") or "").strip()
             depths = queue_depths.get(runner_id) or {
-                "verification": 0,
-                "verification_processing": 0,
                 "commands": 0,
                 "commands_processing": 0,
             }
@@ -3343,14 +3184,12 @@ class MT5ControlPlaneService:
             "healthy_slots": sum(int(item.get("healthy_slots") or 0) for item in runners),
             "available_slots": sum(int(item.get("available_slots") or 0) for item in runners),
             "allocated_slots": sum(int(item.get("allocated_slots") or 0) for item in runners),
-            "verifying_slots": sum(int(item.get("verifying_slots") or 0) for item in runners),
+            "login_reserved_slots": sum(int(item.get("login_reserved_slots") or 0) for item in runners),
             "degraded_slots": sum(int(item.get("degraded_slots") or 0) for item in runners),
             "broken_slots": sum(int(item.get("broken_slots") or 0) for item in runners),
             "stale_slots": sum(int(item.get("stale_slots") or 0) for item in runners),
             "running_deployments": sum(int(item.get("running_deployments") or 0) for item in runners),
             "failed_deployments": sum(int(item.get("failed_deployments") or 0) for item in runners),
-            "verification_queue_depth": sum(int((item.get("queue_depth") or {}).get("verification") or 0) for item in runners),
-            "verification_processing_depth": sum(int((item.get("queue_depth") or {}).get("verification_processing") or 0) for item in runners),
             "command_queue_depth": sum(int((item.get("queue_depth") or {}).get("commands") or 0) for item in runners),
             "command_processing_depth": sum(int((item.get("queue_depth") or {}).get("commands_processing") or 0) for item in runners),
         }
@@ -3371,8 +3210,6 @@ class MT5ControlPlaneService:
         if not runner:
             return None
         queue_depth = _runner_queue_depths([runner_id]).get(runner_id) or {
-            "verification": 0,
-            "verification_processing": 0,
             "commands": 0,
             "commands_processing": 0,
         }
@@ -3664,7 +3501,7 @@ class MT5ControlPlaneService:
         subscription = self._repo.get_user_active_subscription(user_id=user_id)
         # Risk policies per account
         risk_policies: list[dict[str, Any]] = []
-        verifications: list[dict[str, Any]] = []
+        login_reservations: list[dict[str, Any]] = []
         for account in accounts:
             account_id = int(account.get("id") or 0)
             if account_id <= 0:
@@ -3674,11 +3511,9 @@ class MT5ControlPlaneService:
             except Exception:
                 policy = {}
             risk_policies.append({"account_id": account_id, "policy": policy})
-            try:
-                jobs = self._repo.list_account_verification_jobs(account_id=account_id, user_id=user_id, limit=200)
-            except Exception:
-                jobs = []
-            verifications.extend(jobs)
+            active_reservation = self._repo.get_active_login_reservation(account_id=account_id, user_id=user_id)
+            if active_reservation:
+                login_reservations.append(active_reservation)
         try:
             audit = self._store.list_audit(telegram_id=telegram_id, limit=200)
         except Exception:
@@ -3696,7 +3531,7 @@ class MT5ControlPlaneService:
             "accounts": accounts,
             "deployments": deployments,
             "risk_policies": risk_policies,
-            "verifications": verifications,
+            "login_reservations": login_reservations,
             "audit_recent": format_audit_rows(audit),
             "exported_at": int(time.time()),
             "notes": (
@@ -3717,7 +3552,7 @@ class MT5ControlPlaneService:
 
         Steps:
           1. Stop moi running deployment cua user.
-          2. Cancel all pending verification jobs cua user (per account).
+          2. Release all pending login-slot reservations cua user (per account).
           3. Mark accounts.status='disconnected', clear credential blob.
           4. Audit log 'user.delete'.
 
@@ -3753,20 +3588,18 @@ class MT5ControlPlaneService:
             except Exception as exc:
                 deployments_failed.append({"deployment_id": int(deployment["id"]), "error": str(exc)[:200]})
 
-        # Cancel pending verification jobs per account
+        # Release pending login-slot reservations per account.
         accounts = self._repo.list_accounts_for_user(user_id=user_id)
-        verification_cancelled_total = 0
+        login_reservations_released = 0
         for account in accounts:
             account_id = int(account.get("id") or 0)
             if account_id <= 0:
                 continue
             try:
-                bulk = await self._verification_manager.cancel_all_verifications_for_account(
-                    user_id=user_id,
+                login_reservations_released += self._repo.release_login_reservation(
                     account_id=account_id,
                     reason=f"user_delete:{cancel_reason}",
                 )
-                verification_cancelled_total += int(bulk.get("cancelled_count") or 0)
             except Exception:
                 continue
 
@@ -3783,7 +3616,7 @@ class MT5ControlPlaneService:
                 "user_id": user_id,
                 "deployments_stopped_count": len(deployments_stopped),
                 "deployments_failed_count": len(deployments_failed),
-                "verification_cancelled_total": verification_cancelled_total,
+                "login_reservations_released": login_reservations_released,
                 "accounts_soft_deleted_count": accounts_soft_deleted,
                 "reason": cancel_reason,
             },
@@ -3793,7 +3626,7 @@ class MT5ControlPlaneService:
             "user_id": user_id,
             "deployments_stopped": deployments_stopped,
             "deployments_failed": deployments_failed,
-            "verification_cancelled_total": verification_cancelled_total,
+            "login_reservations_released": login_reservations_released,
             "accounts_soft_deleted_count": accounts_soft_deleted,
             "status": "soft_deleted",
             "notes": (

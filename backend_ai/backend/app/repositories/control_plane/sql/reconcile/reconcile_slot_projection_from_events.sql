@@ -71,14 +71,22 @@ latest_slot_events AS (
     ) events
     ORDER BY runner_id, slot_id, event_order_at DESC, created_at DESC, id DESC
 ),
-normalized AS (
-    SELECT
-        runner_id,
-        slot_id,
-        payload_json,
-        created_at,
-        CASE
-            WHEN LOWER(COALESCE(
+	normalized AS (
+	    SELECT
+	        runner_id,
+	        slot_id,
+	        payload_json,
+	        created_at,
+	        (
+	            COALESCE(NULLIF(SUBSTRING(slot_id FROM '([0-9]+)$'), ''), '') <> ''
+	            AND CAST(SUBSTRING(slot_id FROM '([0-9]+)$') AS INTEGER) > 10
+	        ) AS over_node_slot_cap,
+	        CASE
+	            WHEN (
+	                COALESCE(NULLIF(SUBSTRING(slot_id FROM '([0-9]+)$'), ''), '') <> ''
+	                AND CAST(SUBSTRING(slot_id FROM '([0-9]+)$') AS INTEGER) > 10
+	            ) THEN 'disabled'
+	            WHEN LOWER(COALESCE(
                 payload_json->>'current_control_plane_state',
                 payload_json->>'control_plane_state',
                 payload_json->>'new_state',
@@ -140,10 +148,48 @@ normalized AS (
 UPDATE runner_slots s
 SET status = normalized.slot_status,
     current_account_id = CASE
-        WHEN normalized.slot_status = 'ready' THEN NULL
+        WHEN normalized.slot_status IN ('ready', 'disabled') THEN NULL
         ELSE s.current_account_id
     END,
     metadata_json = CASE
+        WHEN normalized.over_node_slot_cap THEN
+            jsonb_strip_nulls(
+                (
+                    COALESCE(s.metadata_json, '{}'::jsonb)
+                        - 'account_id'
+                        - 'active_account_id'
+                        - 'deployment_id'
+                        - 'login_reservation_id'
+                        - 'login_reservation_status'
+                        - 'login_reservation_account_id'
+                        - 'login_slot_status'
+                        - 'login_slot_account_id'
+                        - 'reserved_account_id'
+                        - 'sticky_account_id'
+                        - 'slot_inventory_entry'
+                ) || (
+                    normalized.payload_json
+                        - 'account_id'
+                        - 'active_account_id'
+                        - 'deployment_id'
+                        - 'login_reservation_id'
+                        - 'login_reservation_status'
+                        - 'login_reservation_account_id'
+                        - 'login_slot_status'
+                        - 'login_slot_account_id'
+                        - 'reserved_account_id'
+                        - 'sticky_account_id'
+                        - 'slot_inventory_entry'
+                )
+                || jsonb_build_object(
+                    'disabled_by_node_slot_cap', TRUE,
+                    'node_slot_cap', 10,
+                    'disabled_reason', 'node_slot_cap_10',
+                    'available_for_new_account', FALSE,
+                    'control_plane_state', 'disabled',
+                    'current_control_plane_state', 'disabled'
+                )
+            )
         WHEN normalized.slot_status = 'ready' THEN
             jsonb_strip_nulls(
                 (
@@ -151,10 +197,13 @@ SET status = normalized.slot_status,
                         - 'account_id'
                         - 'active_account_id'
                         - 'deployment_id'
-                        - 'verification_job_id'
-                        - 'verification_status'
-                        - 'verification_account_id'
-                        - 'verification_attempt'
+                        - 'login_reservation_id'
+                        - 'login_reservation_status'
+                        - 'login_reservation_account_id'
+                        - 'login_slot_status'
+                        - 'login_slot_account_id'
+                        - 'reserved_account_id'
+                        - 'sticky_account_id'
                         - 'current_control_plane_state'
                         - 'previous_control_plane_state'
                         - 'current_runner_state'
@@ -163,7 +212,19 @@ SET status = normalized.slot_status,
                         - 'previous_state'
                         - 'reason'
                         - 'last_error'
-                ) || normalized.payload_json || jsonb_build_object(
+                ) || (
+                    normalized.payload_json
+                        - 'account_id'
+                        - 'active_account_id'
+                        - 'deployment_id'
+                        - 'login_reservation_id'
+                        - 'login_reservation_status'
+                        - 'login_reservation_account_id'
+                        - 'login_slot_status'
+                        - 'login_slot_account_id'
+                        - 'reserved_account_id'
+                        - 'sticky_account_id'
+                ) || jsonb_build_object(
                     'control_plane_state', 'ready',
                     'current_control_plane_state', 'ready',
                     'available_for_new_account', TRUE
@@ -189,10 +250,10 @@ WHERE s.runner_id = normalized.runner_id
       )
       AND NOT EXISTS (
           SELECT 1
-          FROM account_verification_jobs v
+          FROM account_login_reservations v
           WHERE v.runner_id = s.runner_id
             AND v.slot_id = s.slot_id
-            AND v.status IN ('pending', 'dispatched')
+            AND v.status IN ('pending', 'dispatched', 'verified')
       )
       AND NOT EXISTS (
           SELECT 1
@@ -202,7 +263,15 @@ WHERE s.runner_id = normalized.runner_id
             AND c.delivery_status IN ('pending', 'queued', 'dispatched')
       )
   )
-  AND (
-      s.status IS DISTINCT FROM normalized.slot_status
-      OR s.metadata_json IS DISTINCT FROM normalized.payload_json
-  )
+	  AND (
+	      s.status IS DISTINCT FROM normalized.slot_status
+	      OR (
+	          normalized.over_node_slot_cap
+	          AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'disabled_by_node_slot_cap'), '')), 'false')
+	                NOT IN ('true', '1', 'yes', 'y', 'on')
+	      )
+	      OR (
+	          NOT normalized.over_node_slot_cap
+	          AND s.metadata_json IS DISTINCT FROM normalized.payload_json
+	      )
+	  )

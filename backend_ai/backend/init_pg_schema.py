@@ -14,22 +14,22 @@ CONTROL_PLANE_SCALE_INDEXES: tuple[tuple[str, str], ...] = (
         "WHERE is_active = TRUE AND status <> 'disconnected'",
     ),
     (
-        "idx_account_verification_jobs_account_latest",
-        "ON account_verification_jobs(account_id, requested_at DESC, id DESC)",
+        "idx_account_login_reservations_account_latest",
+        "ON account_login_reservations(account_id, requested_at DESC, id DESC)",
     ),
     (
-        "idx_account_verification_jobs_user_account_latest",
-        "ON account_verification_jobs(user_id, account_id, requested_at DESC, id DESC)",
+        "idx_account_login_reservations_user_account_latest",
+        "ON account_login_reservations(user_id, account_id, requested_at DESC, id DESC)",
     ),
     (
-        "idx_account_verification_jobs_runner_active",
-        "ON account_verification_jobs(runner_id, status, updated_at DESC, id DESC) "
-        "WHERE status IN ('pending', 'dispatched')",
+        "idx_account_login_reservations_runner_active",
+        "ON account_login_reservations(runner_id, status, updated_at DESC, id DESC) "
+        "WHERE status IN ('pending', 'dispatched', 'verified')",
     ),
     (
-        "idx_account_verification_jobs_runner_slot_active",
-        "ON account_verification_jobs(runner_id, slot_id, updated_at DESC, id DESC) "
-        "WHERE status IN ('pending', 'dispatched')",
+        "idx_account_login_reservations_runner_slot_active",
+        "ON account_login_reservations(runner_id, slot_id, updated_at DESC, id DESC) "
+        "WHERE status IN ('pending', 'dispatched', 'verified')",
     ),
     (
         "idx_runner_nodes_status_heartbeat",
@@ -698,11 +698,11 @@ def init_postgres_schema():
                 server TEXT NOT NULL,
                 login TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'connected'
-                    CHECK (status IN ('pending_verification', 'connected', 'verification_failed', 'disconnected')),
+                    CHECK (status IN ('pending_login', 'connected', 'login_failed', 'disconnected')),
                 label TEXT NULL,
                 is_active BOOLEAN NOT NULL DEFAULT TRUE,
                 last_error TEXT NULL,
-                verification_requested_at TIMESTAMPTZ NULL,
+                login_requested_at TIMESTAMPTZ NULL,
                 verified_at TIMESTAMPTZ NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -712,9 +712,42 @@ def init_postgres_schema():
             CREATE INDEX IF NOT EXISTS idx_broker_accounts_user_id ON broker_accounts(user_id);
             CREATE INDEX IF NOT EXISTS idx_broker_accounts_status ON broker_accounts(status);
         """)
+        cur.execute("ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS login_requested_at TIMESTAMPTZ NULL;")
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'broker_accounts'
+                      AND column_name = 'verification_requested_at'
+                ) THEN
+                    EXECUTE 'UPDATE broker_accounts SET login_requested_at = COALESCE(login_requested_at, verification_requested_at) WHERE login_requested_at IS NULL';
+                END IF;
+            END $$;
+        """)
         # Risk policy per account: JSONB de moi field optional (daily_loss_limit_usd,
         # daily_loss_limit_percent, auto_stop_on_breach, ...). UI co the noi rong sau ma
         # khong can migration moi.
+        cur.execute("""
+            ALTER TABLE broker_accounts
+                DROP CONSTRAINT IF EXISTS broker_accounts_status_check;
+        """)
+        cur.execute("""
+            UPDATE broker_accounts
+            SET status = CASE
+                WHEN status = 'pending_verification' THEN 'pending_login'
+                WHEN status = 'verification_failed' THEN 'login_failed'
+                ELSE status
+            END
+            WHERE status IN ('pending_verification', 'verification_failed');
+        """)
+        cur.execute("""
+            ALTER TABLE broker_accounts
+                ADD CONSTRAINT broker_accounts_status_check
+                CHECK (status IN ('pending_login', 'connected', 'login_failed', 'disconnected'));
+        """)
         cur.execute("ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS risk_policy_json JSONB NOT NULL DEFAULT '{}'::jsonb;")
         cur.execute("ALTER TABLE broker_accounts ADD COLUMN IF NOT EXISTS sort_order INTEGER NOT NULL DEFAULT 0;")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_broker_accounts_sort_order ON broker_accounts(user_id, sort_order, id);")
@@ -805,38 +838,75 @@ def init_postgres_schema():
             CREATE INDEX IF NOT EXISTS idx_runner_slots_status ON runner_slots(status);
             CREATE INDEX IF NOT EXISTS idx_runner_slots_current_account_id ON runner_slots(current_account_id);
         """)
-
-        tracker.step("account_verification_jobs")
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS account_verification_jobs (
+            CREATE OR REPLACE FUNCTION enforce_runner_slot_node_cap()
+            RETURNS trigger AS $$
+            DECLARE
+                slot_number INTEGER;
+            BEGIN
+                IF COALESCE(NULLIF(SUBSTRING(NEW.slot_id FROM '([0-9]+)$'), ''), '') <> '' THEN
+                    slot_number := CAST(SUBSTRING(NEW.slot_id FROM '([0-9]+)$') AS INTEGER);
+                    IF slot_number > 10 THEN
+                        NEW.status := 'disabled';
+                        NEW.current_account_id := NULL;
+                        NEW.metadata_json := jsonb_strip_nulls(
+                            COALESCE(NEW.metadata_json, '{}'::jsonb)
+                            || jsonb_build_object(
+                                'disabled_by_node_slot_cap', TRUE,
+                                'node_slot_cap', 10,
+                                'disabled_reason', 'node_slot_cap_10',
+                                'available_for_new_account', FALSE,
+                                'control_plane_state', 'disabled',
+                                'current_control_plane_state', 'disabled'
+                            )
+                        );
+                    END IF;
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+
+            DROP TRIGGER IF EXISTS trg_enforce_runner_slot_node_cap ON runner_slots;
+            CREATE TRIGGER trg_enforce_runner_slot_node_cap
+            BEFORE INSERT OR UPDATE ON runner_slots
+            FOR EACH ROW
+            EXECUTE FUNCTION enforce_runner_slot_node_cap();
+        """)
+
+        tracker.step("account_login_reservations")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS account_login_reservations (
                 id BIGSERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 account_id BIGINT NOT NULL REFERENCES broker_accounts(id) ON DELETE CASCADE,
-                runner_id TEXT NULL REFERENCES runner_nodes(runner_id) ON DELETE SET NULL,
-                slot_id TEXT NULL,
+                runner_id TEXT NOT NULL REFERENCES runner_nodes(runner_id) ON DELETE CASCADE,
+                slot_id TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending', 'dispatched', 'verified', 'failed', 'cancelled')),
-                last_error TEXT NULL,
+                    CHECK (status IN ('pending', 'dispatched', 'verified', 'failed', 'expired', 'released', 'claimed', 'cancelled')),
+                command_id TEXT NULL,
                 trace_id TEXT NULL,
                 redis_stream_id TEXT NULL,
+                last_error TEXT NULL,
                 payload_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                 requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 dispatched_at TIMESTAMPTZ NULL,
                 completed_at TIMESTAMPTZ NULL,
+                expires_at TIMESTAMPTZ NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
-            CREATE INDEX IF NOT EXISTS idx_account_verification_jobs_account_id
-                ON account_verification_jobs(account_id);
-            CREATE INDEX IF NOT EXISTS idx_account_verification_jobs_status
-                ON account_verification_jobs(status);
-            CREATE INDEX IF NOT EXISTS idx_account_verification_jobs_requested_at
-                ON account_verification_jobs(requested_at DESC);
-        """)
-        cur.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS uq_account_verification_jobs_active_account
-                ON account_verification_jobs(account_id)
-                WHERE status IN ('pending', 'dispatched');
+            CREATE INDEX IF NOT EXISTS idx_account_login_reservations_account_latest
+                ON account_login_reservations(account_id, requested_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_account_login_reservations_status_expiry
+                ON account_login_reservations(status, expires_at);
+            CREATE INDEX IF NOT EXISTS idx_account_login_reservations_runner_slot
+                ON account_login_reservations(runner_id, slot_id, updated_at DESC, id DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_account_login_reservations_active_account
+                ON account_login_reservations(account_id)
+                WHERE status IN ('pending', 'dispatched', 'verified');
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_account_login_reservations_active_slot
+                ON account_login_reservations(runner_id, slot_id)
+                WHERE status IN ('pending', 'dispatched', 'verified');
         """)
 
         tracker.step("account_slot_bindings")
@@ -935,9 +1005,9 @@ def init_postgres_schema():
                 id BIGSERIAL PRIMARY KEY,
                 command_id TEXT NOT NULL UNIQUE,
                 command_type TEXT NOT NULL
-                    CHECK (command_type IN ('START_BOT', 'STOP_BOT', 'UPDATE_BOT_CONFIG', 'PLACE_ORDER', 'MODIFY_ORDER', 'CLOSE_ORDER', 'SYNC_STATE')),
+                    CHECK (command_type IN ('RESERVE_OR_LOGIN_SLOT', 'START_BOT', 'STOP_BOT', 'UPDATE_BOT_CONFIG', 'PLACE_ORDER', 'MODIFY_ORDER', 'CLOSE_ORDER', 'SYNC_STATE')),
                 account_id BIGINT NOT NULL REFERENCES broker_accounts(id) ON DELETE CASCADE,
-                deployment_id BIGINT NOT NULL REFERENCES bot_deployments(id) ON DELETE CASCADE,
+                deployment_id BIGINT NULL REFERENCES bot_deployments(id) ON DELETE CASCADE,
                 bot_id TEXT NOT NULL,
                 runner_id TEXT NOT NULL REFERENCES runner_nodes(runner_id) ON DELETE CASCADE,
                 slot_id TEXT NOT NULL,
@@ -964,6 +1034,7 @@ def init_postgres_schema():
                 ON execution_commands(account_id, deployment_id, command_type, trace_id)
                 WHERE trace_id IS NOT NULL;
         """)
+        cur.execute("ALTER TABLE execution_commands ALTER COLUMN deployment_id DROP NOT NULL;")
         cur.execute("""
             ALTER TABLE execution_commands
                 DROP CONSTRAINT IF EXISTS execution_commands_command_type_check;
@@ -972,6 +1043,7 @@ def init_postgres_schema():
             ALTER TABLE execution_commands
                 ADD CONSTRAINT execution_commands_command_type_check
                 CHECK (command_type IN (
+                    'RESERVE_OR_LOGIN_SLOT',
                     'START_BOT', 'STOP_BOT', 'UPDATE_BOT_CONFIG',
                     'PLACE_ORDER', 'MODIFY_ORDER', 'CLOSE_ORDER', 'SYNC_STATE'
                 ));
@@ -983,7 +1055,7 @@ def init_postgres_schema():
                 id BIGSERIAL PRIMARY KEY,
                 event_id TEXT NOT NULL UNIQUE,
                 event_type TEXT NOT NULL
-                    CHECK (event_type IN ('HEARTBEAT', 'BOT_STARTED', 'BOT_STOP_REQUESTED', 'BOT_WORKER_STOPPED', 'BOT_STOPPED', 'SIGNAL_EXECUTOR_PREPARING', 'SIGNAL_EXECUTOR_READY', 'SIGNAL_EXECUTOR_STOPPING', 'SIGNAL_EXECUTOR_STOPPED', 'BOT_LISTENING', 'ORDER_SENT', 'ORDER_FILLED', 'ORDER_REJECTED', 'POSITION_UPDATED', 'SLOT_DEGRADED', 'SLOT_BROKEN', 'RUNTIME_LOG', 'SLOT_STATE_CHANGED', 'SLOT_TERMINAL_KILL_BEGIN', 'SLOT_TERMINAL_KILL_DONE', 'COMMAND_REJECTED')),
+                    CHECK (event_type IN ('HEARTBEAT', 'LOGIN_SLOT_VERIFIED', 'LOGIN_SLOT_FAILED', 'LOGIN_SLOT_RELEASED', 'BOT_STARTED', 'BOT_STOP_REQUESTED', 'BOT_WORKER_STOPPED', 'BOT_STOPPED', 'SIGNAL_EXECUTOR_PREPARING', 'SIGNAL_EXECUTOR_READY', 'SIGNAL_EXECUTOR_STOPPING', 'SIGNAL_EXECUTOR_STOPPED', 'BOT_LISTENING', 'ORDER_SENT', 'ORDER_FILLED', 'ORDER_REJECTED', 'POSITION_UPDATED', 'SLOT_DEGRADED', 'SLOT_BROKEN', 'RUNTIME_LOG', 'SLOT_STATE_CHANGED', 'SLOT_TERMINAL_KILL_BEGIN', 'SLOT_TERMINAL_KILL_DONE', 'COMMAND_REJECTED')),
                 account_id BIGINT NULL REFERENCES broker_accounts(id) ON DELETE CASCADE,
                 deployment_id BIGINT NULL REFERENCES bot_deployments(id) ON DELETE CASCADE,
                 bot_id TEXT NULL,
@@ -1015,7 +1087,9 @@ def init_postgres_schema():
             ALTER TABLE execution_events
                 ADD CONSTRAINT execution_events_event_type_check
                 CHECK (event_type IN (
-                    'HEARTBEAT', 'BOT_STARTED',
+                    'HEARTBEAT',
+                    'LOGIN_SLOT_VERIFIED', 'LOGIN_SLOT_FAILED', 'LOGIN_SLOT_RELEASED',
+                    'BOT_STARTED',
                     'BOT_STOP_REQUESTED', 'BOT_WORKER_STOPPED', 'BOT_STOPPED',
                     'SIGNAL_EXECUTOR_PREPARING', 'SIGNAL_EXECUTOR_READY',
                     'SIGNAL_EXECUTOR_STOPPING', 'SIGNAL_EXECUTOR_STOPPED',
@@ -1062,7 +1136,7 @@ def init_postgres_schema():
                 deployment_id BIGINT NULL REFERENCES bot_deployments(id) ON DELETE SET NULL,
                 runner_id TEXT NULL REFERENCES runner_nodes(runner_id) ON DELETE SET NULL,
                 slot_id TEXT NULL,
-                connection_status TEXT NOT NULL DEFAULT 'pending_verification',
+                connection_status TEXT NOT NULL DEFAULT 'pending_login',
                 pnl NUMERIC NULL,
                 balance NUMERIC NULL,
                 equity NUMERIC NULL,

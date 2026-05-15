@@ -22,6 +22,6 @@ JOIN broker_accounts a ON a.id = d.account_id
 WHERE d.user_id = %s
   AND (
       d.status = ANY(%s)
-      OR d.updated_at >= COALESCE(a.verification_requested_at, a.created_at)
+      OR d.updated_at >= COALESCE(a.login_requested_at, a.created_at)
   )
 ORDER BY d.updated_at DESC, d.id DESC

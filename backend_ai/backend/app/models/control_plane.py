@@ -10,9 +10,9 @@ class ProfileClass(str, Enum):
 
 
 class BrokerAccountStatus(str, Enum):
-    PENDING_VERIFICATION = "pending_verification"
+    PENDING_LOGIN = "pending_login"
     CONNECTED = "connected"
-    VERIFICATION_FAILED = "verification_failed"
+    LOGIN_FAILED = "login_failed"
     DISCONNECTED = "disconnected"
 
 
@@ -45,6 +45,7 @@ class SlotStatus(str, Enum):
 
 
 class CommandType(str, Enum):
+    RESERVE_OR_LOGIN_SLOT = "RESERVE_OR_LOGIN_SLOT"
     START_BOT = "START_BOT"
     STOP_BOT = "STOP_BOT"
     UPDATE_BOT_CONFIG = "UPDATE_BOT_CONFIG"
@@ -56,6 +57,9 @@ class CommandType(str, Enum):
 
 class EventType(str, Enum):
     HEARTBEAT = "HEARTBEAT"
+    LOGIN_SLOT_VERIFIED = "LOGIN_SLOT_VERIFIED"
+    LOGIN_SLOT_FAILED = "LOGIN_SLOT_FAILED"
+    LOGIN_SLOT_RELEASED = "LOGIN_SLOT_RELEASED"
     BOT_STARTED = "BOT_STARTED"
     BOT_STOP_REQUESTED = "BOT_STOP_REQUESTED"
     BOT_WORKER_STOPPED = "BOT_WORKER_STOPPED"

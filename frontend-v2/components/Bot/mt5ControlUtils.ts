@@ -14,11 +14,7 @@ export function isMt5AccountReady(account: MT5AccountItem | null): boolean {
     return false;
   }
   const status = String(account.status || "").trim().toLowerCase();
-  return (
-    status === "connected" ||
-    Boolean(account.verified_at) ||
-    (status === "pending_verification" && Boolean(account.has_credentials))
-  );
+  return status === "connected" || Boolean(account.verified_at);
 }
 
 export function isTransitionalDeploymentStatus(status?: string | null): boolean {
@@ -133,11 +129,11 @@ export function humanizeAccountStatus(account: MT5AccountItem | null): string {
   }
   const status = String(account.status || "").trim().toLowerCase();
   if (status === "connected") return "Đã kết nối";
-  if (status === "pending_verification" && account.has_credentials) {
-    return "Đã lưu, đang chờ xác minh";
+  if (status === "pending_login" && account.has_credentials) {
+    return "Đã lưu, đang đăng nhập MT5";
   }
-  if (status === "pending_verification") return "Cần nhập thông tin đăng nhập";
-  if (status === "verification_failed") return "Không đăng nhập được";
+  if (status === "pending_login") return "Cần nhập thông tin đăng nhập";
+  if (status === "login_failed") return "Không đăng nhập được";
   return account.status || "Đang cập nhật";
 }
 
@@ -214,15 +210,14 @@ export function getAccountStatusPillClassName(account: MT5AccountItem | null): s
 
   if (
     status === "connected" ||
-    Boolean(account?.verified_at) ||
-    (status === "pending_verification" && Boolean(account?.has_credentials))
+    Boolean(account?.verified_at)
   ) {
     return "border-emerald-300/25 bg-emerald-300/10 text-emerald-100";
   }
-  if (status === "pending_verification") {
+  if (status === "pending_login") {
     return "border-amber-300/25 bg-amber-300/10 text-amber-100";
   }
-  if (status === "verification_failed") {
+  if (status === "login_failed") {
     return "border-rose-300/25 bg-rose-300/10 text-rose-100";
   }
   return "border-white/10 bg-transparent text-cyber-muted";

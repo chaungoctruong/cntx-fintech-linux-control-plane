@@ -7,10 +7,13 @@ SET status = 'ready',
                 - 'account_id'
                 - 'active_account_id'
                 - 'deployment_id'
-                - 'verification_job_id'
-                - 'verification_status'
-                - 'verification_account_id'
-                - 'verification_attempt'
+                - 'login_reservation_id'
+                - 'login_reservation_status'
+                - 'login_reservation_account_id'
+                - 'login_slot_status'
+                - 'login_slot_account_id'
+                - 'reserved_account_id'
+                - 'sticky_account_id'
                 - 'current_control_plane_state'
                 - 'previous_control_plane_state'
                 - 'current_runner_state'
@@ -19,7 +22,19 @@ SET status = 'ready',
                 - 'previous_state'
                 - 'reason'
                 - 'last_error'
-        ) || %s::jsonb || jsonb_build_object(
+        ) || (
+            %s::jsonb
+                - 'account_id'
+                - 'active_account_id'
+                - 'deployment_id'
+                - 'login_reservation_id'
+                - 'login_reservation_status'
+                - 'login_reservation_account_id'
+                - 'login_slot_status'
+                - 'login_slot_account_id'
+                - 'reserved_account_id'
+                - 'sticky_account_id'
+        ) || jsonb_build_object(
             'control_plane_state', 'ready',
             'current_control_plane_state', 'ready'
         )
@@ -38,10 +53,10 @@ WHERE s.runner_id = %s
   )
   AND NOT EXISTS (
       SELECT 1
-      FROM account_verification_jobs v
+      FROM account_login_reservations v
       WHERE v.runner_id = s.runner_id
         AND v.slot_id = s.slot_id
-        AND v.status IN ('pending', 'dispatched')
+        AND v.status IN ('pending', 'dispatched', 'verified')
   )
   AND NOT EXISTS (
       SELECT 1

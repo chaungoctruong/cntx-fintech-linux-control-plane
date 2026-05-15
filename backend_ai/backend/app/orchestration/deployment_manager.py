@@ -51,6 +51,14 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _canonical_slot_id(value: Any) -> str:
+    raw = str(value or "").strip()
+    lowered = raw.lower()
+    if lowered.startswith("slot_") or lowered.startswith("slot-"):
+        return f"slot-{raw[5:]}"
+    return raw
+
+
 _BOT_EXECUTION_CONTRACT_TEXT_KEYS = (
     "bot_type",
     "execution_owner",
@@ -66,6 +74,49 @@ def _contract_bool(value: Any) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _risk_policy_number(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _risk_policy_tz_offset(value: Any) -> int:
+    try:
+        offset = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return min(14 * 60, max(-14 * 60, offset))
+
+
+def _runner_risk_policy_contract(*, policy: Any, user_id: int, account_id: int, deployment_id: int) -> dict[str, Any]:
+    raw = policy if isinstance(policy, dict) else {}
+    daily_loss_limit_usd = _risk_policy_number(raw.get("daily_loss_limit_usd"))
+    daily_loss_limit_percent = _risk_policy_number(raw.get("daily_loss_limit_percent"))
+    configured = bool(raw)
+    auto_stop_on_breach = bool(raw.get("auto_stop_on_breach"))
+    return {
+        "schema_version": "account_risk_policy.v1",
+        "source": "broker_accounts.risk_policy_json",
+        "policy_source": "tenant_account" if configured else "system_default",
+        "scope": "account",
+        "configured": configured,
+        "enforcement_enabled": bool(auto_stop_on_breach and (daily_loss_limit_usd or daily_loss_limit_percent)),
+        "user_id": int(user_id),
+        "account_id": int(account_id),
+        "deployment_id": int(deployment_id),
+        "daily_loss_limit_usd": daily_loss_limit_usd,
+        "daily_loss_limit_percent": daily_loss_limit_percent,
+        "auto_stop_on_breach": auto_stop_on_breach,
+        "timezone_offset_minutes": _risk_policy_tz_offset(raw.get("timezone_offset_minutes")),
+        "updated_at": raw.get("updated_at"),
+        "updated_by": raw.get("updated_by"),
+    }
 
 
 def _iter_contract_sources(*sources: Any) -> list[dict[str, Any]]:
@@ -121,8 +172,6 @@ def _runner_queue_depths(runner_ids: list[str]) -> dict[str, dict[str, int]]:
         keys: list[tuple[str, str]] = []
         for runner_id in ids:
             for name, key in (
-                ("verification", f"mt5:runner:{runner_id}:verification"),
-                ("verification_processing", f"mt5:runner:{runner_id}:verification:processing"),
                 ("commands", f"mt5:runner:{runner_id}:commands"),
                 ("commands_processing", f"mt5:runner:{runner_id}:commands:processing"),
             ):
@@ -134,8 +183,6 @@ def _runner_queue_depths(runner_ids: list[str]) -> dict[str, dict[str, int]]:
 
     out: dict[str, dict[str, int]] = {
         runner_id: {
-            "verification": 0,
-            "verification_processing": 0,
             "commands": 0,
             "commands_processing": 0,
         }
@@ -158,9 +205,7 @@ def _inject_runner_queue_depths(slots: list[dict[str, Any]]) -> list[dict[str, A
         depths = depths_by_runner.get(runner_id)
         if depths:
             command_depth = _safe_int(depths.get("commands")) + _safe_int(depths.get("commands_processing"))
-            verification_depth = _safe_int(depths.get("verification")) + _safe_int(depths.get("verification_processing"))
             item["runner_command_queue_depth"] = command_depth
-            item["runner_verification_queue_depth"] = verification_depth
             item["runner_queue_backlog_threshold"] = threshold
             item["runner_queue_depth"] = dict(depths)
         out.append(item)
@@ -252,6 +297,12 @@ class DeploymentManagerService:
             "config": deployment_config,
             "sticky_reused": sticky_reused,
         }
+        payload["risk_policy"] = _runner_risk_policy_contract(
+            policy=account.get("account_risk_policy") or account.get("risk_policy_json") or {},
+            user_id=int(account.get("user_id") or deployment.get("user_id") or 0),
+            account_id=int(account["id"]),
+            deployment_id=int(deployment["id"]),
+        )
         payload.update(execution_contract)
         required_params = list(bot.get("required_params") or [])
         if required_params:
@@ -262,7 +313,102 @@ class DeploymentManagerService:
             payload["risk_profile"] = risk_profile
         if extra:
             payload.update(dict(extra))
+        if payload.get("reuse_login_slot"):
+            # START after RESERVE_OR_LOGIN_SLOT must attach to the prepared MT5
+            # session. The bot manifest may still request a clean terminal for
+            # cold starts; overriding that here prevents Windows from killing or
+            # re-handoffing the already-verified login slot.
+            reuse_contract = {
+                "reuse_login_slot": True,
+                "runtime_login_already_verified": True,
+                "keep_prepared_session": True,
+                "reuse_prepared_terminal": True,
+                "attach_existing_terminal": True,
+                "skip_terminal_cleanup_on_start": True,
+                "requires_clean_terminal_on_start": False,
+            }
+            payload.update(reuse_contract)
+            payload["resource_hints"] = {
+                **dict(payload.get("resource_hints") or {}),
+                **reuse_contract,
+            }
+            if isinstance(payload.get("runtime_env"), dict):
+                payload["runtime_env"] = {
+                    **dict(payload.get("runtime_env") or {}),
+                    **reuse_contract,
+                }
         return payload
+
+    async def _cleanup_start_dispatch_failure(
+        self,
+        *,
+        deployment: dict[str, Any],
+        reason: str,
+        error: Exception,
+        login_reservation_id: Any = None,
+    ) -> None:
+        deployment_id = int(deployment.get("id") or 0)
+        account_id = int(deployment.get("account_id") or 0)
+        reason_s = str(reason or "start_dispatch_failed").strip()[:200] or "start_dispatch_failed"
+        if account_id > 0 and login_reservation_id:
+            try:
+                self._repo.release_claimed_login_reservation(
+                    reservation_id=int(login_reservation_id),
+                    account_id=account_id,
+                    reason=reason_s,
+                )
+            except Exception as cleanup_exc:
+                log_agent_event(
+                    _intent_log,
+                    logging.WARNING,
+                    "deployment.start.claimed_login_release_failed",
+                    hint="START_BOT dispatch failed, but releasing the claimed login slot also failed.",
+                    operation="start_dispatch_cleanup",
+                    outcome="cleanup_failed",
+                    account_id=account_id,
+                    deployment_id=deployment_id or None,
+                    login_reservation_id=login_reservation_id,
+                    error=str(cleanup_exc)[:300],
+                )
+        try:
+            await self.cancel_pending_deployment(deployment=deployment, reason=reason_s)
+        except Exception as cleanup_exc:
+            if deployment_id > 0:
+                self._repo.update_deployment_status(
+                    deployment_id=deployment_id,
+                    status="failed",
+                    desired_state="stopped",
+                    is_active=False,
+                    health_status="start_dispatch_failed",
+                    last_error=reason_s,
+                    stopped=True,
+                )
+            if account_id > 0:
+                runner_id = str(deployment.get("runner_id") or "").strip()
+                slot_id = str(deployment.get("slot_id") or "").strip()
+                if runner_id and slot_id:
+                    self._repo.release_account_slot_binding(
+                        account_id=account_id,
+                        runner_id=runner_id,
+                        slot_id=slot_id,
+                        keep_sticky=False,
+                    )
+                self._repo.fail_pending_start_commands_for_account(
+                    account_id=account_id,
+                    reason=reason_s,
+                )
+            log_agent_event(
+                _intent_log,
+                logging.WARNING,
+                "deployment.start.dispatch_cleanup_fallback",
+                hint="START_BOT dispatch failed and cancel cleanup did not complete; fallback marked deployment failed and released binding.",
+                operation="start_dispatch_cleanup",
+                outcome="fallback_applied",
+                account_id=account_id or None,
+                deployment_id=deployment_id or None,
+                original_error=str(error)[:300],
+                cleanup_error=str(cleanup_exc)[:300],
+            )
 
     async def _request_replacement_start(
         self,
@@ -536,17 +682,25 @@ class DeploymentManagerService:
                 "intent_seq": int(updated.get("intent_seq") or 0),
             },
         )
-        command = await self._command_router.dispatch(
-            command_type=CommandType.START_BOT,
-            account_id=int(updated["account_id"]),
-            deployment_id=int(updated["id"]),
-            bot_id=str((bot or {}).get("bot_code") or (bot or {}).get("bot_id") or updated.get("bot_code") or ""),
-            runner_id=decision.runner_id,
-            slot_id=decision.slot_id,
-            priority=90 if str((bot or {}).get("profile_class") or "") == "heavy" else 50,
-            payload=payload,
-            trace_id=start_trace_id,
-        )
+        try:
+            command = await self._command_router.dispatch(
+                command_type=CommandType.START_BOT,
+                account_id=int(updated["account_id"]),
+                deployment_id=int(updated["id"]),
+                bot_id=str((bot or {}).get("bot_code") or (bot or {}).get("bot_id") or updated.get("bot_code") or ""),
+                runner_id=decision.runner_id,
+                slot_id=decision.slot_id,
+                priority=90 if str((bot or {}).get("profile_class") or "") == "heavy" else 50,
+                payload=payload,
+                trace_id=start_trace_id,
+            )
+        except Exception as exc:
+            await self._cleanup_start_dispatch_failure(
+                deployment=updated,
+                reason="replacement_start_dispatch_failed",
+                error=exc,
+            )
+            raise
         self._repo.insert_deployment_audit(
             deployment_id=int(updated["id"]),
             action="deployment.replacement_start_requested",
@@ -586,6 +740,14 @@ class DeploymentManagerService:
         start_payload_extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         deployment_mode = _normalize_deployment_mode(mode)
+        start_extra = dict(start_payload_extra or {})
+        claimed_login_runner_id = str(start_extra.get("login_slot_runner_id") or "").strip()
+        claimed_login_slot_id = _canonical_slot_id(start_extra.get("login_slot_slot_id"))
+        reuse_claimed_login_slot = bool(
+            start_extra.get("reuse_login_slot")
+            and claimed_login_runner_id
+            and claimed_login_slot_id
+        )
         self._catalog_loader.sync_catalog(force=False)
         bot = self._repo.get_bot_by_name(bot_name=bot_name)
         if deployment_mode == "paper" and bot and bot.get("supports_demo") is False:
@@ -608,15 +770,22 @@ class DeploymentManagerService:
                 mode=deployment_mode,
                 blocker=blocker,
             )
-        verification_job = self._repo.get_active_account_verification_job(account_id=int(account["id"]))
-        if verification_job:
-            raise OrchestrationPolicyError("account_verification_in_progress")
         pending_command = self._repo.get_pending_account_start_stop_command(account_id=int(account["id"]))
         if pending_command:
             raise OrchestrationPolicyError("start_transition_in_progress")
-        self._repo.prepare_sticky_slot_for_reuse(account_id=int(account["id"]))
+        if not reuse_claimed_login_slot:
+            self._repo.prepare_sticky_slot_for_reuse(account_id=int(account["id"]))
 
-        decision = self._pick_slot(account_id=int(account["id"]), bot=bot or {})
+        if reuse_claimed_login_slot:
+            decision = SchedulerDecision(
+                ok=True,
+                runner_id=claimed_login_runner_id,
+                slot_id=claimed_login_slot_id,
+                reason="claimed_login_slot",
+                sticky_reused=True,
+            )
+        else:
+            decision = self._pick_slot(account_id=int(account["id"]), bot=bot or {})
         if not decision.ok and decision.reason == "sticky_slot_unavailable":
             # Public START can arrive in the small window after BOT_STOPPED
             # persisted but before slot projection has fully settled. Reconcile
@@ -661,7 +830,6 @@ class DeploymentManagerService:
         if new_seq is not None:
             deployment["intent_seq"] = new_seq
 
-        start_extra = dict(start_payload_extra or {})
         if "intent_seq" not in start_extra and new_seq is not None:
             start_extra["intent_seq"] = int(new_seq)
         payload = self._start_payload(
@@ -673,17 +841,26 @@ class DeploymentManagerService:
             sticky_reused=bool(decision.sticky_reused),
             extra=start_extra,
         )
-        command = await self._command_router.dispatch(
-            command_type=CommandType.START_BOT,
-            account_id=int(account["id"]),
-            deployment_id=int(deployment["id"]),
-            bot_id=str(bot.get("bot_code") or bot.get("bot_id") or ""),
-            runner_id=decision.runner_id,
-            slot_id=decision.slot_id,
-            priority=90 if str(bot.get("profile_class") or "") == "heavy" else 50,
-            payload=payload,
-            trace_id=trace_id,
-        )
+        try:
+            command = await self._command_router.dispatch(
+                command_type=CommandType.START_BOT,
+                account_id=int(account["id"]),
+                deployment_id=int(deployment["id"]),
+                bot_id=str(bot.get("bot_code") or bot.get("bot_id") or ""),
+                runner_id=decision.runner_id,
+                slot_id=decision.slot_id,
+                priority=90 if str(bot.get("profile_class") or "") == "heavy" else 50,
+                payload=payload,
+                trace_id=trace_id,
+            )
+        except Exception as exc:
+            await self._cleanup_start_dispatch_failure(
+                deployment=deployment,
+                reason="start_dispatch_failed",
+                error=exc,
+                login_reservation_id=start_extra.get("login_reservation_id"),
+            )
+            raise
         return {
             "deployment": deployment,
             "command": command,

@@ -11,15 +11,15 @@ WITH slot_stats AS (
       ON s.runner_id = n.runner_id
      AND (
          COALESCE(NULLIF(SUBSTRING(s.slot_id FROM '([0-9]+)$'), ''), '') = ''
-         OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= GREATEST(1, n.max_slots)
+         OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(10, GREATEST(1, n.max_slots))
      )
     GROUP BY n.runner_id
 ),
-verification_stats AS (
+login_reservation_stats AS (
     SELECT
         runner_id,
-        COUNT(*) FILTER (WHERE status IN ('pending', 'dispatched')) AS verifying_slots
-    FROM account_verification_jobs
+        COUNT(*) FILTER (WHERE status IN ('pending', 'dispatched', 'verified')) AS login_reserved_slots
+    FROM account_login_reservations
     WHERE runner_id IS NOT NULL
     GROUP BY runner_id
 )
@@ -35,10 +35,10 @@ SET metadata_json = COALESCE(n.metadata_json, '{}'::jsonb)
         'reported_degraded_slots', COALESCE(slot_stats.degraded_slots, 0),
         'reported_slots_broken', COALESCE(slot_stats.broken_slots, 0),
         'reported_broken_slots', COALESCE(slot_stats.broken_slots, 0),
-        'reported_slots_verifying', COALESCE(verification_stats.verifying_slots, 0),
-        'reported_verifying_slots', COALESCE(verification_stats.verifying_slots, 0)
+        'reported_slots_login_reserved', COALESCE(login_reservation_stats.login_reserved_slots, 0),
+        'reported_login_reserved_slots', COALESCE(login_reservation_stats.login_reserved_slots, 0)
     ),
     updated_at = NOW()
 FROM slot_stats
-LEFT JOIN verification_stats ON verification_stats.runner_id = slot_stats.runner_id
+LEFT JOIN login_reservation_stats ON login_reservation_stats.runner_id = slot_stats.runner_id
 WHERE n.runner_id = slot_stats.runner_id

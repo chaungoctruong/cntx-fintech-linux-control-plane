@@ -19,13 +19,10 @@ def validate_account_ready(account: Optional[dict[str, Any]]) -> None:
     if not account:
         raise OrchestrationPolicyError("account_not_found")
     status = str(account.get("status") or "").strip().lower()
-    verification_state = str(account.get("verification_state") or "").strip().upper()
-    has_credentials = bool(account.get("has_credentials"))
     if account.get("has_credentials") is False:
         raise OrchestrationPolicyError("account_credentials_unavailable")
-    if status == "pending_verification" and has_credentials:
-        return
-    if status != "connected" and verification_state != "VERIFIED":
+    login_state = str(account.get("login_state") or "").strip().upper()
+    if status != "connected" and login_state != "READY":
         raise OrchestrationPolicyError("account_not_connected")
 
 

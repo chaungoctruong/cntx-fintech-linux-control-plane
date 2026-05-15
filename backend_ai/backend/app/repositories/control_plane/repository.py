@@ -8,13 +8,13 @@ from app.store import Store
 from app.repositories.control_plane.mixins.accounts import ControlPlaneAccountsMixin
 from app.repositories.control_plane.mixins.commands import ControlPlaneCommandsMixin
 from app.repositories.control_plane.mixins.deployments import ControlPlaneDeploymentsMixin
+from app.repositories.control_plane.mixins.login_reservations import ControlPlaneLoginReservationsMixin
 from app.repositories.control_plane.mixins.runners_slots import ControlPlaneRunnersSlotsMixin
 from app.repositories.control_plane.mixins.tradingview import ControlPlaneTradingViewMixin
 from app.repositories.control_plane.mixins.users import ControlPlaneUserMixin
-from app.repositories.control_plane.mixins.verification import ControlPlaneVerificationMixin
 from app.repositories.control_plane.query_loader import load_sql
 from app.repositories.control_plane.support import (
-    _decorate_account_verification_projection,
+    _decorate_account_login_projection,
     _epoch_now,
     _json_list,
     _json_loads_if_string,
@@ -28,9 +28,9 @@ from app.repositories.control_plane.support import (
 
 class ControlPlaneRepository(
     ControlPlaneRunnersSlotsMixin,
+    ControlPlaneLoginReservationsMixin,
     ControlPlaneCommandsMixin,
     ControlPlaneDeploymentsMixin,
-    ControlPlaneVerificationMixin,
     ControlPlaneAccountsMixin,
     ControlPlaneTradingViewMixin,
     ControlPlaneUserMixin,
@@ -65,7 +65,7 @@ class ControlPlaneRepository(
     _SQL_GET_OPS_SUMMARY_EVENTS = load_sql("ops_summary/get_ops_summary_events.sql")
     _SQL_GET_OPS_SUMMARY_RUNNERS = load_sql("ops_summary/get_ops_summary_runners.sql")
     _SQL_GET_OPS_SUMMARY_SLOTS = load_sql("ops_summary/get_ops_summary_slots.sql")
-    _SQL_GET_OPS_SUMMARY_VERIFICATION = load_sql("ops_summary/get_ops_summary_verification.sql")
+    _SQL_GET_OPS_SUMMARY_LOGIN_SLOTS = load_sql("ops_summary/get_ops_summary_login_slots.sql")
     _SQL_GET_RUNTIME_HEALTH_ACCOUNTS = load_sql("runtime_health/get_runtime_health_accounts.sql")
     _SQL_GET_RUNTIME_HEALTH_DEPLOYMENTS = load_sql("runtime_health/get_runtime_health_deployments.sql")
     _SQL_GET_RUNTIME_HEALTH_EVENTS = load_sql("runtime_health/get_runtime_health_events.sql")
@@ -98,6 +98,10 @@ class ControlPlaneRepository(
         "reconcile/reconcile_mark_deployments_health_stale.sql"
     )
     _SQL_RECONCILE_MARK_RUNNER_NODES_OFFLINE = load_sql("reconcile/reconcile_mark_runner_nodes_offline.sql")
+    _SQL_RECONCILE_ACTIVE_DEPLOYMENTS_ON_READY_SLOTS = load_sql(
+        "reconcile/reconcile_active_deployments_on_ready_slots.sql"
+    )
+    _SQL_RECONCILE_ORPHAN_ALLOCATED_SLOTS = load_sql("reconcile/reconcile_orphan_allocated_slots.sql")
     _SQL_RECONCILE_REFRESH_RUNNER_SLOT_COUNTS_METADATA = load_sql(
         "reconcile/reconcile_refresh_runner_slot_counts_metadata.sql"
     )
@@ -536,10 +540,10 @@ class ControlPlaneRepository(
             )
             row = cur.fetchone()
             return (
-                _decorate_account_verification_projection(
+                _decorate_account_login_projection(
                     dict(row),
                     account_status_key="connection_status",
-                    job_status_key="verification_job_status",
+                    reservation_status_key="login_reservation_status",
                 )
                 if row
                 else None
@@ -659,9 +663,45 @@ class ControlPlaneRepository(
             sticky_projection_refreshed = int(cur.rowcount or 0)
 
             cur.execute(
+                self._SQL_RECONCILE_ORPHAN_ALLOCATED_SLOTS,
+                (runner_cutoff, stop_cutoff),
+            )
+            orphan_slot_row = dict(cur.fetchone() or {})
+            reconciled_orphan_allocated_slots = _safe_int(
+                orphan_slot_row.get("reconciled_orphan_allocated_slots"),
+                0,
+            )
+            released_orphan_allocated_bindings = _safe_int(
+                orphan_slot_row.get("released_orphan_allocated_bindings"),
+                0,
+            )
+
+            cur.execute(
                 self._SQL_RECONCILE_REFRESH_RUNNER_SLOT_COUNTS_METADATA,
             )
             runner_projection_refreshed = int(cur.rowcount or 0)
+
+            cur.execute(
+                self._SQL_RECONCILE_ACTIVE_DEPLOYMENTS_ON_READY_SLOTS,
+                (list(ACTIVE_DEPLOYMENT_STATUSES), runner_cutoff, stop_cutoff, runner_cutoff),
+            )
+            zero_runtime_row = dict(cur.fetchone() or {})
+            reconciled_active_zero_runtime_deployments = _safe_int(
+                zero_runtime_row.get("reconciled_active_zero_runtime_deployments"),
+                0,
+            )
+            reconciled_active_zero_runtime_slots = _safe_int(
+                zero_runtime_row.get("reconciled_active_zero_runtime_slots"),
+                0,
+            )
+            failed_zero_runtime_start_commands = _safe_int(
+                zero_runtime_row.get("failed_zero_runtime_start_commands"),
+                0,
+            )
+            acknowledged_zero_runtime_stop_commands = _safe_int(
+                zero_runtime_row.get("acknowledged_zero_runtime_stop_commands"),
+                0,
+            )
 
             return {
                 "stale_runners": stale_runners,
@@ -672,7 +712,13 @@ class ControlPlaneRepository(
                 "acknowledged_stale_stop_commands": acknowledged_stale_stop_commands,
                 "slot_projection_refreshed": slot_projection_refreshed,
                 "sticky_projection_refreshed": sticky_projection_refreshed,
+                "reconciled_orphan_allocated_slots": reconciled_orphan_allocated_slots,
+                "released_orphan_allocated_bindings": released_orphan_allocated_bindings,
                 "runner_projection_refreshed": runner_projection_refreshed,
+                "reconciled_active_zero_runtime_deployments": reconciled_active_zero_runtime_deployments,
+                "reconciled_active_zero_runtime_slots": reconciled_active_zero_runtime_slots,
+                "failed_zero_runtime_start_commands": failed_zero_runtime_start_commands,
+                "acknowledged_zero_runtime_stop_commands": acknowledged_zero_runtime_stop_commands,
             }
 
         return self._store._with_retry_locked(_do)
@@ -771,9 +817,9 @@ class ControlPlaneRepository(
             slots = dict(cur.fetchone() or {})
 
             cur.execute(
-                self._SQL_GET_OPS_SUMMARY_VERIFICATION,
+                self._SQL_GET_OPS_SUMMARY_LOGIN_SLOTS,
             )
-            verification = dict(cur.fetchone() or {})
+            login_slots = dict(cur.fetchone() or {})
 
             cur.execute(
                 self._SQL_GET_OPS_SUMMARY_COMMANDS,
@@ -805,7 +851,7 @@ class ControlPlaneRepository(
                 "runner_ids": runner_ids,
                 "runners": runners,
                 "slots": slots,
-                "verification": verification,
+                "login_slots": login_slots,
                 "commands": commands,
                 "deployments": deployments,
                 "events": events,
@@ -1147,4 +1193,3 @@ class ControlPlaneRepository(
             return out
 
         return self._store._with_retry_read(_do)
-

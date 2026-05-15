@@ -20,7 +20,6 @@ Mỗi thư mục con là một **bounded context**: chỉ chứa file `.sql` thu
 | `snapshots/` | [snapshots/README.md](snapshots/README.md) | Snapshot account/position |
 | `user_webhooks/` | [user_webhooks/README.md](user_webhooks/README.md) | Webhook user |
 | `users/` | [users/README.md](users/README.md) | Metadata user |
-| `verification/` | [verification/README.md](verification/README.md) | Job verify account (read SQL) |
 
 ## Quy tắc chung
 

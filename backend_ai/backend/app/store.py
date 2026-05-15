@@ -15,7 +15,7 @@ log = logging.getLogger("store")
 
 SECURITY_CRITICAL_AUDIT_ACTIONS = (
     "account.connect",
-    "account.verify",
+    "account.login_slot.requested",
     "user.delete",
     "account.circuit_breaker.trigger",
     "account.risk_policy.update",

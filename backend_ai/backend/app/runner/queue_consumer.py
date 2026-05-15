@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Optional
 
 from app.core.redis_client import get_redis_write
@@ -14,25 +13,15 @@ class MT5RunnerRedisQueueConsumer:
             raise ValueError("runner_id_required")
         self._redis_client = redis_client
         self._command_queue = f"mt5:runner:{self._runner_id}:commands"
-        self._verification_queue = f"mt5:runner:{self._runner_id}:verification"
         self._command_processing_queue = f"{self._command_queue}:processing"
-        self._verification_processing_queue = f"{self._verification_queue}:processing"
 
     @property
     def command_queue(self) -> str:
         return self._command_queue
 
     @property
-    def verification_queue(self) -> str:
-        return self._verification_queue
-
-    @property
     def command_processing_queue(self) -> str:
         return self._command_processing_queue
-
-    @property
-    def verification_processing_queue(self) -> str:
-        return self._verification_processing_queue
 
     async def _redis(self) -> Any:
         if self._redis_client is not None:
@@ -60,13 +49,6 @@ class MT5RunnerRedisQueueConsumer:
         envelope = decode_queue_payload(source_queue, str(raw or ""))
         return envelope.model_copy(update={"processing_queue_name": processing_queue})
 
-    async def pop_next_verification(self, *, timeout_sec: int = 5) -> Optional[QueueEnvelope]:
-        return await self._blocking_dequeue_to_processing(
-            source_queue=self._verification_queue,
-            processing_queue=self._verification_processing_queue,
-            timeout_sec=timeout_sec,
-        )
-
     async def pop_next_command(self, *, timeout_sec: int = 5) -> Optional[QueueEnvelope]:
         return await self._blocking_dequeue_to_processing(
             source_queue=self._command_queue,
@@ -75,19 +57,7 @@ class MT5RunnerRedisQueueConsumer:
         )
 
     async def pop_next(self, *, timeout_sec: int = 5) -> Optional[QueueEnvelope]:
-        deadline = asyncio.get_running_loop().time() + max(1, int(timeout_sec))
-        while True:
-            verification = await self.pop_next_verification(timeout_sec=1)
-            if verification is not None:
-                return verification
-            remaining = deadline - asyncio.get_running_loop().time()
-            if remaining <= 0:
-                return None
-            command = await self.pop_next_command(timeout_sec=min(1, max(1, int(remaining))))
-            if command is not None:
-                return command
-            if asyncio.get_running_loop().time() >= deadline:
-                return None
+        return await self.pop_next_command(timeout_sec=timeout_sec)
 
     async def ack(self, envelope: QueueEnvelope) -> None:
         processing_queue = str(envelope.processing_queue_name or "").strip()
@@ -107,12 +77,7 @@ class MT5RunnerRedisQueueConsumer:
 
     async def recover_inflight(self) -> dict[str, int]:
         redis = await self._redis()
-        recovered = {"verification": 0, "command": 0}
-        while True:
-            raw = await redis.rpoplpush(self._verification_processing_queue, self._verification_queue)
-            if raw is None:
-                break
-            recovered["verification"] += 1
+        recovered = {"command": 0}
         while True:
             raw = await redis.rpoplpush(self._command_processing_queue, self._command_queue)
             if raw is None:

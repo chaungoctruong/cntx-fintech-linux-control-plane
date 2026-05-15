@@ -21,7 +21,13 @@ def _has_stale_runtime(result: dict[str, int]) -> bool:
             "stale_accounts",
             "reconciled_stop_requested_deployments",
             "failed_stale_start_commands",
+            "failed_acknowledged_start_commands",
             "acknowledged_stale_stop_commands",
+            "reconciled_orphan_allocated_slots",
+            "reconciled_active_zero_runtime_deployments",
+            "failed_zero_runtime_start_commands",
+            "acknowledged_zero_runtime_stop_commands",
+            "expired_login_reservations",
         )
     )
 
@@ -62,6 +68,9 @@ class ControlPlaneReconcilerService:
             if hasattr(self._repo, "reconcile_start_bootstrap_failures"):
                 bootstrap_result = self._repo.reconcile_start_bootstrap_failures()
                 result = {**dict(result), **dict(bootstrap_result or {})}
+            if hasattr(self._repo, "release_expired_login_reservations"):
+                expired_login_reservations = self._repo.release_expired_login_reservations()
+                result = {**dict(result), "expired_login_reservations": int(expired_login_reservations or 0)}
             if _sticky_midnight_release_enabled() and hasattr(self._repo, "release_expired_sticky_slot_bindings"):
                 release_result = self._repo.release_expired_sticky_slot_bindings(
                     timezone_name=str(
@@ -85,6 +94,15 @@ class ControlPlaneReconcilerService:
                 result = {
                     **dict(result),
                     "failed_config_hot_update_commands": int(failed_config_hot_updates or 0),
+                }
+            if hasattr(self._repo, "fail_stale_acknowledged_start_commands"):
+                failed_acknowledged_starts = self._repo.fail_stale_acknowledged_start_commands(
+                    timeout_sec=int(getattr(settings, "START_BOT_ACK_TIMEOUT_SEC", 120) or 120),
+                    reason="start_bot_ack_timeout_no_runtime_event",
+                )
+                result = {
+                    **dict(result),
+                    "failed_acknowledged_start_commands": int(failed_acknowledged_starts or 0),
                 }
         except Exception as exc:
             self._last_error = str(exc)

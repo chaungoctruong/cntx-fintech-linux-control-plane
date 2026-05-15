@@ -15,6 +15,25 @@ const TELEGRAM_INIT_DATA_WAIT_MS = 2500;
 const TELEGRAM_INIT_DATA_POLL_MS = 50;
 const API_REQUEST_TIMEOUT_MS = 12000;
 
+function parsePublicInt(raw: string | undefined, fallback: number, min: number, max: number): number {
+  const value = Number.parseInt(String(raw ?? "").trim(), 10);
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(min, Math.min(max, value));
+}
+
+const MT5_LOGIN_SLOT_POLL_INTERVAL_MS = parsePublicInt(
+  process.env.NEXT_PUBLIC_MT5_LOGIN_SLOT_POLL_INTERVAL_MS,
+  1000,
+  250,
+  5000
+);
+const MT5_LOGIN_SLOT_MAX_ATTEMPTS = parsePublicInt(
+  process.env.NEXT_PUBLIC_MT5_LOGIN_SLOT_MAX_ATTEMPTS,
+  180,
+  3,
+  240
+);
+
 function getBackendBaseUrl(): string {
   if (typeof window !== "undefined" && (window as unknown as { __BACKEND_URL?: string }).__BACKEND_URL) {
     return normalizeBackendBase((window as unknown as { __BACKEND_URL: string }).__BACKEND_URL);
@@ -344,12 +363,15 @@ export interface MT5AccountItem {
   verified_at?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
-  verification_job_id?: number | null;
-  verification_job_status?: string | null;
-  verification_state?: string | null;
-  verification_ui_state?: string | null;
-  verification_requested_at?: string | null;
-  verification_completed_at?: string | null;
+  login_reservation_id?: number | null;
+  login_reservation_status?: string | null;
+  login_state?: string | null;
+  login_ui_state?: string | null;
+  login_reservation_requested_at?: string | null;
+  login_reservation_completed_at?: string | null;
+  login_reservation_expires_at?: string | null;
+  connect_status?: string | null;
+  connection_state?: string | null;
   active_deployment_id?: number | null;
   active_deployment_status?: string | null;
   runner_id?: string | null;
@@ -402,31 +424,35 @@ export interface ConnectMt5AccountResponse {
   account_id: number;
   status: string;
   account: MT5AccountItem;
-  verification_job_id?: number | null;
-  job_id?: number | null;
-  verification_state?: string | null;
-  verification_ui_state?: string | null;
+  login_reservation_id?: number | null;
+  login_state?: string | null;
+  connect_status?: string | null;
+  connection_state?: string | null;
+  command_id?: string | null;
+  runner_id?: string | null;
+  slot_id?: string | null;
+  trace_id?: string | null;
   next_action?: string | null;
+  login_slot?: Mt5AccountLoginSlotResponse | null;
 }
 
-export interface Mt5AccountVerifyRequest {
+export interface Mt5AccountLoginSlotRequest {
   account_id: number;
 }
 
-/** Response from POST /api/v2/accounts/verify or GET /api/v2/accounts/verifications/{job_id} */
-export interface Mt5AccountVerificationJobResponse {
+/** Response from POST /api/v2/accounts/{id}/login-slot or GET /api/v2/accounts/login-slots/{id} */
+export interface Mt5AccountLoginSlotResponse {
   id?: number | null;
-  job_id?: number | null;
-  verification_job_id?: number | null;
+  login_reservation_id?: number | null;
   account_id?: number | null;
   status?: string | null;
-  job_status?: string | null;
-  verification_state?: string | null;
-  verification_ui_state?: string | null;
+  login_state?: string | null;
+  connect_status?: string | null;
+  connection_state?: string | null;
   user_message_key?: string | null;
   detail?: string | null;
   account?: MT5AccountItem;
-  job?: Record<string, unknown> | null;
+  reservation?: Record<string, unknown> | null;
   last_error?: string | null;
   [key: string]: unknown;
 }
@@ -435,7 +461,7 @@ export interface DeleteMt5AccountResponse {
   account_id: number;
   deleted: boolean;
   status: string;
-  verification_cancelled_total?: number;
+  login_reservations_released?: number;
   slot_released?: boolean;
 }
 
@@ -836,32 +862,31 @@ export function connectMt5Account(body: ConnectMt5AccountRequest): Promise<Conne
   });
 }
 
-export function requestMt5AccountVerification(body: Mt5AccountVerifyRequest): Promise<Mt5AccountVerificationJobResponse> {
-  return fetchFromAPI<Mt5AccountVerificationJobResponse>("/api/v2/accounts/verify", {
+export function requestMt5AccountLoginSlot(body: Mt5AccountLoginSlotRequest): Promise<Mt5AccountLoginSlotResponse> {
+  return fetchFromAPI<Mt5AccountLoginSlotResponse>(`/api/v2/accounts/${encodeURIComponent(String(body.account_id))}/login-slot`, {
     method: "POST",
-    body: JSON.stringify(body),
   });
 }
 
-export function fetchMt5AccountVerificationJob(jobId: number): Promise<Mt5AccountVerificationJobResponse> {
-  return fetchFromAPI<Mt5AccountVerificationJobResponse>(`/api/v2/accounts/verifications/${encodeURIComponent(String(jobId))}`, {
+export function fetchMt5AccountLoginSlot(reservationId: number): Promise<Mt5AccountLoginSlotResponse> {
+  return fetchFromAPI<Mt5AccountLoginSlotResponse>(`/api/v2/accounts/login-slots/${encodeURIComponent(String(reservationId))}`, {
     timeoutMs: 15000,
   });
 }
 
 /**
- * Poll until job reaches a terminal status (verified / failed / cancelled).
+ * Poll until the login-slot reservation reaches a terminal status.
  */
-export async function pollMt5AccountVerificationJob(
-  jobId: number,
+export async function pollMt5AccountLoginSlot(
+  reservationId: number,
   options?: { intervalMs?: number; maxAttempts?: number }
-): Promise<Mt5AccountVerificationJobResponse> {
-  const intervalMs = options?.intervalMs ?? 2000;
-  const maxAttempts = options?.maxAttempts ?? 90;
+): Promise<Mt5AccountLoginSlotResponse> {
+  const intervalMs = options?.intervalMs ?? MT5_LOGIN_SLOT_POLL_INTERVAL_MS;
+  const maxAttempts = options?.maxAttempts ?? MT5_LOGIN_SLOT_MAX_ATTEMPTS;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const job = await fetchMt5AccountVerificationJob(jobId);
+    const job = await fetchMt5AccountLoginSlot(reservationId);
     const raw = String(job.job_status ?? job.status ?? "").toLowerCase();
-    if (raw === "verified" || raw === "failed" || raw === "cancelled") {
+    if (raw === "verified" || raw === "failed" || raw === "expired" || raw === "released" || raw === "claimed") {
       return job;
     }
     await new Promise<void>((resolve) => {
@@ -869,8 +894,8 @@ export async function pollMt5AccountVerificationJob(
     });
   }
   throw new BackendAPIError(
-    "Xác minh MT5 quá lâu. Kiểm tra runner Windows đang chạy và thử lại, hoặc xem trạng thái trong panel điều khiển.",
-    { status: 408, code: "verification_poll_timeout" }
+    "Đăng nhập MT5 quá lâu. Kiểm tra runner Windows đang chạy và thử lại, hoặc xem trạng thái trong panel điều khiển.",
+    { status: 408, code: "login_slot_poll_timeout" }
   );
 }
 

@@ -5,19 +5,30 @@ from __future__ import annotations
 import json
 import re
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Any, Optional
+from uuid import UUID
 
 from app.models.control_plane import ACTIVE_DEPLOYMENT_STATUSES
 
-RUNNER_ACTIVE_LIMIT_DEFAULT = 10
-RUNNER_MIN_HEALTHY_SLOTS_DEFAULT = 13
+RUNNER_NODE_SLOT_LIMIT_DEFAULT = 10
+RUNNER_ACTIVE_LIMIT_DEFAULT = RUNNER_NODE_SLOT_LIMIT_DEFAULT
+RUNNER_MIN_HEALTHY_SLOTS_DEFAULT = RUNNER_NODE_SLOT_LIMIT_DEFAULT
 
 _ACTIVE_RUNNER_DEPLOYMENT_STATUSES = ("start_requested", "starting", "running", "stop_requested")
 _TERMINAL_DEPLOYMENT_STATUSES = ("stopped", "failed", "blocked")
 _COMMAND_DELIVERY_REPLAY_ADVISORY_LOCK_ID = 5_702_301
 
-_VERIFICATION_FAILURE_DEFAULTS: dict[str, dict[str, Any]] = {
+
+def _cap_runner_slots(value: Any) -> int:
+    try:
+        parsed = int(value or 0)
+    except Exception:
+        parsed = 0
+    return max(1, min(parsed or RUNNER_NODE_SLOT_LIMIT_DEFAULT, RUNNER_NODE_SLOT_LIMIT_DEFAULT))
+
+_LOGIN_FAILURE_DEFAULTS: dict[str, dict[str, Any]] = {
     "INVALID_CREDENTIALS": {
         "retryable": False,
         "failure_kind": "credential",
@@ -78,15 +89,15 @@ _VERIFICATION_FAILURE_DEFAULTS: dict[str, dict[str, Any]] = {
         "failure_category": "runner_slot",
         "user_message_key": "runner_slot_unavailable_retry",
     },
-    "MT5_VERIFICATION_FAILED": {
+    "MT5_LOGIN_FAILED": {
         "retryable": True,
-        "failure_kind": "verification_failed",
+        "failure_kind": "login_failed",
         "failure_category": "unknown",
-        "user_message_key": "mt5_verification_retry",
+        "user_message_key": "mt5_login_retry",
     },
 }
 
-_VERIFICATION_CREDENTIAL_ERROR_CODES = {
+_LOGIN_CREDENTIAL_ERROR_CODES = {
     "INVALID_CREDENTIALS",
     "INVALID_PASSWORD",
     "INVALID_SERVER",
@@ -102,12 +113,12 @@ def _norm_catalog_identity(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
 
 
-def _norm_verification_error_code(value: Any) -> str:
+def _norm_login_error_code(value: Any) -> str:
     raw = _norm(value).upper().replace("-", "_").replace(" ", "_")
     return raw
 
 
-def _verification_retryable(value: Any, *, default: bool) -> bool:
+def _login_retryable(value: Any, *, default: bool) -> bool:
     if isinstance(value, bool):
         return value
     raw = _norm(value).lower()
@@ -118,7 +129,7 @@ def _verification_retryable(value: Any, *, default: bool) -> bool:
     return bool(default)
 
 
-def _legacy_verification_failure_metadata(*, error_text: Any, payload: dict[str, Any]) -> dict[str, Any]:
+def _legacy_login_failure_metadata(*, error_text: Any, payload: dict[str, Any]) -> dict[str, Any]:
     payload_map = payload if isinstance(payload, dict) else {}
     text = " ".join(
         [
@@ -142,16 +153,16 @@ def _legacy_verification_failure_metadata(*, error_text: Any, payload: dict[str,
 
     transient_tokens = (
         "transient_mt5",
-        "template_verification_worker_timeout",
-        "terminal_log_verification_timeout",
+        "template_login_worker_timeout",
+        "terminal_log_login_timeout",
         "template_terminal_lock_timeout",
         "mt5_initialize_failed",
-        "verification_subprocess_timeout",
-        "verification_hard_timeout",
-        "interactive_verification_timeout",
-        "interactive_verification_worker_timeout",
+        "login_subprocess_timeout",
+        "login_hard_timeout",
+        "interactive_login_timeout",
+        "interactive_login_worker_timeout",
         "terminal_initialize_failed",
-        "verification_mt5_init_lock_timeout",
+        "login_mt5_init_lock_timeout",
         "warm_attach_failed",
         "warm_attach_direct_credentials_failed",
         "broker_connection_timeout",
@@ -189,8 +200,8 @@ def _legacy_verification_failure_metadata(*, error_text: Any, payload: dict[str,
         for token in (
             "authorization_failed",
             "auth_failed",
-            "verify_login_mismatch",
-            "verify_server_mismatch",
+            "login_mismatch",
+            "server_mismatch",
         )
     ) or any(token in normalized_auth_text for token in ("authorization failed", "auth failed"))
     password_credential_failure = any(
@@ -219,38 +230,38 @@ def _legacy_verification_failure_metadata(*, error_text: Any, payload: dict[str,
     elif any(
         token in text
         for token in (
-            "verification_terminal_silent",
+            "login_terminal_silent",
             "account_info_none",
             "account_info_failed",
         )
     ):
         code = "TRANSIENT_MT5"
     else:
-        code = "MT5_VERIFICATION_FAILED"
-    defaults = _VERIFICATION_FAILURE_DEFAULTS[code]
+        code = "MT5_LOGIN_FAILED"
+    defaults = _LOGIN_FAILURE_DEFAULTS[code]
     return {"error_code": code, **defaults}
 
 
-def _verification_failure_metadata(*, error_text: Any, payload: Any) -> dict[str, Any]:
+def _login_failure_metadata(*, error_text: Any, payload: Any) -> dict[str, Any]:
     payload_map = payload if isinstance(payload, dict) else {}
-    code = _norm_verification_error_code(payload_map.get("error_code"))
+    code = _norm_login_error_code(payload_map.get("error_code"))
     if not code:
-        return _legacy_verification_failure_metadata(error_text=error_text, payload=payload_map)
+        return _legacy_login_failure_metadata(error_text=error_text, payload=payload_map)
 
     defaults = dict(
-        _VERIFICATION_FAILURE_DEFAULTS.get(
+        _LOGIN_FAILURE_DEFAULTS.get(
             code,
             {
                 "retryable": True,
-                "failure_kind": "verification_failed",
+                "failure_kind": "login_failed",
                 "failure_category": "unknown",
-                "user_message_key": "mt5_verification_retry",
+                "user_message_key": "mt5_login_retry",
             },
         )
     )
     return {
         "error_code": code,
-        "retryable": _verification_retryable(payload_map.get("retryable"), default=bool(defaults["retryable"])),
+        "retryable": _login_retryable(payload_map.get("retryable"), default=bool(defaults["retryable"])),
         "failure_kind": _norm(payload_map.get("failure_kind")) or str(defaults["failure_kind"]),
         "failure_category": _norm(payload_map.get("failure_category")) or str(defaults["failure_category"]),
         "user_message_key": _norm(payload_map.get("user_message_key")) or str(defaults["user_message_key"]),
@@ -280,8 +291,24 @@ def _slot_sequence_number(value: Any) -> Optional[int]:
         return None
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.isoformat()
+        return value.astimezone(timezone.utc).isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, UUID):
+        return str(value)
+    if isinstance(value, set):
+        return sorted(value, key=str)
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def _json_payload(value: Any) -> str:
-    return json.dumps(value or {}, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(value or {}, ensure_ascii=False, separators=(",", ":"), default=_json_default)
 
 
 def _json_list(value: Any) -> str:
@@ -289,7 +316,7 @@ def _json_list(value: Any) -> str:
         raw = [item for item in value]
     else:
         raw = []
-    return json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(raw, ensure_ascii=False, separators=(",", ":"), default=_json_default)
 
 
 def _epoch_now() -> int:
@@ -393,11 +420,11 @@ def _extract_runner_heartbeat_capacity(
     ]
     hard_positive = [candidate for candidate in hard_candidates if candidate > 0]
     if hard_positive:
-        capacity = max(hard_positive)
+        capacity = min(max(hard_positive), RUNNER_NODE_SLOT_LIMIT_DEFAULT)
         slots_total = _safe_int(heartbeat.get("slots_total"), 0)
         if disabled_slots_count > 0 and slots_total >= capacity:
             capacity = max(1, slots_total - disabled_slots_count)
-        return max(1, capacity)
+        return _cap_runner_slots(capacity)
 
     configured_candidates = [
         _safe_int(heartbeat.get("requested_slots"), 0),
@@ -423,8 +450,8 @@ def _extract_runner_heartbeat_capacity(
     if not positive:
         return 1
     if int(current_max_slots or 0) > 0:
-        positive.append(int(current_max_slots))
-    return max(1, min(positive))
+        positive.append(_cap_runner_slots(current_max_slots))
+    return _cap_runner_slots(min(positive))
 
 
 def _build_runner_heartbeat_metadata(
@@ -453,7 +480,7 @@ def _build_runner_heartbeat_metadata(
         or _safe_int(scale_vps.get("max_slots"), 0)
         or effective_slots
     )
-    metadata["active_limit"] = max(1, min(active_limit_signal, effective_slots))
+    metadata["active_limit"] = _cap_runner_slots(min(active_limit_signal, effective_slots))
     metadata["min_healthy_slots"] = max(1, min(effective_slots, _safe_int(existing.get("min_healthy_slots"), effective_slots) or effective_slots))
 
     for key in (
@@ -464,7 +491,7 @@ def _build_runner_heartbeat_metadata(
         "maintenance",
         "maintenance_mode",
         "dispatch_paused",
-        "verification_paused",
+        "login_paused",
         "warm_guard_paused",
         "warm_guard_pause",
         "warm_pool_paused",
@@ -486,7 +513,7 @@ def _build_runner_heartbeat_metadata(
         (("reported_slots_active", "reported_active_slots"), ("active_slots", "slots_active")),
         (("reported_slots_broken", "reported_broken_slots"), ("broken_slots", "slots_broken")),
         (("reported_slots_degraded", "reported_degraded_slots"), ("degraded_slots", "slots_degraded")),
-        (("reported_slots_verifying", "reported_verifying_slots"), ("verifying_slots", "slots_verifying")),
+        (("reported_slots_login_reserved", "reported_login_reserved_slots"), ("login_reserved_slots", "slots_login_reserved")),
     )
     for output_keys, payload_keys in slot_count_aliases:
         value = next((heartbeat.get(key) for key in payload_keys if heartbeat.get(key) is not None), None)
@@ -525,7 +552,7 @@ def _overlay_runner_slot_projection_metadata(
     allocated_slots = _safe_int(counts.get("allocated_slots"), 0)
     degraded_slots = _safe_int(counts.get("degraded_slots"), 0)
     broken_slots = _safe_int(counts.get("broken_slots"), 0)
-    verifying_slots = _safe_int(counts.get("verifying_slots"), 0)
+    login_reserved_slots = _safe_int(counts.get("login_reserved_slots"), 0)
     canonical_counts = {
         "reported_slots_total": total_slots,
         "reported_slots_ready": ready_slots,
@@ -536,10 +563,58 @@ def _overlay_runner_slot_projection_metadata(
         "reported_degraded_slots": degraded_slots,
         "reported_slots_broken": broken_slots,
         "reported_broken_slots": broken_slots,
-        "reported_slots_verifying": verifying_slots,
-        "reported_verifying_slots": verifying_slots,
+        "reported_slots_login_reserved": login_reserved_slots,
+        "reported_login_reserved_slots": login_reserved_slots,
     }
     merged.update(canonical_counts)
+    return _clear_resolved_runner_failure_metadata(merged)
+
+
+def _clear_resolved_runner_failure_metadata(metadata: Optional[dict[str, Any]]) -> dict[str, Any]:
+    merged = dict(metadata or {})
+    degraded_slots = _safe_int(
+        merged.get("reported_slots_degraded", merged.get("reported_degraded_slots")),
+        0,
+    )
+    broken_slots = _safe_int(
+        merged.get("reported_slots_broken", merged.get("reported_broken_slots")),
+        0,
+    )
+    ready_slots = _safe_int(
+        merged.get("reported_slots_ready", merged.get("reported_ready_slots")),
+        0,
+    )
+    active_slots = _safe_int(
+        merged.get("reported_slots_active", merged.get("reported_active_slots")),
+        0,
+    )
+    runner_state = _norm(merged.get("runner_state")).lower()
+    unhealthy_state = runner_state in {
+        "broken",
+        "degraded",
+        "draining",
+        "frozen",
+        "maintenance",
+        "offline",
+        "paused",
+        "unhealthy",
+    }
+    penalty_until = _parse_projection_timestamp(merged.get("dispatch_penalty_until"))
+    penalty_active = penalty_until > time.time()
+    if (
+        not penalty_active
+        and not unhealthy_state
+        and degraded_slots <= 0
+        and broken_slots <= 0
+        and (ready_slots + active_slots) > 0
+    ):
+        for key in (
+            "dispatch_penalty_until",
+            "last_start_failure_at",
+            "last_start_failure_reason",
+            "start_failure_recent_count",
+        ):
+            merged.pop(key, None)
     return merged
 
 
@@ -624,14 +699,14 @@ def _runner_heartbeat_allows_online_status(metadata: dict[str, Any]) -> bool:
         "frozen",
         "freeze",
         "dispatch_paused",
-        "verification_paused",
+        "login_paused",
         "warm_guard_paused",
         "warm_guard_pause",
         "warm_pool_paused",
     ):
         return False
     runner_state = _norm(metadata.get("runner_state")).lower()
-    return runner_state not in {"draining", "frozen", "maintenance", "paused", "verification_paused", "warm_guard_paused"}
+    return runner_state not in {"draining", "frozen", "maintenance", "paused", "login_paused", "warm_guard_paused"}
 
 
 def _runner_operational_status(row: dict[str, Any]) -> str:
@@ -645,7 +720,9 @@ def _runner_operational_status(row: dict[str, Any]) -> str:
     active_count = _safe_int(row.get("running_deployments"))
     degraded_slots = _safe_int(row.get("degraded_slots"))
     broken_slots = _safe_int(row.get("broken_slots"))
-    active_limit = _safe_int(metadata.get("active_limit"), RUNNER_ACTIVE_LIMIT_DEFAULT) or RUNNER_ACTIVE_LIMIT_DEFAULT
+    active_limit = _cap_runner_slots(
+        _safe_int(metadata.get("active_limit"), RUNNER_ACTIVE_LIMIT_DEFAULT) or RUNNER_ACTIVE_LIMIT_DEFAULT
+    )
     min_healthy = _safe_int(metadata.get("min_healthy_slots"), RUNNER_MIN_HEALTHY_SLOTS_DEFAULT) or RUNNER_MIN_HEALTHY_SLOTS_DEFAULT
 
     if status == "offline" or is_stale:
@@ -659,7 +736,7 @@ def _runner_operational_status(row: dict[str, Any]) -> str:
         "frozen",
         "freeze",
         "dispatch_paused",
-        "verification_paused",
+        "login_paused",
         "warm_guard_paused",
         "warm_guard_pause",
         "warm_pool_paused",
@@ -693,45 +770,45 @@ def _capacity_state_from_operational_status(value: str) -> str:
     return mapping.get(str(value or "").strip().upper(), "degraded")
 
 
-def _derive_verification_state(*, account_status: Any, job_status: Any) -> str:
-    job_s = _norm(job_status).lower()
+def _derive_login_state(*, account_status: Any, reservation_status: Any) -> str:
+    job_s = _norm(reservation_status).lower()
     account_s = _norm(account_status).lower()
     if job_s in {"pending", "dispatched"}:
-        return "VERIFYING"
+        return "LOGIN_IN_PROGRESS"
     if job_s == "verified":
-        return "VERIFIED"
+        return "READY"
     if job_s == "failed":
         return "FAILED"
-    if account_s == "pending_verification":
-        return "VERIFYING"
+    if account_s == "pending_login":
+        return "LOGIN_IN_PROGRESS"
     if account_s == "connected":
-        return "VERIFIED"
-    if account_s == "verification_failed":
+        return "READY"
+    if account_s == "login_failed":
         return "FAILED"
     return "UNKNOWN"
 
 
-def _derive_verification_ui_state(row: dict[str, Any]) -> str:
-    job_s = _norm(row.get("status") or row.get("verification_job_status")).lower()
+def _derive_login_ui_state(row: dict[str, Any]) -> str:
+    job_s = _norm(row.get("status") or row.get("login_reservation_status")).lower()
     account_s = _norm(row.get("account_status") or row.get("status")).lower()
     runner_id = _norm(row.get("runner_id"))
     slot_id = _norm_slot_id(row.get("slot_id"))
 
     if job_s == "verified":
-        return "VERIFIED"
+        return "READY"
     if job_s in {"failed", "cancelled"}:
         return "FAILED"
     if job_s == "dispatched":
-        return "VERIFYING_MT5"
+        return "LOGIN_IN_PROGRESS"
     if job_s == "pending" and runner_id and slot_id:
         return "ASSIGNED"
     if job_s == "pending":
         return "SUBMITTED"
     if account_s == "connected":
-        return "VERIFIED"
-    if account_s == "verification_failed":
+        return "READY"
+    if account_s == "login_failed":
         return "FAILED"
-    if account_s == "pending_verification":
+    if account_s == "pending_login":
         return "SUBMITTED"
     return "UNKNOWN"
 
@@ -789,38 +866,38 @@ def _slot_inventory_projection_status(entry: dict[str, Any]) -> str | None:
     return None
 
 
-def _decorate_account_verification_projection(
+def _decorate_account_login_projection(
     row: Optional[dict[str, Any]],
     *,
     account_status_key: str,
-    job_status_key: str = "verification_job_status",
+    reservation_status_key: str = "login_reservation_status",
 ) -> Optional[dict[str, Any]]:
     if not row:
         return row
     decorated = dict(row)
-    decorated["verification_state"] = _derive_verification_state(
+    decorated["login_state"] = _derive_login_state(
         account_status=decorated.get(account_status_key),
-        job_status=decorated.get(job_status_key),
+        reservation_status=decorated.get(reservation_status_key),
     )
-    decorated["verification_ui_state"] = _derive_verification_ui_state(decorated)
+    decorated["login_ui_state"] = _derive_login_ui_state(decorated)
     account_status = _norm(decorated.get(account_status_key)).lower()
-    if account_status == "pending_verification" and bool(decorated.get("has_credentials")):
+    if account_status == "pending_login" and bool(decorated.get("has_credentials")):
         decorated.setdefault("raw_status", decorated.get(account_status_key))
         decorated[account_status_key] = "connected"
-        if _norm(decorated.get("status")).lower() == "pending_verification":
+        if _norm(decorated.get("status")).lower() == "pending_login":
             decorated["status"] = "connected"
         decorated["connect_status"] = "PENDING_RUNTIME_LOGIN"
         decorated["connection_state"] = "PENDING_RUNTIME_LOGIN"
         decorated["runtime_login_required"] = True
-        # Credentials are on control-plane; MT5 proof is still pending (runner verify or START_BOT).
-        decorated["verification_state"] = "VERIFYING"
-        decorated["verification_ui_state"] = "SUBMITTED"
+        # Credentials are on control-plane; MT5 proof is pending on the reserved login slot.
+        decorated["login_state"] = "LOGIN_IN_PROGRESS"
+        decorated["login_ui_state"] = "SUBMITTED"
         account_status = "connected"
     start_ready = bool(
-        decorated["verification_state"] == "VERIFIED"
+        decorated["login_state"] == "READY"
         or account_status == "connected"
     )
-    decorated["start_verification_ready"] = start_ready
+    decorated["start_login_ready"] = start_ready
     active_deployment_id = decorated.get("active_deployment_id")
     if not active_deployment_id and decorated.get("deployment_id"):
         deployment_status = _norm(decorated.get("deployment_status")).lower()
@@ -828,47 +905,47 @@ def _decorate_account_verification_projection(
             active_deployment_id = decorated.get("deployment_id")
     decorated["can_start_bot"] = bool(start_ready and not active_deployment_id)
     if not start_ready:
-        decorated["start_block_reason"] = "account_credentials_unavailable" if account_status == "pending_verification" else "account_not_connected"
+        decorated["start_block_reason"] = "account_credentials_unavailable" if account_status == "pending_login" else "account_not_connected"
     elif active_deployment_id:
         decorated["start_block_reason"] = "account_has_active_deployment"
     else:
         decorated["start_block_reason"] = None
-    failure_payload = decorated.get("verification_payload_json")
+    failure_payload = decorated.get("login_reservation_payload_json")
     if not isinstance(failure_payload, dict):
         failure_payload = decorated.get("payload_json")
     failure_payload_map = failure_payload if isinstance(failure_payload, dict) else {}
-    failure = _verification_failure_metadata(
-        error_text=decorated.get("last_error") or decorated.get("verification_last_error"),
+    failure = _login_failure_metadata(
+        error_text=decorated.get("last_error") or decorated.get("login_last_error"),
         payload=failure_payload_map,
     )
     if failure and (
-        _norm(decorated.get(account_status_key)).lower() == "verification_failed"
-        or _norm(decorated.get(job_status_key)).lower() == "failed"
-        or _norm_verification_error_code(failure_payload_map.get("error_code"))
+        _norm(decorated.get(account_status_key)).lower() == "login_failed"
+        or _norm(decorated.get(reservation_status_key)).lower() == "failed"
+        or _norm_login_error_code(failure_payload_map.get("error_code"))
     ):
-        decorated["verification_failure"] = failure
+        decorated["login_failure"] = failure
         decorated.update(failure)
     return decorated
 
 
-def _decorate_verification_job_row(row: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+def _decorate_login_reservation_row(row: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     if not row:
         return row
     decorated = dict(row)
-    decorated["verification_state"] = _derive_verification_state(
+    decorated["login_state"] = _derive_login_state(
         account_status=decorated.get("account_status"),
-        job_status=decorated.get("status"),
+        reservation_status=decorated.get("status"),
     )
-    decorated["verification_ui_state"] = _derive_verification_ui_state(decorated)
+    decorated["login_ui_state"] = _derive_login_ui_state(decorated)
     payload_map = decorated.get("payload_json") if isinstance(decorated.get("payload_json"), dict) else {}
-    failure = _verification_failure_metadata(
+    failure = _login_failure_metadata(
         error_text=decorated.get("last_error"),
         payload=payload_map,
     )
     if failure and (
         _norm(decorated.get("status")).lower() == "failed"
-        or _norm_verification_error_code(payload_map.get("error_code"))
+        or _norm_login_error_code(payload_map.get("error_code"))
     ):
-        decorated["verification_failure"] = failure
+        decorated["login_failure"] = failure
         decorated.update(failure)
     return decorated

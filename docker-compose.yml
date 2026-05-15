@@ -1,6 +1,6 @@
-# Local/dev compose only. Production-style host deploy uses PM2 (`ecosystem.config.js`)
-# and runbooks in `docs/`; do not treat this file as a production
-# Postgres/Redis/security baseline.
+# Docker Compose runtime for this Linux control plane. Keep public exposure
+# minimal: application HTTP is published explicitly, Redis is loopback-only for
+# SSH tunnel use, and internal services talk over the Compose network.
 #
 # Env file selection (gitignored .env*):
 #   prod (default): docker compose up -d            → reads .env
@@ -8,19 +8,26 @@
 #                   or use the helper: ops/compose-dev.sh up -d
 # Both LOCAL_* substitution vars and container env_file resolve from the same
 # file, so swapping ENV_FILE swaps everything atomically.
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 services:
   hubbot:
     build:
       context: .
       dockerfile: hubbot/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
     env_file:
       - ${ENV_FILE:-.env}
     volumes:
       - ./hubbot:/app/hubbot
       - ./logs:/app/logs
-    ports:
-      - "8081:8081"
     depends_on:
       - db
       - redis
@@ -30,6 +37,9 @@ services:
       context: .
       dockerfile: backend_ai/Dockerfile
     restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
     env_file:
       - ${ENV_FILE:-.env}
     ports:
@@ -56,6 +66,9 @@ services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
     environment:
       POSTGRES_DB: ${LOCAL_POSTGRES_DB:-spider_dev}
       POSTGRES_USER: ${LOCAL_POSTGRES_USER:-spider_dev}
@@ -72,6 +85,9 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
     environment:
       REDIS_PASSWORD: ${LOCAL_REDIS_PASSWORD:?set LOCAL_REDIS_PASSWORD in your env file}
     # Product-style single-node Redis: auth + AOF persistence. Full production
@@ -81,9 +97,6 @@ services:
       # Windows runner reaches this through SSH tunnel:
       # ssh -p 24700 -N -L 6380:127.0.0.1:6380 root@<backend-host>
       - "${REDIS_HOST_BIND:-127.0.0.1}:${REDIS_HOST_PORT:-6380}:6379"
-      # Direct Windows runner test endpoint. Keep this bound to the backend
-      # public IP and restrict source IP in DOCKER-USER/firewall rules.
-      - "${REDIS_PUBLIC_HOST_BIND:-127.0.0.1}:${REDIS_PUBLIC_HOST_PORT:-6379}:6379"
     volumes:
       - redisdata:/data
     healthcheck:
@@ -92,6 +105,66 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+
+  token-bot-api:
+    build:
+      context: ./token-bot
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - ./token-bot/.env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8090
+      SOURCE_BOT_DIR: /bot-trading
+      ENCRYPTED_BOT_DIR: /app/var/encrypted
+      DATABASE_URL: sqlite:////app/var/token_bot.db
+      REDIS_URL: redis://:${LOCAL_REDIS_PASSWORD:?set LOCAL_REDIS_PASSWORD}@redis:6379/0
+      BACKEND_URL: http://spider-app:8001
+    command: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8090"]
+    ports:
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - ./token-bot/var:/app/var
+      - ./bot-trading:/bot-trading:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      spider-app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3).read()\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  token-bot-tg:
+    build:
+      context: ./token-bot
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    env_file:
+      - ./token-bot/.env
+    environment:
+      SOURCE_BOT_DIR: /bot-trading
+      ENCRYPTED_BOT_DIR: /app/var/encrypted
+      DATABASE_URL: sqlite:////app/var/token_bot.db
+      REDIS_URL: redis://:${LOCAL_REDIS_PASSWORD:?set LOCAL_REDIS_PASSWORD}@redis:6379/0
+      BACKEND_URL: http://spider-app:8001
+    command: ["python", "scripts/run_tg_bot.py"]
+    volumes:
+      - ./token-bot/var:/app/var
+      - ./bot-trading:/bot-trading:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      spider-app:
+        condition: service_healthy
 
 volumes:
   pgdata:

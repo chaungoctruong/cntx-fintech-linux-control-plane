@@ -7,16 +7,22 @@ SELECT
     a.status,
     a.label,
     a.is_active,
+    a.risk_policy_json AS account_risk_policy,
     a.last_error,
     a.verified_at,
-    a.verification_requested_at AS account_verification_requested_at,
+    a.login_requested_at,
     a.created_at,
     a.updated_at,
-    v.id AS verification_job_id,
-    v.status AS verification_job_status,
-    v.payload_json AS verification_payload_json,
-    v.requested_at AS verification_requested_at,
-    v.completed_at AS verification_completed_at,
+    r.id AS login_reservation_id,
+    r.status AS login_reservation_status,
+    r.payload_json AS login_reservation_payload_json,
+    r.runner_id AS login_reservation_runner_id,
+    r.slot_id AS login_reservation_slot_id,
+    r.trace_id AS login_reservation_trace_id,
+    r.requested_at AS login_reservation_requested_at,
+    r.dispatched_at AS login_reservation_dispatched_at,
+    r.completed_at AS login_reservation_completed_at,
+    r.expires_at AS login_reservation_expires_at,
     EXISTS(
         SELECT 1 FROM account_credentials_encrypted c
         WHERE c.account_id = a.id
@@ -24,11 +30,12 @@ SELECT
     ) AS has_credentials
 FROM broker_accounts a
 LEFT JOIN LATERAL (
-    SELECT id, status, payload_json, requested_at, completed_at
-    FROM account_verification_jobs
+    SELECT id, status, payload_json, runner_id, slot_id, trace_id,
+           requested_at, dispatched_at, completed_at, expires_at
+    FROM account_login_reservations
     WHERE account_id = a.id
-      AND requested_at >= COALESCE(a.verification_requested_at, a.created_at)
+      AND requested_at >= COALESCE(a.login_requested_at, a.created_at)
     ORDER BY requested_at DESC, id DESC
     LIMIT 1
-) v ON TRUE
+) r ON TRUE
 WHERE a.id = %s AND a.user_id = %s

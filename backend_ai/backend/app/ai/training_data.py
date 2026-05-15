@@ -239,7 +239,7 @@ def training_skip_reason(
             "deployment_id",
             "runner_id",
             "slot_id",
-            "verification_job_id",
+            "login_reservation_id",
             "command_id",
             "broker_account_id",
             "mt5_login",

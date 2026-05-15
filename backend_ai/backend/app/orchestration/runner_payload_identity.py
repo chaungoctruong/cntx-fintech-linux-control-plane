@@ -100,13 +100,36 @@ def normalize_runner_command_payload(
     if deployment_id_i is not None:
         normalized["deployment_id"] = deployment_id_i
 
-    normalized.pop("keep_prepared_session", None)
-    normalized.pop("soft_detach", None)
+    reuse_login_slot = bool(
+        command_type_value == "START_BOT"
+        and (
+            normalized.get("reuse_login_slot")
+            or normalized.get("runtime_login_already_verified")
+            or normalized.get("reuse_prepared_terminal")
+        )
+    )
+    if not reuse_login_slot:
+        normalized.pop("keep_prepared_session", None)
+        normalized.pop("soft_detach", None)
 
-    if command_type_value == "START_BOT":
+    if command_type_value == "RESERVE_OR_LOGIN_SLOT":
+        normalized.setdefault("runtime_login_required", True)
+        normalized.setdefault("reserve_login_slot", True)
+        normalized.setdefault("credential_check_policy", "reserve_or_login_slot")
+        normalized.setdefault("mt5_recovery_policy", "recover_or_launch")
+        normalized.setdefault("login_slot_ttl_sec", 300)
+    elif command_type_value == "START_BOT":
         normalized.setdefault("runtime_login_required", True)
         normalized.setdefault("credential_check_policy", "login_before_start")
         normalized.setdefault("mt5_recovery_policy", "recover_or_launch")
+        if reuse_login_slot:
+            normalized["reuse_login_slot"] = True
+            normalized["runtime_login_already_verified"] = True
+            normalized["keep_prepared_session"] = True
+            normalized["reuse_prepared_terminal"] = True
+            normalized["attach_existing_terminal"] = True
+            normalized["skip_terminal_cleanup_on_start"] = True
+            normalized["requires_clean_terminal_on_start"] = False
     elif command_type_value == "STOP_BOT":
         normalized.setdefault("stop_policy", "end_task")
         normalized.setdefault("end_task", True)
@@ -125,7 +148,16 @@ def normalize_runner_command_payload(
     if storage_slot_id:
         normalized["storage_slot_id"] = storage_slot_id
         resource_hints["storage_slot_id"] = storage_slot_id
-    resource_hints.pop("keep_prepared_session", None)
-    resource_hints.pop("soft_detach", None)
+    if reuse_login_slot:
+        resource_hints["reuse_login_slot"] = True
+        resource_hints["runtime_login_already_verified"] = True
+        resource_hints["keep_prepared_session"] = True
+        resource_hints["reuse_prepared_terminal"] = True
+        resource_hints["attach_existing_terminal"] = True
+        resource_hints["skip_terminal_cleanup_on_start"] = True
+        resource_hints["requires_clean_terminal_on_start"] = False
+    else:
+        resource_hints.pop("keep_prepared_session", None)
+        resource_hints.pop("soft_detach", None)
     normalized["resource_hints"] = resource_hints
     return normalized

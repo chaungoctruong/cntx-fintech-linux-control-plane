@@ -96,7 +96,7 @@ class CommandRouterService:
         *,
         command_type: CommandType,
         account_id: int,
-        deployment_id: int,
+        deployment_id: int | None,
         bot_id: str,
         runner_id: str,
         slot_id: str,
@@ -155,11 +155,15 @@ class CommandRouterService:
             "priority": priority,
         }
 
-        existing = self._repo.get_execution_command_by_trace_identity(
-            account_id=account_id,
-            deployment_id=deployment_id,
-            command_type=command_type.value,
-            trace_id=trace_id,
+        existing = (
+            self._repo.get_execution_command_by_trace_identity(
+                account_id=account_id,
+                deployment_id=deployment_id,
+                command_type=command_type.value,
+                trace_id=trace_id,
+            )
+            if deployment_id is not None
+            else None
         )
         if existing:
             log_agent_event(

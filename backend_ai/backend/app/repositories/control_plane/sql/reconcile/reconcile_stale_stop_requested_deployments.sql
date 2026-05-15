@@ -219,10 +219,11 @@ released_slots AS (
                     - 'account_id'
                     - 'active_account_id'
                     - 'deployment_id'
-                    - 'verification_job_id'
-                    - 'verification_status'
-                    - 'verification_account_id'
-                    - 'verification_attempt'
+                    - 'login_reservation_id'
+                    - 'login_reservation_status'
+                    - 'login_reservation_account_id'
+                    - 'login_slot_status'
+                    - 'login_slot_account_id'
                     - 'current_control_plane_state'
                     - 'previous_control_plane_state'
                     - 'current_runner_state'
@@ -242,6 +243,10 @@ released_slots AS (
     FROM updated_deployments d
     WHERE s.runner_id = d.runner_id
       AND s.slot_id = d.slot_id
+      AND (
+          COALESCE(NULLIF(SUBSTRING(s.slot_id FROM '([0-9]+)$'), ''), '') = ''
+          OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= 10
+      )
     RETURNING 1
 ),
 refreshed_bindings AS (

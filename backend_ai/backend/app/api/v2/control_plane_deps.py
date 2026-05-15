@@ -38,7 +38,8 @@ def user_dep(
 _UNIQUE_CONSTRAINT_TO_CODE: dict[str, str] = {
     "uq_bot_deployments_active_account": "account_has_active_deployment",
     "uq_bot_deployments_active_user": "telegram_user_has_active_bot",
-    "uq_account_verification_jobs_active_account": "verification_already_pending",
+    "uq_account_login_reservations_active_account": "account_login_in_progress",
+    "uq_account_login_reservations_active_slot": "no_available_unreserved_slot",
     "uq_account_slot_bindings_current_account": "account_has_active_deployment",
     "uq_account_slot_bindings_current_slot": "no_available_unreserved_slot",
 }

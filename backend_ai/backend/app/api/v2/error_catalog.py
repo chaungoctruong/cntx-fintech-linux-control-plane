@@ -17,7 +17,7 @@ Quy uoc:
     - contact_support  : khong tu fix duoc
     - upgrade_plan     : qua quota
 - `retryable`: backend goi y co the retry tu dong (idempotent) khong
-- `group`: gom logic cho metric/alert (account / deployment / runner / verification / runtime / system)
+- `group`: gom logic cho metric/alert (account / deployment / runner / login_slot / runtime / system)
 """
 
 from __future__ import annotations
@@ -323,47 +323,34 @@ _ENTRIES: tuple[ErrorEntry, ...] = (
         group="deployment",
     ),
     # ---------------------------------------------------------------
-    # VERIFICATION
+    # LOGIN SLOT
     # ---------------------------------------------------------------
     ErrorEntry(
-        public_code="verification_job_not_found",
+        public_code="login_reservation_not_found",
         http_status=status.HTTP_404_NOT_FOUND,
-        message_vi="Không tìm thấy yêu cầu xác thực tài khoản này.",
-        message_en="Verification job not found.",
+        message_vi="Không tìm thấy phiên đăng nhập MT5 này.",
+        message_en="Login slot reservation not found.",
         action="reload",
         retryable=False,
-        group="verification",
+        group="login_slot",
     ),
     ErrorEntry(
-        public_code="verification_already_pending",
+        public_code="account_login_in_progress",
         http_status=status.HTTP_409_CONFLICT,
-        message_vi="Tài khoản đang có một yêu cầu xác thực chờ xử lý. Vui lòng đợi hoặc huỷ yêu cầu cũ trước khi tạo mới.",
-        message_en="An active verification request is already pending. Wait or cancel it before requesting a new one.",
-        action="cancel_pending",
+        message_vi="Tài khoản đang đăng nhập MT5. Vui lòng đợi kết quả trước khi thao tác tiếp.",
+        message_en="The MT5 account is currently logging in. Wait for the result before continuing.",
+        action="wait",
         retryable=False,
-        group="verification",
+        group="login_slot",
     ),
     ErrorEntry(
-        public_code="verification_already_completed",
+        public_code="account_login_required",
         http_status=status.HTTP_409_CONFLICT,
-        message_vi="Yêu cầu xác thực này đã kết thúc, không thể huỷ.",
-        message_en="This verification request has already finished and cannot be cancelled.",
-        action="reload",
+        message_vi="Vui lòng đăng nhập MT5 thành công trước khi bật bot.",
+        message_en="Log in to MT5 successfully before starting the bot.",
+        action="retry_login",
         retryable=False,
-        group="verification",
-    ),
-    ErrorEntry(
-        public_code="verification_result_runner_mismatch",
-        http_status=status.HTTP_409_CONFLICT,
-        message_vi="Phản hồi xác thực không khớp runner. Yêu cầu đang được kiểm tra lại.",
-        message_en="Verification result does not match the assigned runner. The request will be re-checked.",
-        action="retry",
-        retryable=True,
-        group="verification",
-        aliases=(
-            "verification_result_slot_mismatch",
-            "verification_result_trace_mismatch",
-        ),
+        group="login_slot",
     ),
     # ---------------------------------------------------------------
     # SCHEDULER / RUNNER / SLOT
