@@ -10,6 +10,7 @@ from typing import Any
 
 from app.core.log_context import bind_log_context
 from app.events.command_router import CommandRouterService
+from app.events.runner_event_idempotency import stable_runner_event_id
 from app.infra.redis_streams import RedisStreamPublisher
 from app.models.control_plane import CommandType, DeploymentStatus, EventType
 from app.orchestration.deployment_config import TRADING_CONFIG_SCHEMA_VERSION, normalize_deployment_config
@@ -164,6 +165,66 @@ def _payload_confirms_terminal_stopped(payload: dict[str, Any]) -> bool:
         return True
     terminal_pid = "" if payload.get("terminal_pid") is None else str(payload.get("terminal_pid")).strip().lower()
     return bool(terminal_pid) and terminal_pid in {"0", "none", "null"}
+
+
+_RECOVERY_EVENT_ALIASES = {
+    "RECOVERY_STARTED": EventType.RECOVERY_STARTED.value,
+    "MT5_RECOVERY_STARTED": EventType.RECOVERY_STARTED.value,
+    "AUTO_RECOVERY_STARTED": EventType.RECOVERY_STARTED.value,
+    "RECOVERY_COMPLETED": EventType.RECOVERY_COMPLETED.value,
+    "MT5_RECOVERY_COMPLETED": EventType.RECOVERY_COMPLETED.value,
+    "AUTO_RECOVERY_COMPLETED": EventType.RECOVERY_COMPLETED.value,
+    "RECOVERY_FAILED": EventType.RECOVERY_FAILED.value,
+    "MT5_RECOVERY_FAILED": EventType.RECOVERY_FAILED.value,
+    "AUTO_RECOVERY_FAILED": EventType.RECOVERY_FAILED.value,
+    "RECOVERY_BLOCKED": EventType.RECOVERY_BLOCKED.value,
+    "MT5_RECOVERY_BLOCKED": EventType.RECOVERY_BLOCKED.value,
+    "AUTO_RECOVERY_BLOCKED": EventType.RECOVERY_BLOCKED.value,
+    "MT5_RECOVERY_BUDGET_EXHAUSTED": EventType.MT5_RECOVERY_BUDGET_EXHAUSTED.value,
+    "RECOVERY_BUDGET_EXHAUSTED": EventType.MT5_RECOVERY_BUDGET_EXHAUSTED.value,
+    "BUDGET_EXHAUSTED": EventType.MT5_RECOVERY_BUDGET_EXHAUSTED.value,
+}
+_RECOVERY_EVENT_TYPES = set(_RECOVERY_EVENT_ALIASES.values())
+
+
+def _normalize_recovery_event(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = raw.replace("-", "_").replace(" ", "_").upper()
+    return _RECOVERY_EVENT_ALIASES.get(normalized)
+
+
+def _payload_recovery_event_type(*, event_type: str, payload: dict[str, Any], runtime_message: str = "") -> str | None:
+    direct = _normalize_recovery_event(event_type)
+    if direct:
+        return direct
+    for key in (
+        "recovery_event",
+        "recovery_status",
+        "recovery_state",
+        "recovery_phase",
+        "runner_event_type",
+        "event",
+        "phase",
+        "status",
+        "reason",
+    ):
+        candidate = _normalize_recovery_event(payload.get(key))
+        if candidate:
+            return candidate
+    text = f"{runtime_message} {_event_reason(payload)} {payload.get('message') or ''}".lower()
+    if "mt5_recovery_budget_exhausted" in text or "recovery_budget_exhausted" in text:
+        return EventType.MT5_RECOVERY_BUDGET_EXHAUSTED.value
+    if "recovery_blocked" in text:
+        return EventType.RECOVERY_BLOCKED.value
+    if "recovery_completed" in text:
+        return EventType.RECOVERY_COMPLETED.value
+    if "recovery_started" in text:
+        return EventType.RECOVERY_STARTED.value
+    if "recovery_failed" in text:
+        return EventType.RECOVERY_FAILED.value
+    return None
 
 
 def _runtime_log_terminal_event_type(payload: dict[str, Any], runtime_message: str) -> str | None:
@@ -510,6 +571,130 @@ class RunnerEventIngestService:
                 health_status="terminal_cleanup_started",
                 runner_id=event_model.runner_id,
                 slot_id=event_model.slot_id,
+            )
+
+    def _apply_recovery_event(
+        self,
+        *,
+        event_model: RunnerEvent,
+        recovery_event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if event_model.deployment_id is None:
+            return
+        deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
+        if not deployment:
+            return
+        wants_stopped = _deployment_wants_stopped(deployment)
+        reason = _event_reason(payload) or recovery_event_type.lower()
+
+        if recovery_event_type == EventType.RECOVERY_STARTED.value:
+            if wants_stopped:
+                return
+            self._repo.update_deployment_status(
+                deployment_id=event_model.deployment_id,
+                status=DeploymentStatus.RUNNING.value,
+                desired_state="running",
+                is_active=True,
+                health_status="recovering",
+                last_error=reason,
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+            )
+            if event_model.slot_id:
+                self._repo.update_runner_slot_state(
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                    status="allocated",
+                    metadata={**payload, "recovery_status": "started", "available_for_new_account": False},
+                )
+            return
+
+        if recovery_event_type == EventType.RECOVERY_COMPLETED.value:
+            if wants_stopped:
+                return
+            self._repo.update_deployment_status(
+                deployment_id=event_model.deployment_id,
+                status=DeploymentStatus.RUNNING.value,
+                desired_state="running",
+                is_active=True,
+                health_status="running",
+                last_error=None,
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+            )
+            if event_model.slot_id:
+                self._repo.update_runner_slot_state(
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                    status="allocated",
+                    metadata={**payload, "recovery_status": "completed", "available_for_new_account": False},
+                )
+            return
+
+        if recovery_event_type == EventType.RECOVERY_FAILED.value:
+            if wants_stopped:
+                return
+            self._repo.update_deployment_status(
+                deployment_id=event_model.deployment_id,
+                status=DeploymentStatus.RUNNING.value,
+                desired_state="running",
+                is_active=True,
+                health_status="recovery_failed",
+                last_error=reason,
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+            )
+            return
+
+        if recovery_event_type == EventType.RECOVERY_BLOCKED.value:
+            if wants_stopped:
+                return
+            self._repo.update_deployment_status(
+                deployment_id=event_model.deployment_id,
+                status=DeploymentStatus.FAILED.value,
+                desired_state="stopped",
+                is_active=False,
+                health_status="recovery_blocked",
+                last_error=reason,
+                stopped=True,
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+            )
+            return
+
+        if recovery_event_type == EventType.MT5_RECOVERY_BUDGET_EXHAUSTED.value:
+            self._repo.update_deployment_status(
+                deployment_id=event_model.deployment_id,
+                status=DeploymentStatus.FAILED.value,
+                desired_state="stopped",
+                is_active=False,
+                health_status="mt5_recovery_budget_exhausted",
+                last_error=reason,
+                stopped=True,
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+            )
+            if event_model.slot_id:
+                self._repo.update_runner_slot_state(
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                    status="degraded",
+                    metadata={**payload, "recovery_status": "budget_exhausted", "last_error": reason},
+                )
+            schedule_error_alert(
+                area="Windows runner recovery",
+                summary="MT5 auto-recovery đã hết số lần thử.",
+                severity="critical",
+                account_id=event_model.account_id,
+                deployment_id=event_model.deployment_id,
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+                impact="Bot đã dừng rõ trạng thái, cần operator hoặc user bật lại sau khi kiểm tra slot.",
+                action="Kiểm tra Windows runner, terminal slot và log recovery.",
+                detail={"reason": reason, "payload": payload},
+                alert_key=f"mt5_recovery_budget_exhausted:{event_model.deployment_id}:{event_model.runner_id}:{event_model.slot_id}",
+                cooldown_sec=300,
             )
 
     async def _fallback_config_hot_update_restart(
@@ -1212,10 +1397,21 @@ class RunnerEventIngestService:
                 "created_at": created_at,
             }
         )
-        normalized_event_id = event_model.event_id
         event_type_value = event_model.event_type.value
         payload_map = dict(event_model.payload or {})
         event_command_id = event_model.command_id or _payload_command_id(payload_map)
+        normalized_event_id = stable_runner_event_id(
+            event_id=event_model.event_id,
+            event_type=event_type_value,
+            command_id=event_command_id or "",
+            payload={
+                **payload_map,
+                "deployment_id": event_model.deployment_id,
+                "account_id": event_model.account_id,
+            },
+        )
+        if normalized_event_id and normalized_event_id != event_model.event_id:
+            payload_map.setdefault("runner_event_id_original", event_model.event_id)
         if event_model.created_at and not payload_map.get("event_at"):
             payload_map["event_at"] = event_model.created_at
         severity_value = event_model.severity.value
@@ -1367,6 +1563,14 @@ class RunnerEventIngestService:
                     payload={"last_event_type": event_type_value, "runner_id": event_model.runner_id, "slot_id": event_model.slot_id},
                 )
             return {"event": event, "login_reservation": result, "ok": ok}
+
+        recovery_event_type = _payload_recovery_event_type(event_type=event_type_value, payload=payload_map)
+        if recovery_event_type and event_type_value != EventType.RUNTIME_LOG.value:
+            self._apply_recovery_event(
+                event_model=event_model,
+                recovery_event_type=recovery_event_type,
+                payload=payload_map,
+            )
 
         if event_command_id and event_type_value in {
             EventType.BOT_STARTED.value,
@@ -1807,6 +2011,17 @@ class RunnerEventIngestService:
                     event_model=event_model,
                     command_id=event_command_id,
                     terminal_event_type=terminal_event_type,
+                )
+            recovery_event_type = _payload_recovery_event_type(
+                event_type=event_type_value,
+                payload=payload_map,
+                runtime_message=runtime_message,
+            )
+            if recovery_event_type:
+                self._apply_recovery_event(
+                    event_model=event_model,
+                    recovery_event_type=recovery_event_type,
+                    payload=payload_map,
                 )
             runtime_text = f"{runtime_message} {_event_reason(payload_map)}".lower()
             if "backend_state" in runtime_text or "store_candle_skipped" in runtime_text:

@@ -178,8 +178,11 @@ class ControlPlaneRunnersSlotsMixin:
                 int(account_id),
                 str(int(account_id)),
                 str(int(account_id)),
+                int(account_id),
                 str(int(account_id)),
                 str(int(account_id)),
+                int(account_id),
+                int(account_id),
                 int(account_id),
             ),
         )
@@ -966,12 +969,30 @@ class ControlPlaneRunnersSlotsMixin:
                       NULLIF(BTRIM(COALESCE(s.metadata_json->>'reserved_account_id', '')), '') IS NULL
                       OR LOWER(NULLIF(BTRIM(COALESCE(s.metadata_json->>'reserved_account_id', '')), '')) IN ('null', 'none', '0')
                       OR NULLIF(BTRIM(COALESCE(s.metadata_json->>'reserved_account_id', '')), '') = %s
+                      OR EXISTS (
+                          SELECT 1
+                          FROM account_login_reservations v
+                          WHERE v.account_id = %s
+                            AND v.runner_id = s.runner_id
+                            AND v.slot_id = s.slot_id
+                            AND v.status = 'claimed'
+                            AND (v.expires_at IS NULL OR v.expires_at > NOW())
+                      )
                   )
 	                  AND (
 	                      COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'available_for_new_account'), '')), 'true')
 	                            NOT IN ('false', '0', 'no', 'n', 'off')
 	                      OR %s IS NULL
 	                      OR NULLIF(BTRIM(COALESCE(s.metadata_json->>'reserved_account_id', '')), '') = %s
+	                      OR EXISTS (
+	                          SELECT 1
+	                          FROM account_login_reservations v
+	                          WHERE v.account_id = %s
+	                            AND v.runner_id = s.runner_id
+	                            AND v.slot_id = s.slot_id
+	                            AND v.status = 'claimed'
+	                            AND (v.expires_at IS NULL OR v.expires_at > NOW())
+	                      )
 	                      OR (
 	                          NULLIF(BTRIM(COALESCE(s.metadata_json->>'sticky_account_id', '')), '') IS NOT NULL
 	                          AND LOWER(NULLIF(BTRIM(COALESCE(s.metadata_json->>'sticky_account_id', '')), '')) NOT IN ('null', 'none', '0')
@@ -999,7 +1020,19 @@ class ControlPlaneRunnersSlotsMixin:
                       )
                   )
                   AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'mt5_liveness_state'), '')), 'ready')
-                        NOT IN ('broken', 'dead', 'degraded', 'disabled', 'failed', 'offline', 'stale')
+                        NOT IN ('broken', 'dead', 'disabled', 'failed', 'offline', 'stale')
+                  AND (
+                      COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'mt5_liveness_state'), '')), 'ready') <> 'degraded'
+                      OR EXISTS (
+                          SELECT 1
+                          FROM account_login_reservations v
+                          WHERE v.account_id = %s
+                            AND v.runner_id = s.runner_id
+                            AND v.slot_id = s.slot_id
+                            AND v.status = 'claimed'
+                            AND (v.expires_at IS NULL OR v.expires_at > NOW())
+                      )
+                  )
                   AND COALESCE(LOWER(NULLIF(BTRIM(s.metadata_json->>'login_slot_status'), '')), '')
                         NOT IN ('dispatched', 'pending', 'queued', 'running', 'verifying')
                 RETURNING runner_id, slot_id, status, current_account_id
@@ -1014,8 +1047,11 @@ class ControlPlaneRunnersSlotsMixin:
                     int(account_id),
                     str(int(account_id)),
                     str(int(account_id)),
+                    int(account_id),
                     str(int(account_id)),
                     str(int(account_id)),
+                    int(account_id),
+                    int(account_id),
                     int(account_id),
                 ),
             )

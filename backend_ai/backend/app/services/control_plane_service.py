@@ -48,6 +48,7 @@ from app.risk.orchestration_policy import OrchestrationPolicyError, validate_run
 from app.security import CryptoBox
 from app.services.runner_gsalgo_state import GsAlgoBackendStateService
 from app.services.store_service import get_process_store
+from app.services.tradingview_position_resolver import resolve_close_positions
 from app.settings import settings
 
 log = logging.getLogger(__name__)
@@ -2287,6 +2288,9 @@ class MT5ControlPlaneService:
           - bot_code (str): optional bot guard for multi-bot signal routing.
           - default_volume (float): legacy fallback only if deployment lot is missing.
           - sl/tp or stop_loss/take_profit: required for PLACE_ORDER.
+          - CLOSE_ORDER resolves current position snapshots per subscriber and sends
+            one ticket-based close command per open MT5 position. If no ticket is
+            known for a subscriber, that subscriber gets a clear failed result.
           - max_subscribers (int, default 5000): safety cap.
           - secret: shared secret if TRADINGVIEW_WEBHOOK_SECRET is set.
 
@@ -2297,8 +2301,10 @@ class MT5ControlPlaneService:
             "broadcast_id": "...", "results": [{account_id, ok, command_id, error?}, ...]
           }
 
-        Idempotency: trace_id = `tv_bcast:{alert_id}:{account_id}:{kind}` →
-        repeat-broadcast for same alert_id is no-op per subscriber.
+        Idempotency:
+          - PLACE_ORDER: `tv_bcast:{alert_id}:{account_id}:place_order`
+          - CLOSE_ORDER: `tv_bcast:{alert_id}:{account_id}:close_order:{ticket}`
+        repeat-broadcast for same alert_id is no-op per target command.
         """
         if not isinstance(body, dict):
             raise ValueError("invalid_request")
@@ -2368,6 +2374,7 @@ class MT5ControlPlaneService:
                 "action": str(action),
                 "kind": kind,
                 "subscribers_total": 0,
+                "commands_total": 0,
                 "dispatched": 0,
                 "deduped": 0,
                 "failed": 0,
@@ -2404,7 +2411,6 @@ class MT5ControlPlaneService:
                 deployment_id=deployment_id,
                 bot_code=bot_code,
             )
-            trace_id = f"tv_bcast:{alert_id}:{account_id}:{kind.lower()}"
             order_symbol = self._map_tradingview_symbol(
                 symbol,
                 self._broker_default_symbol_config(
@@ -2417,6 +2423,7 @@ class MT5ControlPlaneService:
             )
 
             if kind == "PLACE_ORDER":
+                trace_id = f"tv_bcast:{alert_id}:{account_id}:place_order"
                 request = {
                     "symbol": order_symbol,
                     "side": side,
@@ -2427,13 +2434,81 @@ class MT5ControlPlaneService:
                 }
                 cmd_type = CommandType.PLACE_ORDER
             else:
-                request = {
-                    "close_kind": meta.get("close_kind") or "CLOSE",
-                    "magic": magic,
-                }
-                if order_symbol:
-                    request["symbol"] = order_symbol
-                cmd_type = CommandType.CLOSE_ORDER
+                close_kind = str(meta.get("close_kind") or "CLOSE").strip().upper() or "CLOSE"
+                try:
+                    snapshots = self._repo.list_position_snapshots(
+                        account_id=account_id,
+                        user_id=int(sub["user_id"]),
+                        deployment_id=deployment_id,
+                        limit=500,
+                    )
+                except Exception as exc:
+                    items.append({
+                        "_skip_dispatch": True,
+                        "_error": f"position_snapshot_lookup_failed:{exc.__class__.__name__}",
+                        "account_id": account_id,
+                        "subscription_id": sub.get("subscription_id"),
+                    })
+                    continue
+
+                resolved_positions = resolve_close_positions(
+                    snapshots,
+                    symbol=order_symbol,
+                    close_kind=close_kind,
+                )
+
+                if not resolved_positions:
+                    items.append({
+                        "_skip_dispatch": True,
+                        "_error": "missing_position_ticket",
+                        "account_id": account_id,
+                        "subscription_id": sub.get("subscription_id"),
+                        "close_kind": close_kind,
+                        "symbol": order_symbol,
+                    })
+                    continue
+
+                for position in resolved_positions:
+                    request = {
+                        "close_kind": close_kind,
+                        "magic": magic,
+                        "ticket": position.ticket,
+                        "position": position.ticket,
+                    }
+                    if order_symbol:
+                        request["symbol"] = order_symbol
+                    payload = {
+                        "request": request,
+                        "broadcast_signal_id": signal_id,
+                        "broadcast_alert_id": alert_id,
+                        "broadcast_bot_code": requested_bot_code,
+                        "broadcast_source_symbol": symbol,
+                        "broadcast_mapped_symbol": order_symbol,
+                        "broadcast_position_key": position.position_key,
+                        "broadcast_position_ticket": position.ticket,
+                        "position_snapshot_at": position.row.get("snapshot_at"),
+                        "position_side": position.row.get("side"),
+                        "position_volume": position.volume,
+                    }
+                    for key in ("signal_role", "dca_price", "tv_symbol", "timeframe"):
+                        if body.get(key) not in (None, ""):
+                            payload[key] = body.get(key)
+
+                    items.append({
+                        "command_type": CommandType.CLOSE_ORDER,
+                        "account_id": account_id,
+                        "deployment_id": deployment_id,
+                        "bot_id": bot_code,
+                        "runner_id": runner_id,
+                        "slot_id": slot_id,
+                        "priority": int(sub.get("subscription_priority") or 60),
+                        "trace_id": f"tv_bcast:{alert_id}:{account_id}:close_order:{position.ticket}",
+                        "payload": payload,
+                        "_subscription_id": sub.get("subscription_id"),
+                        "_position_ticket": position.ticket,
+                        "_position_key": position.position_key,
+                    })
+                continue
 
             payload = {
                 "request": request,
@@ -2461,7 +2536,11 @@ class MT5ControlPlaneService:
             })
 
         # Fan-out batch dispatch
-        dispatchable = [{k: v for k, v in i.items() if not k.startswith("_")} for i in items if not i.get("_invalid_volume")]
+        dispatchable = [
+            {k: v for k, v in i.items() if not k.startswith("_")}
+            for i in items
+            if not i.get("_invalid_volume") and not i.get("_skip_dispatch")
+        ]
         results = await self._command_router.dispatch_batch(items=dispatchable, broadcast_id=broadcast_id)
 
         # Merge results back with input order
@@ -2475,9 +2554,27 @@ class MT5ControlPlaneService:
                 merged.append({"account_id": account_id, "subscription_id": sub_id, "ok": False, "error": "no_volume_resolved"})
                 failed += 1
                 continue
+            if item.get("_skip_dispatch"):
+                entry = {
+                    "account_id": account_id,
+                    "subscription_id": sub_id,
+                    "ok": False,
+                    "error": item.get("_error") or "dispatch_skipped",
+                }
+                if item.get("close_kind"):
+                    entry["close_kind"] = item.get("close_kind")
+                if item.get("symbol"):
+                    entry["symbol"] = item.get("symbol")
+                merged.append(entry)
+                failed += 1
+                continue
             r = results[result_idx] if result_idx < len(results) else {"ok": False, "error": "no_result"}
             result_idx += 1
             entry = {"account_id": account_id, "subscription_id": sub_id, "ok": bool(r.get("ok"))}
+            if item.get("_position_ticket"):
+                entry["position_ticket"] = item.get("_position_ticket")
+            if item.get("_position_key"):
+                entry["position_key"] = item.get("_position_key")
             cmd_rec = r.get("command_record") or {}
             if cmd_rec.get("command_id"):
                 entry["command_id"] = cmd_rec["command_id"]
@@ -2498,6 +2595,7 @@ class MT5ControlPlaneService:
             "action": str(action),
             "kind": kind,
             "subscribers_total": len(subscribers),
+            "commands_total": len(dispatchable),
             "dispatched": dispatched,
             "deduped": deduped,
             "failed": failed,

@@ -1247,6 +1247,196 @@ class ControlPlaneDeploymentsMixin:
 
         self._store._with_retry_locked(_do)
 
+    def list_runner_offline_failover_candidates(
+        self,
+        *,
+        stale_sec: int,
+        waiting_retry_sec: int,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        stale_i = max(60, int(stale_sec or 0))
+        retry_i = max(30, int(waiting_retry_sec or 0))
+        limit_i = max(1, min(int(limit or 1), 100))
+        start_like_statuses = ["start_requested", "starting", "running"]
+
+        def _do(con: Any, cur: Any) -> list[dict[str, Any]]:
+            cur.execute(
+                """
+                SELECT
+                    d.id,
+                    d.user_id,
+                    d.account_id,
+                    d.bot_code,
+                    d.bot_name,
+                    d.profile_class,
+                    d.mode,
+                    d.status,
+                    d.desired_state,
+                    d.is_active,
+                    d.runner_id,
+                    d.slot_id,
+                    d.binding_id,
+                    d.config_json,
+                    d.health_status,
+                    d.last_error,
+                    d.trace_id,
+                    d.intent_seq,
+                    d.started_at,
+                    d.updated_at,
+                    n.status AS runner_status,
+                    n.last_heartbeat_at AS runner_last_heartbeat_at,
+                    CASE
+                        WHEN n.last_heartbeat_at IS NULL THEN NULL
+                        ELSE EXTRACT(EPOCH FROM (NOW() - n.last_heartbeat_at))::BIGINT
+                    END AS runner_heartbeat_age_sec
+                FROM bot_deployments d
+                LEFT JOIN runner_nodes n ON n.runner_id = d.runner_id
+                WHERE d.desired_state = 'running'
+                  AND d.runner_id IS NOT NULL
+                  AND d.slot_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM bot_deployments other
+                      WHERE other.account_id = d.account_id
+                        AND other.id <> d.id
+                        AND other.status = ANY(%s)
+                  )
+                  AND (
+                      (
+                          d.status = ANY(%s)
+                          AND COALESCE(d.is_active, FALSE) = TRUE
+                          AND (
+                              n.runner_id IS NULL
+                              OR n.status = 'offline'
+                              OR n.last_heartbeat_at IS NULL
+                              OR n.last_heartbeat_at < (NOW() - (%s * INTERVAL '1 second'))
+                          )
+                      )
+                      OR (
+                          d.status = 'blocked'
+                          AND COALESCE(d.is_active, FALSE) = FALSE
+                          AND COALESCE(d.health_status, '') = 'runner_offline_waiting_capacity'
+                          AND d.updated_at < (NOW() - (%s * INTERVAL '1 second'))
+                      )
+                  )
+                ORDER BY
+                    CASE WHEN d.status = 'blocked' THEN 1 ELSE 0 END ASC,
+                    d.updated_at ASC,
+                    d.id ASC
+                LIMIT %s
+                """,
+                (
+                    list(ACTIVE_DEPLOYMENT_STATUSES),
+                    start_like_statuses,
+                    stale_i,
+                    retry_i,
+                    limit_i,
+                ),
+            )
+            return [dict(row) for row in (cur.fetchall() or [])]
+
+        return self._store._with_retry_read(_do)
+
+    def claim_runner_offline_failover_candidate(
+        self,
+        *,
+        deployment_id: int,
+        runner_id: str,
+        slot_id: str,
+        stale_sec: int,
+        reason: str,
+    ) -> Optional[dict[str, Any]]:
+        runner_id_s = _norm(runner_id)
+        slot_id_s = _norm_slot_id(slot_id)
+        stale_i = max(60, int(stale_sec or 0))
+        reason_s = (_norm(reason) or "runner_offline_failover")[:200]
+        start_like_statuses = ["start_requested", "starting", "running"]
+        if not runner_id_s or not slot_id_s:
+            return None
+
+        def _do(con: Any, cur: Any) -> Optional[dict[str, Any]]:
+            cur.execute(
+                """
+                WITH candidate AS (
+                    SELECT d.*
+                    FROM bot_deployments d
+                    LEFT JOIN runner_nodes n ON n.runner_id = d.runner_id
+                    WHERE d.id = %s
+                      AND d.desired_state = 'running'
+                      AND d.runner_id = %s
+                      AND d.slot_id = %s
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM bot_deployments other
+                          WHERE other.account_id = d.account_id
+                            AND other.id <> d.id
+                            AND other.status = ANY(%s)
+                      )
+                      AND (
+                          (
+                              d.status = ANY(%s)
+                              AND COALESCE(d.is_active, FALSE) = TRUE
+                              AND (
+                                  n.runner_id IS NULL
+                                  OR n.status = 'offline'
+                                  OR n.last_heartbeat_at IS NULL
+                                  OR n.last_heartbeat_at < (NOW() - (%s * INTERVAL '1 second'))
+                              )
+                          )
+                          OR (
+                              d.status = 'blocked'
+                              AND COALESCE(d.is_active, FALSE) = FALSE
+                              AND COALESCE(d.health_status, '') = 'runner_offline_waiting_capacity'
+                          )
+                      )
+                    FOR UPDATE OF d
+                ),
+                claimed AS (
+                    UPDATE bot_deployments d
+                    SET status = 'blocked',
+                        desired_state = 'running',
+                        is_active = FALSE,
+                        health_status = 'runner_offline_failover_claimed',
+                        last_error = %s,
+                        stopped_at = COALESCE(d.stopped_at, NOW()),
+                        intent_seq = d.intent_seq + 1,
+                        updated_at = NOW()
+                    FROM candidate c
+                    WHERE d.id = c.id
+                    RETURNING d.*
+                ),
+                failed_start_commands AS (
+                    UPDATE execution_commands c
+                    SET delivery_status = 'failed',
+                        last_error = COALESCE(NULLIF(c.last_error, ''), %s),
+                        updated_at = NOW()
+                    FROM claimed d
+                    WHERE c.deployment_id = d.id
+                      AND c.command_type = 'START_BOT'
+                      AND c.delivery_status IN ('pending', 'queued', 'dispatched', 'acknowledged')
+                    RETURNING c.command_id
+                )
+                SELECT
+                    claimed.*,
+                    (SELECT COUNT(*) FROM failed_start_commands) AS failed_old_start_commands
+                FROM claimed
+                """,
+                (
+                    int(deployment_id),
+                    runner_id_s,
+                    slot_id_s,
+                    list(ACTIVE_DEPLOYMENT_STATUSES),
+                    start_like_statuses,
+                    stale_i,
+                    reason_s,
+                    reason_s,
+                ),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+        return self._store._with_retry_locked(_do)
+
     def list_running_deployments_for_account(self, *, account_id: int) -> list[dict[str, Any]]:
         """Liet ke deployment dang running cua 1 account (de circuit-breaker auto-stop)."""
         def _do(con: Any, cur: Any) -> list[dict[str, Any]]:

@@ -5,6 +5,7 @@ import logging
 import time
 from typing import Any, Optional
 
+from app.orchestration.runner_failover import RunnerFailoverService
 from app.repositories.control_plane_repository import ControlPlaneRepository
 from app.services.store_service import get_process_store
 from app.settings import settings
@@ -28,6 +29,10 @@ def _has_stale_runtime(result: dict[str, int]) -> bool:
             "failed_zero_runtime_start_commands",
             "acknowledged_zero_runtime_stop_commands",
             "expired_login_reservations",
+            "runner_failover_claimed",
+            "runner_failover_started",
+            "runner_failover_waiting_capacity",
+            "runner_failover_failed",
         )
     )
 
@@ -39,6 +44,7 @@ def _sticky_midnight_release_enabled() -> bool:
 class ControlPlaneReconcilerService:
     def __init__(self, repo: Optional[ControlPlaneRepository] = None) -> None:
         self._repo = repo or ControlPlaneRepository(get_process_store())
+        self._runner_failover = RunnerFailoverService(self._repo)
         self._run_count = 0
         self._last_started_at = 0
         self._last_success_at = 0
@@ -114,6 +120,20 @@ class ControlPlaneReconcilerService:
         self._last_result = dict(result)
         return result
 
+    async def reconcile_once_async(self) -> dict[str, int]:
+        result = await asyncio.to_thread(self.reconcile_once)
+        try:
+            failover = await self._runner_failover.recover_once()
+        except Exception as exc:
+            self._last_error = str(exc)
+            log.warning("Runner offline failover iteration failed: %s", exc)
+            failover = {"enabled": 1, "scanned": 0, "claimed": 0, "started": 0, "waiting_capacity": 0, "failed": 1}
+        if failover:
+            failover_result = {f"runner_failover_{key}": int(value or 0) for key, value in failover.items()}
+            result = {**dict(result), **failover_result}
+            self._last_result = dict(result)
+        return result
+
     async def run_forever(self, stop_event: asyncio.Event) -> None:
         interval = max(10, int(getattr(settings, "CONTROL_PLANE_RECONCILE_INTERVAL_SEC", 30) or 30))
         log.info(
@@ -124,7 +144,7 @@ class ControlPlaneReconcilerService:
         )
         while not stop_event.is_set():
             try:
-                result = await asyncio.to_thread(self.reconcile_once)
+                result = await self.reconcile_once_async()
                 if _has_stale_runtime(result):
                     log.warning("Control plane reconciler detected stale runtime: %s", result)
             except asyncio.CancelledError:
