@@ -9,6 +9,39 @@ _ACTIVE_LOGIN_RESERVATION_STATUSES = ("pending", "dispatched", "verified")
 
 
 class ControlPlaneLoginReservationsMixin:
+    def delete_old_login_reservations(self, *, retention_days: int = 30, batch_size: int = 5000) -> int:
+        """Hard-delete terminal login-slot rows after the operational window.
+
+        Login reservations are transient runner coordination records. Active
+        rows stay protected by status filters; completed rows are safe to drop
+        after retention because durable account/deployment state lives in the
+        broker/deployment tables and final runner events.
+        """
+
+        retention_days_i = max(1, int(retention_days or 30))
+        batch_size_i = max(1, min(int(batch_size or 5000), 50000))
+
+        def _do(con: Any, cur: Any) -> int:
+            cur.execute(
+                """
+                WITH old_rows AS (
+                    SELECT id
+                    FROM account_login_reservations
+                    WHERE status IN ('failed', 'expired', 'released', 'claimed', 'cancelled')
+                      AND COALESCE(completed_at, updated_at, requested_at) < NOW() - (%s::int * INTERVAL '1 day')
+                    ORDER BY id
+                    LIMIT %s
+                )
+                DELETE FROM account_login_reservations r
+                USING old_rows
+                WHERE r.id = old_rows.id
+                """,
+                (retention_days_i, batch_size_i),
+            )
+            return int(cur.rowcount or 0)
+
+        return int(self._store._with_retry_locked(_do) or 0)
+
     def release_expired_login_reservations(self) -> int:
         """Expire stale login-slot holds and free their runner slots."""
 

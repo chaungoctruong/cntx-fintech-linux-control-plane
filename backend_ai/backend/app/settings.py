@@ -101,6 +101,12 @@ class Settings(BaseSettings):
     MINIAPP_BOTS_CACHE_TTL_SEC: float = 1.5
     MT5_BOT_CATALOG_DISABLED_CODES: List[str] = []
     BOT_CONTROL_COOLDOWN_SEC: int = 60
+    BOT_TOKEN_TRADING_ROOT: str = ""
+    BOT_TOKEN_ACCEPT_LEGACY_SHA256: bool = True
+    BOT_TOKEN_SCHEMA_INIT_ENABLED: bool = True
+    BOT_TOKEN_EXPIRY_RECONCILER_ENABLED: bool = True
+    BOT_TOKEN_EXPIRY_RECONCILE_INTERVAL_SEC: int = 60
+    BOT_TOKEN_EXPIRY_BATCH_SIZE: int = 100
     PUBLIC_OVERVIEW_CACHE_TTL_SEC: float = 15.0
     PUBLIC_OVERVIEW_FEATURED_BOTS_MAX: int = 6
     # Frozen legacy broker-adapter settings. Keep only for archive/compatibility;
@@ -290,13 +296,13 @@ class Settings(BaseSettings):
     REDIS_MAX_CONNECTIONS: int = 200
     # Serialize migration / repair during multi-worker startup to avoid every HTTP worker repeating heavy boot work.
     STARTUP_SINGLETON_ENABLED: bool = True
-    STARTUP_SINGLETON_KEY_PREFIX: str = "spider:backend:startup"
+    STARTUP_SINGLETON_KEY_PREFIX: str = "cntxlab:backend:startup"
     STARTUP_SINGLETON_LOCK_TTL_SEC: int = 180
     STARTUP_SINGLETON_READY_TTL_SEC: int = 300
     STARTUP_SINGLETON_POLL_SEC: float = 0.5
     # Only one HTTP worker should own backend background jobs (consumers, reconciliation, cleanup).
     BACKGROUND_SINGLETON_ENABLED: bool = True
-    BACKGROUND_SINGLETON_KEY: str = "spider:backend:background-owner"
+    BACKGROUND_SINGLETON_KEY: str = "cntxlab:backend:background-owner"
     BACKGROUND_SINGLETON_TTL_SEC: int = 90
     BACKGROUND_SINGLETON_RENEW_SEC: int = 30
     CONTROL_PLANE_RECONCILE_INTERVAL_SEC: int = 30
@@ -334,6 +340,7 @@ class Settings(BaseSettings):
     COMMAND_DELIVERY_OBSERVABILITY_WINDOW_SEC: int = 3600
     COMMAND_DELIVERY_OBSERVABILITY_STALE_SEC: int = 300
     COMMAND_DELIVERY_DLQ_MAXLEN: int = 5000
+    COMMAND_STREAM_MAXLEN: int = 50000
     STICKY_SLOT_MIDNIGHT_RELEASE_ENABLED: bool = True
     STICKY_SLOT_MIDNIGHT_RELEASE_TIMEZONE: str = "Asia/Ho_Chi_Minh"
     STICKY_SLOT_MIDNIGHT_RELEASE_BATCH_SIZE: int = 500
@@ -341,6 +348,11 @@ class Settings(BaseSettings):
     CONTROL_PLANE_EVENT_CONSUMER_GROUP: str = "control-plane-event-audit"
     CONTROL_PLANE_EVENT_CONSUMER_BLOCK_MS: int = 5000
     EVENT_STREAM_MAXLEN: int = 20000
+    RUNTIME_HOUSEKEEPING_ENABLED: bool = True
+    RUNTIME_HOUSEKEEPING_INTERVAL_SEC: int = 3600
+    RUNTIME_HOUSEKEEPING_BATCH_SIZE: int = 5000
+    LOGIN_RESERVATION_HISTORY_RETENTION_DAYS: int = 30
+    BOT_TOKEN_HISTORY_RETENTION_DAYS: int = 1095
     OPS_LOGIN_SLOT_BACKLOG_THRESHOLD: int = 20
     OPS_COMMAND_BACKLOG_THRESHOLD: int = 40
     OPS_EVENT_BACKLOG_THRESHOLD: int = 100

@@ -31,126 +31,158 @@ const checkboxItems = [
 export const MINIAPP_RISK_WARNING_SHORT =
   "Cảnh báo: Bot giao dịch tự động không cam kết lợi nhuận. Giao dịch đòn bẩy có thể gây mất vốn. Nền tảng chỉ cung cấp công nghệ, không nhận ủy thác đầu tư, không giữ tiền và không chịu trách nhiệm đối với lời hứa/cam kết từ đối tác hoặc bên thứ ba.";
 
-export const MINIAPP_DISCLAIMER_NOTICE_PARAGRAPHS = [
-  "CNTx Labs cung cấp công cụ công nghệ hỗ trợ vận hành bot, không cam kết lợi nhuận, không nhận ủy thác đầu tư và không thay mặt người dùng ra quyết định tài chính.",
-  "Giao dịch tài chính luôn có rủi ro. Người dùng tự chịu trách nhiệm với tài khoản, vốn và quyết định giao dịch của mình.",
-] as const;
-
 function FullTermsContent() {
   return (
     <div className="space-y-5 text-sm leading-6 text-slate-200">
-      <p>Vui lòng đọc kỹ trước khi kết nối tài khoản MT5 hoặc bật bot.</p>
+      <p>Vui lòng đọc kỹ trước khi sử dụng nền tảng.</p>
 
       <section className="space-y-2">
         <h3 className="text-sm font-semibold text-white">1. Vai trò của nền tảng</h3>
         <p>
-          Nền tảng này chỉ cung cấp hạ tầng công nghệ, công cụ phần mềm và hệ thống hỗ trợ tự động hóa
-          giao dịch trên tài khoản MT5 do người dùng tự sở hữu.
+          Nền tảng chỉ cung cấp phần mềm, hạ tầng kỹ thuật, server, dashboard, công cụ quản lý bot và
+          công cụ hỗ trợ kết nối tài khoản giao dịch MT5.
         </p>
         <p>
-          Nền tảng không phải là tổ chức tư vấn đầu tư, không phải sàn giao dịch, không phải broker,
-          không nhận ủy thác đầu tư, không giữ tiền của người dùng và không đại diện cho bất kỳ tổ chức
-          tài chính nào.
+          Nền tảng không phải là sàn giao dịch, không phải broker, không phải công ty chứng khoán, không
+          phải công ty quản lý quỹ, không phải đơn vị nhận ủy thác đầu tư và không phải đơn vị cam kết
+          lợi nhuận.
+        </p>
+        <p>
+          Người dùng tự lựa chọn broker/sàn, tự mở tài khoản giao dịch, tự nạp/rút tiền và tự chịu
+          trách nhiệm với tài khoản giao dịch của mình.
         </p>
       </section>
 
       <section className="space-y-2">
-        <h3 className="text-sm font-semibold text-white">2. Không cam kết lợi nhuận</h3>
-        <p>Bot giao dịch tự động không đảm bảo có lợi nhuận.</p>
+        <h3 className="text-sm font-semibold text-white">2. Không tư vấn đầu tư</h3>
         <p>
-          Mọi kết quả mô phỏng, backtest, lịch sử giao dịch, hình ảnh lợi nhuận hoặc thông tin hiển thị
-          trong hệ thống chỉ có giá trị tham khảo và không phải là cam kết lợi nhuận trong tương lai.
+          Các bot, tín hiệu, cấu hình, thông tin hiển thị, dữ liệu backtest, dữ liệu thử nghiệm hoặc nội
+          dung từ đối tác/KOL chỉ nhằm mục đích cung cấp công cụ công nghệ và thông tin tham khảo.
         </p>
-        <p>Nền tảng không cam kết:</p>
+        <p>
+          Nội dung trên nền tảng không được xem là lời khuyên đầu tư, khuyến nghị mua/bán, cam kết lợi
+          nhuận hoặc bảo đảm kết quả giao dịch.
+        </p>
+        <p>
+          Người dùng tự quyết định việc bật/tắt bot, lựa chọn bot, lựa chọn broker, cấu hình lot, SL,
+          TP, rủi ro và mọi hành động giao dịch trên tài khoản của mình.
+        </p>
+      </section>
+
+      <section className="space-y-2">
+        <h3 className="text-sm font-semibold text-white">3. Cảnh báo rủi ro giao dịch</h3>
+        <p>
+          Giao dịch tài chính, đặc biệt là forex, vàng, CFD, phái sinh, crypto hoặc các sản phẩm có đòn
+          bẩy, có rủi ro rất cao.
+        </p>
+        <p>Người dùng có thể mất một phần hoặc toàn bộ số vốn trong tài khoản giao dịch.</p>
+        <p>
+          Hiệu suất quá khứ, kết quả backtest, kết quả demo hoặc kết quả thử nghiệm không đảm bảo kết
+          quả trong tương lai.
+        </p>
+        <p>
+          Nền tảng không cam kết lợi nhuận, không cam kết hoàn vốn, không cam kết tỷ lệ thắng và không
+          chịu trách nhiệm cho khoản lỗ phát sinh từ quyết định sử dụng bot, tín hiệu hoặc cấu hình của
+          người dùng.
+        </p>
+      </section>
+
+      <section className="space-y-2">
+        <h3 className="text-sm font-semibold text-white">4. Quyền điều khiển bot</h3>
+        <p>
+          Người dùng có toàn quyền bật bot, tắt bot, thay đổi cấu hình, dừng sử dụng dịch vụ và quản lý
+          tài khoản giao dịch của mình.
+        </p>
+        <p>
+          Khi người dùng bật bot hoặc bật chế độ nhận tín hiệu, người dùng đồng ý cho hệ thống gửi lệnh
+          kỹ thuật đến tài khoản MT5 theo cấu hình mà người dùng đã chọn hoặc đã xác nhận.
+        </p>
+        <p>
+          Người dùng hiểu rằng bot có thể hoạt động sai, server có thể lỗi, broker có thể lỗi, MT5 có
+          thể mất kết nối, thị trường có thể biến động mạnh và lệnh có thể bị trượt giá, từ chối hoặc
+          khớp không như kỳ vọng.
+        </p>
+      </section>
+
+      <section className="space-y-2">
+        <h3 className="text-sm font-semibold text-white">5. Quan hệ với broker/sàn</h3>
+        <p>
+          Nền tảng không giữ tiền của người dùng, không nhận tiền nạp/rút, không bảo quản tài sản giao
+          dịch và không đại diện broker/sàn giao dịch.
+        </p>
+        <p>
+          Mọi vấn đề liên quan đến tài khoản giao dịch, báo giá, đòn bẩy, khớp lệnh, spread, nạp/rút
+          tiền, điều kiện giao dịch và tranh chấp với broker/sàn thuộc trách nhiệm giữa người dùng và
+          broker/sàn mà người dùng đã lựa chọn.
+        </p>
+      </section>
+
+      <section className="space-y-2">
+        <h3 className="text-sm font-semibold text-white">6. Phí dịch vụ</h3>
+        <p>
+          Người dùng có thể phải trả phí sử dụng phần mềm, bot, server, dashboard, hạ tầng hoặc các
+          dịch vụ kỹ thuật khác theo gói đã chọn.
+        </p>
+        <p>
+          Phí dịch vụ không phải là tiền đầu tư, không phải tiền ủy thác, không phải tiền nạp vào
+          broker/sàn và không đảm bảo bất kỳ lợi nhuận nào.
+        </p>
+      </section>
+
+      <section className="space-y-2">
+        <h3 className="text-sm font-semibold text-white">7. Dữ liệu và quyền riêng tư</h3>
+        <p>
+          Để cung cấp dịch vụ, nền tảng có thể thu thập và xử lý các dữ liệu cần thiết như: thông tin
+          người dùng, tài khoản MT5, broker/server, trạng thái bot, cấu hình bot, lịch sử bật/tắt bot,
+          tín hiệu, lệnh giao dịch, kết quả thực thi, log kỹ thuật, lỗi hệ thống và dữ liệu vận hành.
+        </p>
+        <p>
+          Mật khẩu, token hoặc thông tin nhạy cảm sẽ được xử lý theo cơ chế bảo mật của hệ thống và
+          không được cố ý hiển thị công khai.
+        </p>
+        <p>
+          Nền tảng có thể sử dụng dữ liệu đã được ẩn danh hoặc giả danh để cải thiện hệ thống, nâng cấp
+          bot, tối ưu hạ tầng, phân tích rủi ro, cải thiện tốc độ thực thi và phát triển sản phẩm.
+        </p>
+        <p>Nền tảng không bán dữ liệu cá nhân của người dùng cho bên thứ ba.</p>
+      </section>
+
+      <section className="space-y-2">
+        <h3 className="text-sm font-semibold text-white">8. Trách nhiệm của người dùng</h3>
+        <p>Người dùng cam kết:</p>
         <ul className="list-disc space-y-1 pl-5">
-          <li>Có lãi cố định;</li>
-          <li>Không thua lỗ;</li>
-          <li>Không cháy tài khoản;</li>
-          <li>Bảo toàn vốn;</li>
-          <li>Hoàn vốn;</li>
-          <li>Đạt tỷ lệ thắng cụ thể;</li>
-          <li>Đạt mức lợi nhuận theo ngày, tuần hoặc tháng.</li>
+          <li>Cung cấp thông tin chính xác.</li>
+          <li>Tự chịu trách nhiệm với broker/sàn mình lựa chọn.</li>
+          <li>Tự chịu trách nhiệm với cấu hình bot và mức rủi ro.</li>
+          <li>Không sử dụng nền tảng cho mục đích gian lận, vi phạm pháp luật hoặc gây thiệt hại cho bên khác.</li>
+          <li>Không chia sẻ tài khoản, mật khẩu hoặc quyền truy cập cho người không có thẩm quyền.</li>
         </ul>
       </section>
 
       <section className="space-y-2">
-        <h3 className="text-sm font-semibold text-white">3. Rủi ro giao dịch</h3>
+        <h3 className="text-sm font-semibold text-white">9. Giới hạn trách nhiệm</h3>
         <p>
-          Giao dịch Forex, CFD, vàng, tiền tệ, chỉ số hoặc các sản phẩm đòn bẩy có rủi ro cao. Người dùng
-          có thể mất một phần hoặc toàn bộ số vốn trong tài khoản giao dịch.
-        </p>
-        <p>Người dùng tự chịu trách nhiệm đối với:</p>
-        <ul className="list-disc space-y-1 pl-5">
-          <li>Việc lựa chọn tài khoản giao dịch;</li>
-          <li>Vốn nạp vào tài khoản;</li>
-          <li>Đòn bẩy sử dụng;</li>
-          <li>Khối lượng giao dịch;</li>
-          <li>Việc bật/tắt bot;</li>
-          <li>Kết quả lời/lỗ phát sinh;</li>
-          <li>Mọi quyết định liên quan đến giao dịch.</li>
-        </ul>
-      </section>
-
-      <section className="space-y-2">
-        <h3 className="text-sm font-semibold text-white">4. Token và đối tác phân phối</h3>
-        <p>
-          Token truy cập bot có thể được cấp bởi đối tác phân phối/đơn vị giới thiệu. Đối tác phân phối
-          chịu trách nhiệm độc lập đối với hoạt động tư vấn, chăm sóc khách hàng, thu phí, quảng cáo,
-          giới thiệu sản phẩm và mọi cam kết riêng với người dùng nếu có.
+          Trong phạm vi pháp luật cho phép, nền tảng không chịu trách nhiệm cho các khoản lỗ giao dịch,
+          lỗi broker/sàn, lỗi kết nối Internet, lỗi MT5, lỗi server, lỗi dữ liệu, trượt giá, spread
+          giãn, lệnh bị từ chối, biến động thị trường hoặc các thiệt hại gián tiếp phát sinh từ việc sử
+          dụng dịch vụ.
         </p>
         <p>
-          Nền tảng không chịu trách nhiệm đối với bất kỳ lời hứa, cam kết lợi nhuận, tư vấn đầu tư, kêu
-          gọi góp vốn, nhận ủy thác hoặc nội dung quảng cáo nào do đối tác hoặc bên thứ ba đưa ra ngoài
-          hệ thống chính thức.
-        </p>
-        <p>
-          Nếu người dùng nhận được bất kỳ cam kết nào như “lãi chắc”, “không cháy”, “bảo toàn vốn”,
-          “lợi nhuận cố định”, “được hoàn tiền nếu thua lỗ”, người dùng cần hiểu rằng các cam kết này
-          không đến từ nền tảng và có thể là dấu hiệu rủi ro.
+          Nền tảng có thể tạm dừng, giới hạn hoặc ngắt dịch vụ khi phát hiện rủi ro kỹ thuật, hành vi
+          bất thường, lỗi hệ thống, vi phạm điều khoản hoặc sự kiện bất khả kháng.
         </p>
       </section>
 
       <section className="space-y-2">
-        <h3 className="text-sm font-semibold text-white">5. Không ủy thác, không huy động vốn</h3>
-        <p>Người dùng không được sử dụng nền tảng để:</p>
+        <h3 className="text-sm font-semibold text-white">10. Xác nhận đồng ý</h3>
+        <p>Bằng việc bấm “Tôi đồng ý”, người dùng xác nhận rằng:</p>
         <ul className="list-disc space-y-1 pl-5">
-          <li>Huy động vốn trái phép;</li>
-          <li>Nhận tiền giao dịch thay người khác;</li>
-          <li>Kêu gọi góp vốn;</li>
-          <li>Cam kết lợi nhuận cho bên thứ ba;</li>
-          <li>Bán tín hiệu hoặc bán bot bằng nội dung gây hiểu nhầm;</li>
-          <li>Thực hiện hành vi lừa đảo, gian dối hoặc vi phạm pháp luật.</li>
-        </ul>
-      </section>
-
-      <section className="space-y-2">
-        <h3 className="text-sm font-semibold text-white">6. Quyền tạm khóa hoặc dừng dịch vụ</h3>
-        <p>
-          Nền tảng có quyền tạm khóa token, dừng bot, khóa tài khoản, hạn chế quyền truy cập hoặc chấm dứt
-          cung cấp dịch vụ nếu phát hiện hoặc có căn cứ nghi ngờ người dùng/đối tác sử dụng hệ thống để:
-        </p>
-        <ul className="list-disc space-y-1 pl-5">
-          <li>Cam kết lợi nhuận;</li>
-          <li>Huy động vốn;</li>
-          <li>Nhận ủy thác đầu tư;</li>
-          <li>Lừa đảo;</li>
-          <li>Quảng cáo sai sự thật;</li>
-          <li>Gây hiểu nhầm cho khách hàng;</li>
-          <li>Vi phạm pháp luật hoặc điều khoản sử dụng.</li>
-        </ul>
-      </section>
-
-      <section className="space-y-2">
-        <h3 className="text-sm font-semibold text-white">7. Xác nhận của người dùng</h3>
-        <p>Bằng việc bấm “Tôi hiểu rủi ro và tiếp tục”, tôi xác nhận rằng:</p>
-        <ul className="list-disc space-y-1 pl-5">
-          <li>Tôi đã đọc, hiểu và đồng ý với toàn bộ điều khoản trên;</li>
-          <li>Tôi hiểu bot không cam kết lợi nhuận;</li>
-          <li>Tôi hiểu giao dịch có thể gây thua lỗ;</li>
-          <li>Tôi tự chịu trách nhiệm với tài khoản MT5, vốn và kết quả giao dịch của mình;</li>
-          <li>Tôi không giao tiền cho nền tảng để đầu tư hộ;</li>
-          <li>Tôi không hiểu nền tảng là đơn vị bảo lãnh lợi nhuận hoặc bảo toàn vốn;</li>
-          <li>Tôi đủ 18 tuổi và có đầy đủ năng lực chịu trách nhiệm đối với quyết định sử dụng dịch vụ.</li>
+          <li>Đã đọc và hiểu điều khoản sử dụng.</li>
+          <li>Đã hiểu rủi ro giao dịch và khả năng mất tiền.</li>
+          <li>Hiểu rằng nền tảng không cam kết lợi nhuận.</li>
+          <li>Hiểu rằng nền tảng không phải broker, không phải quỹ và không nhận ủy thác đầu tư.</li>
+          <li>Đồng ý cho hệ thống xử lý dữ liệu cần thiết để cung cấp dịch vụ.</li>
+          <li>Tự chịu trách nhiệm với mọi quyết định sử dụng bot, tín hiệu, broker/sàn và tài khoản giao dịch của mình.</li>
         </ul>
       </section>
     </div>
@@ -291,7 +323,7 @@ export default function MiniappTermsModal({
                 Đang lưu xác nhận
               </>
             ) : (
-              "Tôi hiểu rủi ro và tiếp tục"
+              "Tôi đồng ý"
             )}
           </button>
         </div>

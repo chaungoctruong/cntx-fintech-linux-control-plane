@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "bot_id": "gsalgovip",
   "bot_code": "gsalgovip",
-  "bot_name": "GsAlgo VIP",
+  "bot_name": "Gs Algo",
   "owner": "cntx_labs",
   "package_path": "bot-trading/gsalgovip",
   "version": "0.3.0",

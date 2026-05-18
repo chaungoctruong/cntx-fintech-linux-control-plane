@@ -136,43 +136,43 @@ export class BackendAPIError extends Error {
 
 const friendlyErrorMessages: Record<string, string> = {
   account_quota_exceeded:
-    "Bạn đã đạt giới hạn số tài khoản MT5 của gói hiện tại. Hãy gỡ tài khoản cũ hoặc liên hệ hỗ trợ để được mở thêm.",
+    "Gói hiện tại đã đạt giới hạn tài khoản MT5. Gỡ tài khoản cũ hoặc liên hệ hỗ trợ để mở thêm.",
   quota_exceeded:
-    "Bạn đã đạt giới hạn số bot đang chạy của gói hiện tại. Hãy tắt bot đang chạy hoặc nâng cấp gói.",
+    "Gói hiện tại đã đạt giới hạn bot đang chạy. Tắt một bot hoặc nâng cấp gói để bật thêm.",
   telegram_user_has_active_bot:
-    "Mỗi tài khoản Telegram chỉ chạy một bot tại một thời điểm. Hãy tắt bot hiện tại trước khi bật bot khác.",
+    "Mỗi tài khoản Telegram chỉ chạy một bot tại một thời điểm. Tắt bot hiện tại trước khi bật bot khác.",
   bot_control_cooldown_active:
-    "Bạn vừa bật hoặc tắt bot. Vui lòng đợi khoảng 60 giây rồi thử lại.",
-  telegram_init_data_missing: "Vui lòng mở ứng dụng trong Telegram để tiếp tục.",
-  rate_limited: "Bạn thao tác hơi nhanh. Vui lòng chờ vài giây rồi thử lại.",
-  bot_token_required: "Vui lòng nhập mã kích hoạt để dùng bot này.",
+    "Bot vừa được bật hoặc tắt. Đợi khoảng 60 giây rồi thử lại.",
+  telegram_init_data_missing: "Mở ứng dụng trong Telegram để tiếp tục.",
+  rate_limited: "Thao tác đang quá nhanh. Đợi vài giây rồi thử lại.",
+  bot_token_required: "Nhập mã kích hoạt để dùng bot này.",
   bot_token_not_found: "Mã không đúng hoặc không tồn tại.",
   bot_token_already_used: "Mã này đã được sử dụng.",
   bot_token_expired: "Mã đã hết hạn.",
   bot_token_revoked: "Mã này đã bị vô hiệu.",
   bot_token_wrong_bot: "Mã này không áp dụng cho bot đã chọn.",
-  bot_token_partner_locked: "Đối tác cấp mã đang tạm khóa. Vui lòng liên hệ hỗ trợ.",
-  bot_token_entitlement_expired: "Quyền dùng bot đã hết hạn. Vui lòng nhập mã mới.",
+  bot_token_partner_locked: "Đối tác cấp mã đang tạm khóa. Liên hệ hỗ trợ để kiểm tra.",
+  bot_token_entitlement_expired: "Quyền dùng bot đã hết hạn. Nhập mã mới để tiếp tục.",
   bot_token_entitlement_not_found: "Bạn chưa kích hoạt quyền cho bot này.",
   start_transition_in_progress:
-    "Thao tác bật/tắt bot trước đó chưa xong. Vui lòng làm mới rồi thử lại.",
-  mt5_runtime_maintenance: "Phiên bot đang được khởi động lại. Vui lòng thử lại sau vài phút.",
-  windows_runtime_unhealthy: "Phiên bot đang được khởi động lại. Vui lòng thử lại sau vài phút.",
-  runner_queue_backlog: "Hệ thống đang xử lý nhiều yêu cầu. Vui lòng thử lại sau vài phút.",
-  runner_offline: "Kết nối tạm gián đoạn. Vui lòng thử lại sau vài phút.",
-  runner_full: "Lượng truy cập đang cao. Vui lòng thử lại sau vài phút.",
-  slot_not_ipc_ready: "Phiên bot đang được khởi động lại. Vui lòng thử lại sau vài phút.",
-  slot_resident_worker_missing: "Phiên bot đang được khởi động lại. Vui lòng thử lại sau vài phút.",
-  no_available_unreserved_slot: "Lượng truy cập đang cao. Vui lòng thử lại sau vài phút.",
-  no_scheduler_candidate: "Lượng truy cập đang cao. Vui lòng thử lại sau vài phút.",
-  no_healthy_slot_available: "Lượng truy cập đang cao. Vui lòng thử lại sau vài phút.",
-  no_available_healthy_slot: "Lượng truy cập đang cao. Vui lòng thử lại sau vài phút.",
+    "Thao tác trước đó chưa hoàn tất. Làm mới trạng thái rồi thử lại.",
+  mt5_runtime_maintenance: "Phiên MT5 đang khởi động lại. Đợi ít phút rồi thử lại.",
+  windows_runtime_unhealthy: "Phiên MT5 đang khởi động lại. Đợi ít phút rồi thử lại.",
+  runner_queue_backlog: "Hệ thống đang xử lý nhiều yêu cầu. Đợi ít phút rồi thử lại.",
+  runner_offline: "Kết nối tới máy chạy MT5 tạm gián đoạn. Đợi ít phút rồi thử lại.",
+  runner_full: "Hệ thống đang hết phiên MT5 trống. Đợi ít phút rồi thử lại.",
+  slot_not_ipc_ready: "Phiên MT5 đang khởi động lại. Đợi ít phút rồi thử lại.",
+  slot_resident_worker_missing: "Phiên MT5 đang khởi động lại. Đợi ít phút rồi thử lại.",
+  no_available_unreserved_slot: "Hệ thống đang hết phiên MT5 trống. Đợi ít phút rồi thử lại.",
+  no_scheduler_candidate: "Hệ thống đang hết phiên MT5 trống. Đợi ít phút rồi thử lại.",
+  no_healthy_slot_available: "Hệ thống đang hết phiên MT5 trống. Đợi ít phút rồi thử lại.",
+  no_available_healthy_slot: "Hệ thống đang hết phiên MT5 trống. Đợi ít phút rồi thử lại.",
   TERMS_NOT_ACCEPTED:
-    "Vui lòng đọc và xác nhận Điều khoản sử dụng & Cảnh báo rủi ro trước khi tiếp tục.",
+    "Xác nhận Điều khoản sử dụng và Cảnh báo rủi ro trước khi tiếp tục.",
   terms_not_accepted:
-    "Vui lòng đọc và xác nhận Điều khoản sử dụng & Cảnh báo rủi ro trước khi tiếp tục.",
-  invalid_terms_version: "Phiên bản điều khoản đã thay đổi. Vui lòng tải lại ứng dụng và xác nhận lại.",
-  terms_checkboxes_required: "Vui lòng xác nhận đầy đủ các nội dung bắt buộc trước khi tiếp tục.",
+    "Xác nhận Điều khoản sử dụng và Cảnh báo rủi ro trước khi tiếp tục.",
+  invalid_terms_version: "Điều khoản đã được cập nhật. Tải lại ứng dụng và xác nhận lại.",
+  terms_checkboxes_required: "Xác nhận đầy đủ các nội dung bắt buộc trước khi tiếp tục.",
 };
 
 export function getBackendErrorCode(error: unknown): string | null {
@@ -251,12 +251,12 @@ export async function fetchFromAPI<T = unknown>(
         ? getInitData()
         : "");
   if (authMode === "required" && !initData) {
-    throw new BackendAPIError("Vui lòng mở trong Telegram Mini App để tiếp tục.", {
+    throw new BackendAPIError("Mở ứng dụng trong Telegram để tiếp tục.", {
       status: 0,
       code: "telegram_init_data_missing",
       errorInfo: {
         public_code: "telegram_init_data_missing",
-        message_vi: "Vui lòng mở trong Telegram Mini App để tiếp tục.",
+        message_vi: "Mở ứng dụng trong Telegram để tiếp tục.",
         retryable: false,
       },
     });
@@ -286,7 +286,7 @@ export async function fetchFromAPI<T = unknown>(
   } catch (error) {
     const errorName = error && typeof error === "object" ? (error as { name?: string }).name : "";
     if (errorName === "AbortError") {
-      throw new BackendAPIError("Kết nối backend quá thời gian chờ. Vui lòng thử lại.", {
+      throw new BackendAPIError("Kết nối tới hệ thống quá thời gian chờ. Thử lại sau ít phút.", {
         status: 0,
         code: "request_timeout",
       });
@@ -894,7 +894,7 @@ export async function pollMt5AccountLoginSlot(
     });
   }
   throw new BackendAPIError(
-    "Đăng nhập MT5 quá lâu. Kiểm tra runner Windows đang chạy và thử lại, hoặc xem trạng thái trong panel điều khiển.",
+    "Đăng nhập MT5 mất nhiều thời gian hơn bình thường. Đợi ít phút rồi thử lại.",
     { status: 408, code: "login_slot_poll_timeout" }
   );
 }

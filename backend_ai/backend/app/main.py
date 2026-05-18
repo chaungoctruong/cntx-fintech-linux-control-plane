@@ -54,6 +54,8 @@ from .ai.deferred_queue import start_deferred_ai_queue, stop_deferred_ai_queue
 # Core / services
 from .settings import settings
 from .services.control_plane_service import reset_control_plane_service
+from .services.bot_token_license import BotTokenLicenseService
+from .services.bot_tokens.expiry_reconciler import BotTokenExpiryReconciler
 from .services.store_service import close_process_store, get_process_store
 from .services.watchdog import system_watchdog_loop, _refresh_system_maintenance_state
 from .repositories.control_plane_repository import ControlPlaneRepository
@@ -139,7 +141,7 @@ def _startup_singleton_enabled() -> bool:
 
 
 def _startup_singleton_key_prefix() -> str:
-    return str(getattr(settings, "STARTUP_SINGLETON_KEY_PREFIX", "spider:backend:startup") or "spider:backend:startup").strip()
+    return str(getattr(settings, "STARTUP_SINGLETON_KEY_PREFIX", "cntxlab:backend:startup") or "cntxlab:backend:startup").strip()
 
 
 def _startup_singleton_lock_ttl_sec() -> int:
@@ -258,8 +260,8 @@ def _background_singleton_enabled() -> bool:
 
 def _background_singleton_key() -> str:
     return str(
-        getattr(settings, "BACKGROUND_SINGLETON_KEY", "spider:backend:background-owner")
-        or "spider:backend:background-owner"
+        getattr(settings, "BACKGROUND_SINGLETON_KEY", "cntxlab:backend:background-owner")
+        or "cntxlab:backend:background-owner"
     ).strip()
 
 
@@ -554,6 +556,8 @@ async def lifespan(app: FastAPI):
     runner_event_consumer_stop: Optional[asyncio.Event] = None
     command_delivery_reconciler_task: Optional[asyncio.Task] = None
     command_delivery_reconciler_stop: Optional[asyncio.Event] = None
+    bot_token_expiry_reconciler_task: Optional[asyncio.Task] = None
+    bot_token_expiry_reconciler_stop: Optional[asyncio.Event] = None
     circuit_breaker_scheduler_task: Optional[asyncio.Task] = None
     circuit_breaker_scheduler_stop: Optional[asyncio.Event] = None
     ai_care_started = False
@@ -566,6 +570,7 @@ async def lifespan(app: FastAPI):
     control_plane_reconciler_service: Optional[ControlPlaneReconcilerService] = None
     circuit_breaker_scheduler_service: Optional[CircuitBreakerSchedulerService] = None
     command_delivery_reconciler_service: Optional[CommandDeliveryReconcilerService] = None
+    bot_token_expiry_reconciler_service: Optional[BotTokenExpiryReconciler] = None
 
     _set_startup_state(app, "booting")
     _set_background_singleton_state(app, "starting" if background_singleton_enabled else "disabled")
@@ -579,6 +584,8 @@ async def lifespan(app: FastAPI):
         nonlocal runner_event_consumer_stop
         nonlocal command_delivery_reconciler_task
         nonlocal command_delivery_reconciler_stop
+        nonlocal bot_token_expiry_reconciler_task
+        nonlocal bot_token_expiry_reconciler_stop
         nonlocal circuit_breaker_scheduler_task
         nonlocal circuit_breaker_scheduler_stop
         nonlocal ai_care_started
@@ -586,6 +593,7 @@ async def lifespan(app: FastAPI):
         nonlocal control_plane_reconciler_service
         nonlocal circuit_breaker_scheduler_service
         nonlocal command_delivery_reconciler_service
+        nonlocal bot_token_expiry_reconciler_service
 
         if control_plane_reconciler_task is None or control_plane_reconciler_task.done():
             if control_plane_reconciler_service is None:
@@ -619,6 +627,18 @@ async def lifespan(app: FastAPI):
             command_delivery_reconciler_task = asyncio.create_task(
                 command_delivery_reconciler_service.run_forever(command_delivery_reconciler_stop),
                 name="command_delivery_reconciler",
+            )
+
+        if bool(getattr(settings, "BOT_TOKEN_EXPIRY_RECONCILER_ENABLED", True)) and (
+            bot_token_expiry_reconciler_task is None or bot_token_expiry_reconciler_task.done()
+        ):
+            if bot_token_expiry_reconciler_service is None:
+                bot_token_expiry_reconciler_service = BotTokenExpiryReconciler()
+                app.state.bot_token_expiry_reconciler = bot_token_expiry_reconciler_service
+            bot_token_expiry_reconciler_stop = asyncio.Event()
+            bot_token_expiry_reconciler_task = asyncio.create_task(
+                bot_token_expiry_reconciler_service.run_forever(bot_token_expiry_reconciler_stop),
+                name="bot_token_expiry_reconciler",
             )
 
         if bool(getattr(settings, "CONTROL_PLANE_EVENT_CONSUMER_ENABLED", True)) and (
@@ -660,6 +680,8 @@ async def lifespan(app: FastAPI):
         nonlocal runner_event_consumer_stop
         nonlocal command_delivery_reconciler_task
         nonlocal command_delivery_reconciler_stop
+        nonlocal bot_token_expiry_reconciler_task
+        nonlocal bot_token_expiry_reconciler_stop
         nonlocal circuit_breaker_scheduler_task
         nonlocal circuit_breaker_scheduler_stop
         nonlocal ai_care_started
@@ -685,6 +707,12 @@ async def lifespan(app: FastAPI):
         await _safe_cancel_task(command_delivery_reconciler_task, "command_delivery_reconciler")
         command_delivery_reconciler_task = None
         command_delivery_reconciler_stop = None
+
+        if bot_token_expiry_reconciler_stop is not None:
+            bot_token_expiry_reconciler_stop.set()
+        await _safe_cancel_task(bot_token_expiry_reconciler_task, "bot_token_expiry_reconciler")
+        bot_token_expiry_reconciler_task = None
+        bot_token_expiry_reconciler_stop = None
 
         if runner_event_consumer_stop is not None:
             runner_event_consumer_stop.set()
@@ -769,6 +797,9 @@ async def lifespan(app: FastAPI):
         store = get_process_store()
         app.state.store = store
         store.init()
+        if bool(getattr(settings, "BOT_TOKEN_SCHEMA_INIT_ENABLED", True)):
+            BotTokenLicenseService(store).ensure_schema()
+            log.info("Bot-token license schema initialized.")
         app.state.control_plane_metrics = ControlPlaneMetricsService(ControlPlaneRepository(store))
         log.info("Database initialized successfully!")
 
@@ -886,7 +917,7 @@ async def lifespan(app: FastAPI):
 
 # Khởi tạo App với lifespan
 app = FastAPI(
-    title="Trading Automation SaaS Backend",
+    title="CNTx Lab Backend",
     version=APP_VERSION,
     lifespan=lifespan,
 )
@@ -1093,8 +1124,10 @@ app.include_router(public_status_v2_router, prefix="/api/v2")
 app.include_router(streams_v2_router, prefix="/api/v2")
 app.include_router(admin_v2_router, prefix="/api/v2")
 app.include_router(tradingview_webhook_v2_router, prefix="/api/v2")
+from .api.v2.token_bot_internal import router as token_bot_internal_v2_router  # noqa: E402
 from .partner_users.routes import router as partner_users_v2_router  # noqa: E402
 from .partner_users.ui import router as partner_users_ui_router  # noqa: E402
+app.include_router(token_bot_internal_v2_router, prefix="/api/v2")
 app.include_router(partner_users_v2_router, prefix="/api/v2")
 app.include_router(partner_users_ui_router, prefix="/api/v2")
 

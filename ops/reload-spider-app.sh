@@ -6,11 +6,12 @@ cd "$ROOT_DIR"
 
 ENV_PATH="${ENV_PATH:-.env}"
 RUNNER_ID="${1:-${RUNNER_ID:-runner-win-test-01}}"
+BACKEND_SERVICE="${BACKEND_SERVICE:-cntx-lab}"
 READY_URL="${READY_URL:-http://127.0.0.1:8001/ready}"
 BOOTSTRAP_URL="${BOOTSTRAP_URL:-http://127.0.0.1:8001/api/v2/runner/bootstrap?runner_id=${RUNNER_ID}}"
 
-log() { printf '[reload-spider-app] %s\n' "$*"; }
-die() { printf '[reload-spider-app] ERROR: %s\n' "$*" >&2; exit 1; }
+log() { printf '[reload-cntx-lab] %s\n' "$*"; }
+die() { printf '[reload-cntx-lab] ERROR: %s\n' "$*" >&2; exit 1; }
 
 [[ -f "$ENV_PATH" ]] || die "$ENV_PATH not found"
 command -v docker >/dev/null 2>&1 || die "docker is not installed"
@@ -20,11 +21,11 @@ command -v python3 >/dev/null 2>&1 || die "python3 is not installed"
 
 export ENV_FILE="$ENV_PATH"
 
-log "building spider-app image from current source"
-docker compose --env-file "$ENV_PATH" build spider-app
+log "building $BACKEND_SERVICE image from current source"
+docker compose --env-file "$ENV_PATH" build "$BACKEND_SERVICE"
 
-log "recreating spider-app only; db/redis/hubbot are left untouched"
-docker compose --env-file "$ENV_PATH" up -d --no-deps --force-recreate spider-app
+log "recreating $BACKEND_SERVICE only; db/redis/hubbot are left untouched"
+docker compose --env-file "$ENV_PATH" up -d --no-deps --force-recreate "$BACKEND_SERVICE"
 
 log "waiting for backend readiness: $READY_URL"
 for _ in $(seq 1 60); do
@@ -67,6 +68,6 @@ print("bootstrap OK")
 PY
 
 log "docker status"
-docker compose --env-file "$ENV_PATH" ps spider-app
+docker compose --env-file "$ENV_PATH" ps "$BACKEND_SERVICE"
 
 log "DONE"

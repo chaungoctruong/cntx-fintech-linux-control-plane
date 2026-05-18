@@ -1,4 +1,4 @@
-# GsAlgo VIP
+# Gs Algo
 
 `gsalgovip` là một **package catalog Linux** do control-plane Spider AI
 MT5 SaaS bảo trì. Đây là bản clone đã được vệ sinh lại từ package

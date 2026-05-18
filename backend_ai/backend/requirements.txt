@@ -1,4 +1,4 @@
-# Default control-plane runtime for spider-app (see backend_ai/Dockerfile: pip install -r requirements.txt).
+# Default control-plane runtime for cntx-lab (see backend_ai/Dockerfile: pip install -r requirements.txt).
 # Python: 3.11 (image python:3.11-slim).
 # Optional / not installed by default Docker build:
 #   requirements-ai-vector.txt  — vector semantic retrieval (enable only if AI_PLATFORM_KNOWLEDGE_VECTOR_ENABLED)

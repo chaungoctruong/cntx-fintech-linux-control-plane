@@ -22,9 +22,11 @@ class Settings(BaseSettings):
     source_bot_dir: Path = Path("../bot-trading")
     encrypted_bot_dir: Path = Path("./var/encrypted")
     database_url: str = "sqlite:///./var/token_bot.db"
+    auto_encrypt_on_startup: bool = True
 
     token_default_ttl_sec: int = 86400
     enable_debug_decrypt: bool = False
+    enable_legacy_jwt_tokens: bool = False
 
     telegram_bot_token: str | None = None
     tg_admin_user_ids: str = ""

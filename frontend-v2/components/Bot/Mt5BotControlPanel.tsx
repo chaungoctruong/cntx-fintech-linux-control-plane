@@ -333,10 +333,10 @@ export default function Mt5BotControlPanel({
         ) : filteredAccounts.length === 0 ? (
           <div className="rounded-2xl border border-dashed border-white/10 bg-transparent px-4 py-5">
             <p className="text-sm font-semibold text-white">
-              Chưa có account nào
+              Chưa có tài khoản MT5
             </p>
             <p className="mt-2 text-sm leading-6 text-cyber-muted">
-              Hãy kết nối account ở form bên trên trước, rồi panel bật/tắt bot sẽ tự sẵn sàng.
+              Kết nối tài khoản ở form bên trên, bảng điều khiển bot sẽ tự sẵn sàng.
             </p>
           </div>
         ) : (
@@ -345,7 +345,7 @@ export default function Mt5BotControlPanel({
               <div className="space-y-2">
                 <div className="flex items-center justify-between gap-3">
                   <span className="text-xs font-semibold uppercase tracking-[0.18em] text-cyber-muted">
-                    Chọn account
+                    Chọn tài khoản
                   </span>
                   <button
                     type="button"
@@ -362,7 +362,7 @@ export default function Mt5BotControlPanel({
                     ) : (
                       <Trash2 className="h-4 w-4" strokeWidth={1.9} />
                     )}
-                    <span>{deleteConfirmationActive ? "Xác nhận xóa" : "Xóa account"}</span>
+                    <span>{deleteConfirmationActive ? "Xác nhận xóa" : "Xóa tài khoản"}</span>
                   </button>
                 </div>
                 <select
@@ -402,8 +402,8 @@ export default function Mt5BotControlPanel({
               {botCatalogError ? (
                 <div className="rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-xs leading-5 text-amber-100">
                   {bots.length > 0
-                    ? "Chưa tải được bản mới của danh sách bot. Panel đang giữ danh sách đã tải để không làm mất trạng thái token."
-                    : "Chưa tải được danh sách bot. Token và nút bật bot vẫn được khóa cho tới khi chọn được bot."}
+                    ? "Chưa tải được danh sách bot mới. Bảng điều khiển vẫn giữ dữ liệu gần nhất để không gián đoạn thao tác."
+                    : "Chưa tải được danh sách bot. Nhập mã và bật bot sẽ mở lại khi danh sách sẵn sàng."}
                 </div>
               ) : null}
 
@@ -411,12 +411,12 @@ export default function Mt5BotControlPanel({
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-100">
-                      Token mở quyền bot
+                      Mã kích hoạt bot
                     </p>
                     <p className="mt-1 text-xs leading-5 text-cyber-muted">
                       {mt5FullAccess
-                        ? "User này đã được mở quyền Mini App, không cần token."
-                        : "Chọn bot xong nhập token để mở quyền cho account này."}
+                        ? "Tài khoản Telegram này đã được mở quyền, không cần nhập mã."
+                        : "Nhập mã kích hoạt để mở quyền bot cho tài khoản này."}
                     </p>
                   </div>
                   <span
@@ -426,13 +426,13 @@ export default function Mt5BotControlPanel({
                         : "border-amber-300/25 bg-amber-300/10 text-amber-100"
                     }`}
                   >
-                    {botAccessReady ? "Đã mở" : "Cần token"}
+                    {botAccessReady ? "Đã mở" : "Cần mã"}
                   </span>
                 </div>
 
                 {mt5FullAccess ? (
                   <p className="mt-3 rounded-2xl border border-emerald-300/20 bg-emerald-300/10 px-3 py-2 text-xs leading-5 text-emerald-100">
-                    Tài khoản Telegram này có quyền dùng bot không cần token.
+                    Tài khoản Telegram này có quyền dùng bot không cần mã kích hoạt.
                   </p>
                 ) : activeBotEntitlement ? (
                   <p className="mt-3 rounded-2xl border border-emerald-300/20 bg-emerald-300/10 px-3 py-2 text-xs leading-5 text-emerald-100">
@@ -444,7 +444,7 @@ export default function Mt5BotControlPanel({
                       className={selectClassName}
                       value={botTokenInput}
                       onChange={(event) => setBotTokenInput(event.target.value)}
-                      placeholder="Dán token bạn nhận được"
+                      placeholder="Dán mã kích hoạt bạn nhận được"
                       autoComplete="off"
                       disabled={controlsLocked || !selectedAccount || !isMt5AccountReady(selectedAccount) || !selectedBot}
                     />
@@ -463,7 +463,7 @@ export default function Mt5BotControlPanel({
                       {unlockingBotToken ? (
                         <>
                           <Loader2 className="h-4 w-4 animate-spin" strokeWidth={1.9} />
-                          Đang kiểm tra token
+                          Đang kiểm tra mã
                         </>
                       ) : (
                         "Mở quyền bot"
@@ -480,10 +480,10 @@ export default function Mt5BotControlPanel({
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 text-cyan-100">
                       <ServerCog className="h-4 w-4 shrink-0" strokeWidth={1.9} />
-                      <p className="text-[11px] font-semibold uppercase tracking-[0.16em]">Account</p>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.16em]">Tài khoản</p>
                     </div>
                     <p className="mt-2 truncate text-sm font-semibold text-white">
-                      {selectedAccount ? selectedAccount.login : "Chưa chọn account"}
+                      {selectedAccount ? selectedAccount.login : "Chưa chọn tài khoản"}
                     </p>
                     <p className="mt-1 truncate text-xs leading-5 text-cyber-muted">
                       {selectedAccount?.server || selectedBroker}
@@ -625,9 +625,9 @@ export default function Mt5BotControlPanel({
               const progressText = (startingBot || stoppingBot || isTransitionalDeploymentStatus(latestDeployment?.status))
                 ? humanizeDeploymentProgress(latestDeployment ?? selectedDeployment) ??
                   (startingBot
-                    ? "Đang bật bot. vui lòng đợi 15-25 giây..."
+                    ? "Đang bật bot. Đợi 15-25 giây..."
                     : stoppingBot
-                      ? "Đang tắt bot, vui lòng đợi vài giây..."
+                      ? "Đang tắt bot, đợi vài giây..."
                       : null)
                 : null;
               if (progressText) {

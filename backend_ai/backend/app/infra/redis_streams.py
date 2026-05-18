@@ -21,6 +21,9 @@ end
 local stream_id = redis.call(
   'XADD',
   KEYS[1],
+  'MAXLEN',
+  '~',
+  tonumber(ARGV[15]),
   '*',
   'command_id', ARGV[1],
   'command_type', ARGV[2],
@@ -46,6 +49,14 @@ def _event_stream_maxlen() -> int:
         value = int(getattr(settings, "EVENT_STREAM_MAXLEN", 20000) or 20000)
     except (TypeError, ValueError):
         return 20000
+    return max(1, value)
+
+
+def _command_stream_maxlen() -> int:
+    try:
+        value = int(getattr(settings, "COMMAND_STREAM_MAXLEN", 50000) or 50000)
+    except (TypeError, ValueError):
+        return 50000
     return max(1, value)
 
 
@@ -99,6 +110,7 @@ class RedisStreamPublisher:
             runner_queue_key,
             "1" if runner_id else "0",
             str(_command_publish_dedupe_ttl_sec()),
+            str(_command_stream_maxlen()),
         )
         if isinstance(result, (list, tuple)) and result:
             stream_id = str(result[0] or "")
@@ -138,6 +150,7 @@ class RedisStreamPublisher:
         if redis is None:
             raise RuntimeError("redis_unavailable")
         ttl = str(_command_publish_dedupe_ttl_sec())
+        stream_maxlen = str(_command_stream_maxlen())
 
         pipe = redis.pipeline(transaction=False)
         prepared: list[bool] = []  # parallel list — True if eval queued
@@ -176,6 +189,7 @@ class RedisStreamPublisher:
                     runner_queue_key,
                     "1" if runner_id else "0",
                     ttl,
+                    stream_maxlen,
                 )
                 prepared.append(True)
             except Exception:

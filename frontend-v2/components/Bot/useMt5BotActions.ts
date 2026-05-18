@@ -248,7 +248,7 @@ export function useMt5BotActions({
 
     const token = params.botTokenInput.trim();
     if (!token) {
-      onNotice("error", "Vui lòng nhập mã kích hoạt cho bot đã chọn.");
+      onNotice("error", "Nhập mã kích hoạt cho bot đã chọn.");
       return;
     }
 
@@ -290,33 +290,33 @@ export function useMt5BotActions({
       return;
     }
     if (params.selectedAccountHasActiveBot) {
-      onNotice("info", "Tài khoản đang có bot chạy. Hãy tắt bot hiện tại trước.");
+      onNotice("info", "Tài khoản đang có bot chạy. Tắt bot hiện tại trước.");
       return;
     }
     if (params.telegramUserHasOtherActiveBot) {
       onNotice(
         "info",
-        "Mỗi tài khoản Telegram chỉ chạy một bot tại một thời điểm. Hãy tắt bot hiện tại trước khi bật bot khác."
+        "Mỗi tài khoản Telegram chỉ chạy một bot tại một thời điểm. Tắt bot hiện tại trước khi bật bot khác."
       );
       return;
     }
     if (!params.selectedBot) {
-      onNotice("error", "Danh sách bot hiện không có lựa chọn khả dụng. Hãy làm mới rồi thử lại.");
+      onNotice("error", "Danh sách bot hiện không có lựa chọn khả dụng. Làm mới rồi thử lại.");
       return;
     }
     if (!params.botAccessReady) {
-      onNotice("error", "Vui lòng nhập mã kích hoạt cho bot đã chọn trước khi bật bot.");
+      onNotice("error", "Nhập mã kích hoạt cho bot đã chọn trước khi bật bot.");
       return;
     }
     const lotSize = parsePositiveDecimalInput(params.lotSizeInput);
     if (lotSize === null) {
-      onNotice("error", "Vui lòng nhập khối lượng (Lot) lớn hơn 0 trước khi bật bot.");
+      onNotice("error", "Nhập khối lượng (Lot) lớn hơn 0 trước khi bật bot.");
       return;
     }
 
     setStartingBot(true);
     try {
-      onNotice("info", "Đã nhận yêu cầu bật bot. Thường mất khoảng 15-25 giây để mở MT5 và chạy bot.");
+      onNotice("info", "Đã nhận yêu cầu bật bot. Thường mất 15-25 giây để mở MT5 và chạy bot.");
       const baselineDeploymentId = params.latestDeployment?.id ?? null;
       const startResponse = await startMt5Deployment({
         account_id: params.selectedAccount.id,
@@ -341,7 +341,7 @@ export function useMt5BotActions({
         return;
       }
       if (pollResult.settled && !pollResult.success) {
-        onNotice("error", "Bot chưa khởi động ổn định. Vui lòng thử lại sau ít phút.");
+        onNotice("error", "Bot chưa khởi động ổn định. Thử lại sau ít phút.");
         return;
       }
       onNotice("info", "Đã nhận yêu cầu bật bot. Mini App sẽ tự cập nhật khi bot chạy.");
@@ -388,7 +388,7 @@ export function useMt5BotActions({
       return;
     }
     if (params.selectedAccountHasActiveBot) {
-      onNotice("info", "Tài khoản đang có bot chạy. Hãy tắt bot trước khi gỡ tài khoản.");
+      onNotice("info", "Tài khoản đang có bot chạy. Tắt bot trước khi gỡ tài khoản.");
       return;
     }
     if (deleteConfirmAccountId !== params.selectedAccount.id) {

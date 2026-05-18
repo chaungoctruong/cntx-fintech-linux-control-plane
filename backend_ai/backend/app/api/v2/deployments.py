@@ -30,7 +30,14 @@ def bot_token_license_dep(request: Request) -> BotTokenLicenseService:
 def _translate_bot_token_error(exc: Exception) -> HTTPException:
     detail = str(exc) or exc.__class__.__name__
     status_code = 403
-    if detail in {"bot_token_not_found", "bot_token_already_used", "bot_token_expired", "bot_token_revoked"}:
+    if detail in {
+        "bot_token_not_found",
+        "bot_token_already_used",
+        "bot_token_expired",
+        "bot_token_revoked",
+        "bot_token_bot_package_not_found",
+        "bot_token_duration_invalid",
+    }:
         status_code = 400
     return HTTPException(status_code=status_code, detail=detail)
 
@@ -114,8 +121,29 @@ async def start_deployment(
                 entitlement_id=entitlement_id,
                 deployment_id=int(deployment_id),
             )
-        except BotTokenLicenseError:
-            pass
+        except BotTokenLicenseError as exc:
+            log.error(
+                "deployment_license_bind_failed telegram_id=%s account_id=%s deployment_id=%s entitlement_id=%s detail=%s",
+                user.get("telegram_id"),
+                payload.account_id,
+                deployment_id,
+                entitlement_id,
+                str(exc),
+            )
+            try:
+                await service.stop_deployment(
+                    telegram_id=str(user["telegram_id"]),
+                    username=user.get("username"),
+                    deployment_id=int(deployment_id),
+                    reason="bot_token_bind_failed",
+                )
+            except Exception as stop_exc:
+                log.warning(
+                    "deployment_license_bind_cleanup_failed deployment_id=%s detail=%s",
+                    deployment_id,
+                    str(stop_exc)[:180],
+                )
+            raise _translate_bot_token_error(exc) from exc
     scheduler = result.get("scheduler") or {}
     return {
         "deployment_id": deployment.get("id"),

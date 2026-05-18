@@ -1,4 +1,5 @@
 import base64
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -10,6 +11,8 @@ from .crypto import BotCipher
 from .db import ensure_schema_patches, make_engine, make_session_factory
 from .models import Base
 from .token_service import TokenService
+
+log = logging.getLogger(__name__)
 
 
 def build_app() -> FastAPI:
@@ -24,6 +27,12 @@ def build_app() -> FastAPI:
 
         cipher = BotCipher(base64.b64decode(settings.master_key_b64))
         registry = BotRegistry(settings.source_bot_dir, settings.encrypted_bot_dir, cipher)
+        if settings.auto_encrypt_on_startup:
+            try:
+                encrypted = registry.encrypt_all()
+                log.info("auto_encrypt_on_startup completed packages=%d", len(encrypted))
+            except Exception as exc:
+                log.warning("auto_encrypt_on_startup failed: %s", exc)
         token_service = TokenService(settings.jwt_secret)
 
         app.state.settings = settings

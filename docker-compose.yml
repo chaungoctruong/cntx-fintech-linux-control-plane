@@ -32,7 +32,7 @@ services:
       - db
       - redis
 
-  spider-app:
+  cntx-lab:
     build:
       context: .
       dockerfile: backend_ai/Dockerfile
@@ -51,6 +51,11 @@ services:
     volumes:
       - ./frontend-v2:/app/frontend-v2:ro
       - ./logs:/app/logs
+    networks:
+      default:
+        aliases:
+          # Backward-compatible alias while old scripts/env files are phased out.
+          - spider-app
     depends_on:
       db:
         condition: service_healthy
@@ -90,9 +95,16 @@ services:
       - no-new-privileges:true
     environment:
       REDIS_PASSWORD: ${LOCAL_REDIS_PASSWORD:?set LOCAL_REDIS_PASSWORD in your env file}
+      REDIS_MAXMEMORY: ${REDIS_MAXMEMORY:-1024mb}
+      REDIS_MAXMEMORY_POLICY: ${REDIS_MAXMEMORY_POLICY:-noeviction}
     # Product-style single-node Redis: auth + AOF persistence. Full production
     # should still move Redis to managed/HA storage before real-money traffic.
-    command: sh -c 'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"'
+    command: >
+      sh -c 'exec redis-server
+      --appendonly yes
+      --requirepass "$$REDIS_PASSWORD"
+      --maxmemory "$$REDIS_MAXMEMORY"
+      --maxmemory-policy "$$REDIS_MAXMEMORY_POLICY"'
     ports:
       # Windows runner reaches this through SSH tunnel:
       # ssh -p 24700 -N -L 6380:127.0.0.1:6380 root@<backend-host>
@@ -122,7 +134,7 @@ services:
       ENCRYPTED_BOT_DIR: /app/var/encrypted
       DATABASE_URL: sqlite:////app/var/token_bot.db
       REDIS_URL: redis://:${LOCAL_REDIS_PASSWORD:?set LOCAL_REDIS_PASSWORD}@redis:6379/0
-      BACKEND_URL: http://spider-app:8001
+      BACKEND_URL: http://cntx-lab:8001
     command: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8090"]
     ports:
       - "127.0.0.1:8090:8090"
@@ -132,7 +144,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      spider-app:
+      cntx-lab:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3).read()\""]
@@ -155,7 +167,7 @@ services:
       ENCRYPTED_BOT_DIR: /app/var/encrypted
       DATABASE_URL: sqlite:////app/var/token_bot.db
       REDIS_URL: redis://:${LOCAL_REDIS_PASSWORD:?set LOCAL_REDIS_PASSWORD}@redis:6379/0
-      BACKEND_URL: http://spider-app:8001
+      BACKEND_URL: http://cntx-lab:8001
     command: ["python", "scripts/run_tg_bot.py"]
     volumes:
       - ./token-bot/var:/app/var
@@ -163,7 +175,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-      spider-app:
+      cntx-lab:
         condition: service_healthy
 
 volumes:

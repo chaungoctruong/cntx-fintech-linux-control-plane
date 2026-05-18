@@ -7,7 +7,7 @@ const bool maxTPLastHour = false
 
 var initRun = true
 
-indicator("severtest", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = maxDistanceToLastBar + 100)
+indicator("Gsalarm", overlay = true, max_boxes_count = 500, max_labels_count = 500, max_lines_count = 500, max_bars_back = maxDistanceToLastBar + 100)
 
 //
 
@@ -74,17 +74,13 @@ i_R_tp = input.float(10, "R TP:", group = "Quản lý lệnh:")
 use_SL = i_R_sl
 use_TP = i_R_tp
 
-alert_group = "⏰⏰⏰__________CÀI ĐẶT BÁO ĐỘNG___________⏰⏰⏰"
-i_alert_1 = input.bool(true, "1 nến báo 1 lần duy nhất khi NẾN ĐÓNG thõa điều kiện", group = alert_group)
-i_alert_2 = input.bool(false, "1 nến báo 1 lần duy nhất ở thời điểm sớm nhất mà nến thõa điều kiện dù NẾN CHƯA ĐÓNG", group = alert_group)
-i_alert_3 = input.bool(false, "Cảnh báo khi >= 2 lần thua liên tiếp", group = alert_group)
-i_alert_4 = input.bool(false, "Cảnh báo Chuẩn bị buy/sell", group = alert_group)
-i_alert_5 = input.bool(false, "DCA: 1 nến báo 1 lần duy nhất khi NẾN ĐÓNG thõa điều kiện", group = alert_group)
-i_alert_6 = input.bool(false, "DCA:1 nến báo 1 lần duy nhất ở thời điểm sớm nhất mà nến thõa điều kiện dù NẾN CHƯA ĐÓNG", group = alert_group)
-i_alert_7 = input.bool(false, "Cảnh báo TP/SL dạng text (không dùng cho webhook backend)", group = alert_group)
-backendSecret = input.string("", "Backend webhook secret", display = display.none, group = alert_group)
-backendSignalId = input.string("gsalgovip-xauusd", "Backend signal id", display = display.none, group = alert_group)
-backendSymbol = input.string("XAUUSD", "Backend symbol", display = display.none, group = alert_group)
+backend_group = "🔗 BACKEND WEBHOOK"
+i_backend_alerts = input.bool(false, "Gửi JSON về backend", group = backend_group)
+i_backend_secret = input.string("", "Backend secret", group = backend_group)
+i_backend_signal_id = input.string("Gsalarm-xauusd", "Signal ID", group = backend_group)
+i_backend_bot_code = input.string("gsalgovip", "Bot code", group = backend_group)
+i_backend_symbol = input.string("XAUUSD", "Symbol gửi backend", group = backend_group)
+i_alert_5 = input.bool(false, "Gửi thêm DCA", group = backend_group)
 
 //
 
@@ -230,6 +226,12 @@ getPosition (positionText) =>
         position.bottom_center
     else if positionText == "Middle Center"
         position.middle_center
+
+backendJson(string _action, float _sl, float _tp, string _role, float _dcaPrice) =>
+    rolePart = str.length(_role) > 0 ? ",\"signal_role\":\"" + _role + "\"" : ""
+    dcaPart = not na(_dcaPrice) ? ",\"dca_price\":" + str.tostring(_dcaPrice, format.mintick) : ""
+    alertId = i_backend_signal_id + "-" + syminfo.ticker + "-" + timeframe.period + "-" + str.tostring(time) + "-" + _action + (str.length(_role) > 0 ? "-" + _role : "")
+    "{\"secret\":\"" + i_backend_secret + "\",\"alert_id\":\"" + alertId + "\",\"signal_id\":\"" + i_backend_signal_id + "\",\"bot_code\":\"" + i_backend_bot_code + "\",\"action\":\"" + _action + "\",\"symbol\":\"" + i_backend_symbol + "\",\"tv_symbol\":\"" + syminfo.tickerid + "\",\"timeframe\":\"" + timeframe.period + "\",\"sl\":" + str.tostring(_sl, format.mintick) + ",\"tp\":" + str.tostring(_tp, format.mintick) + rolePart + dcaPart + "}"
 
 tfInMin = timeframe.in_seconds() / 60
 
@@ -1137,57 +1139,24 @@ if array.size(trades) > 0
 //=============================================================================
 // alert
 
-buyAlertId = backendSignalId + ":BUY:" + syminfo.tickerid + ":" + timeframe.period + ":" + str.tostring(time)
-sellAlertId = backendSignalId + ":SELL:" + syminfo.tickerid + ":" + timeframe.period + ":" + str.tostring(time)
-backendSl = str.tostring(use_SL)
-backendTp = str.tostring(use_TP)
-backendAuthJson = '"secret":"' + backendSecret + '",'
-buyJson = '{' + backendAuthJson + '"alert_id":"' + buyAlertId + '","signal_id":"' + backendSignalId + '","action":"BUY","symbol":"' + backendSymbol + '","bot_code":"gsalgovip","tv_symbol":"' + syminfo.tickerid + '","timeframe":"' + timeframe.period + '","sl":' + backendSl + ',"tp":' + backendTp + '}'
-sellJson = '{' + backendAuthJson + '"alert_id":"' + sellAlertId + '","signal_id":"' + backendSignalId + '","action":"SELL","symbol":"' + backendSymbol + '","bot_code":"gsalgovip","tv_symbol":"' + syminfo.tickerid + '","timeframe":"' + timeframe.period + '","sl":' + backendSl + ',"tp":' + backendTp + '}'
-dcaBuyAlertId = backendSignalId + ":DCA_BUY:" + syminfo.tickerid + ":" + timeframe.period + ":" + str.tostring(time)
-dcaSellAlertId = backendSignalId + ":DCA_SELL:" + syminfo.tickerid + ":" + timeframe.period + ":" + str.tostring(time)
-dcaBuyJson = '{' + backendAuthJson + '"alert_id":"' + dcaBuyAlertId + '","signal_id":"' + backendSignalId + '","action":"BUY","symbol":"' + backendSymbol + '","bot_code":"gsalgovip","tv_symbol":"' + syminfo.tickerid + '","timeframe":"' + timeframe.period + '","sl":' + backendSl + ',"tp":' + backendTp + ',"signal_role":"DCA","dca_price":"' + str.tostring(dca_price, format.mintick) + '"}'
-dcaSellJson = '{' + backendAuthJson + '"alert_id":"' + dcaSellAlertId + '","signal_id":"' + backendSignalId + '","action":"SELL","symbol":"' + backendSymbol + '","bot_code":"gsalgovip","tv_symbol":"' + syminfo.tickerid + '","timeframe":"' + timeframe.period + '","sl":' + backendSl + ',"tp":' + backendTp + ',"signal_role":"DCA","dca_price":"' + str.tostring(dca_price, format.mintick) + '"}'
+if sigLong and isMonToFri
+    alert(i_backend_alerts ? backendJson("BUY", lastTS.entryPrice - use_SL, lastTS.entryPrice + use_TP, "", float(na)) : "🟢 Buy - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ EN: " + str.tostring(lastTS.entryPrice, format.mintick) + "\n" + "❌ SL:" + str.tostring(lastTS.entryPrice - use_SL, format.mintick) + "\n" + "✅ TP:" + str.tostring(lastTS.entryPrice + use_TP, format.mintick), alert.freq_once_per_bar_close)
+else if sigShort and isMonToFri
+    alert(i_backend_alerts ? backendJson("SELL", lastTS.entryPrice + use_SL, lastTS.entryPrice - use_TP, "", float(na)) : "🔴 Sell - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ EN: " + str.tostring(lastTS.entryPrice, format.mintick) + "\n" + "❌ SL:" + str.tostring(lastTS.entryPrice + use_SL, format.mintick) + "\n" + "✅ TP:" + str.tostring(lastTS.entryPrice - use_TP, format.mintick), alert.freq_once_per_bar_close)
 
-if i_alert_4 and chuan_bi_sell_loc and isMonToFri
-    alert("🔔 Chuẩn bị Sell" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar_close)
-else if i_alert_4 and chuan_bi_buy_loc and isMonToFri
-    alert("🔔 Chuẩn bị Buy" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar_close)
-
-if sigLong and isMonToFri and i_alert_1
-    alert(buyJson, alert.freq_once_per_bar_close)
-else if sigShort and isMonToFri and i_alert_1
-    alert(sellJson, alert.freq_once_per_bar_close)
-else if sigLong and isMonToFri and i_alert_2
-    alert(buyJson, alert.freq_once_per_bar)
-else if sigShort and isMonToFri and i_alert_2
-    alert(sellJson, alert.freq_once_per_bar)
-
-if (slbuyAlertTick or slsellAlertTick) and n_sl_lientiep >= 2 and  i_alert_3 and isMonToFri 
-    alert("🔔 Đã chạm " + str.tostring(n_sl_lientiep) + " SL", alert.freq_once_per_bar)
-
-if i_alert_7 and n_tp[1] < n_tp[0] and tpbuyAlertTick and isMonToFri
+if not i_backend_alerts and n_tp[1] < n_tp[0] and tpbuyAlertTick and isMonToFri
     alert("🔔 Chạm TP Buy" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
-else if i_alert_7 and n_tp[1] < n_tp[0] and tpsellAlertTick and isMonToFri
+else if not i_backend_alerts and n_tp[1] < n_tp[0] and tpsellAlertTick and isMonToFri
     alert("🔔 Chạm TP Sell" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
-else if i_alert_7 and n_sl[1] < n_sl[0] and slbuyAlertTick and isMonToFri
+else if not i_backend_alerts and n_sl[1] < n_sl[0] and slbuyAlertTick and isMonToFri
     alert("🔔 Chạm SL Buy" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
-else if i_alert_7 and n_sl[1] < n_sl[0] and slsellAlertTick and isMonToFri
+else if not i_backend_alerts and n_sl[1] < n_sl[0] and slsellAlertTick and isMonToFri
     alert("🔔 Chạm SL Sell" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
 
-//if i_alert_5 and not dca_alert[1] and dca_alert and dang_buy and isMonToFri
-//    alert("🔔 DCA Buy - " + str.tostring(dca_price) + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar_close)
-//else if i_alert_5 and not dca_alert[1] and dca_alert and dang_sell and isMonToFri
-//    alert("🔔 DCA Sell - " + str.tostring(dca_price) + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar_close)
-
 if i_alert_5 and not dca_alert[1] and dca_alert and dang_buy and isMonToFri
-    alert(dcaBuyJson, alert.freq_once_per_bar_close)
+    alert(i_backend_alerts ? backendJson("BUY", lastTS.entryPrice - use_SL, lastTS.entryPrice + use_TP, "DCA", dca_price) : "🟢 Buy - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ DCA: " + str.tostring(dca_price, format.mintick) + "\n" + "❌ SL:" + str.tostring(lastTS.entryPrice - use_SL, format.mintick) + "\n" + "✅ TP:" + str.tostring(lastTS.entryPrice + use_TP, format.mintick), alert.freq_once_per_bar_close)
 else if i_alert_5 and not dca_alert[1] and dca_alert and dang_sell and isMonToFri
-    alert(dcaSellJson, alert.freq_once_per_bar_close)
-else if i_alert_6 and not dca_alert[1] and dca_alert and dang_buy and isMonToFri
-    alert(dcaBuyJson, alert.freq_once_per_bar)
-else if i_alert_6 and not dca_alert[1] and dca_alert and dang_sell and isMonToFri
-    alert(dcaSellJson, alert.freq_once_per_bar)
+    alert(i_backend_alerts ? backendJson("SELL", lastTS.entryPrice + use_SL, lastTS.entryPrice - use_TP, "DCA", dca_price) : "🔴 Sell - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ DCA: " + str.tostring(dca_price, format.mintick) + "\n" + "❌ SL:" + str.tostring(lastTS.entryPrice + use_SL, format.mintick) + "\n" + "✅ TP:" + str.tostring(lastTS.entryPrice - use_TP, format.mintick), alert.freq_once_per_bar_close)
 
 
 

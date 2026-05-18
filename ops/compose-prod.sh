@@ -3,8 +3,8 @@
 #
 # Usage:
 #   ops/compose-prod.sh up -d
-#   ops/compose-prod.sh logs -f spider-app
-#   ops/compose-prod.sh restart spider-app
+#   ops/compose-prod.sh logs -f cntx-lab
+#   ops/compose-prod.sh restart cntx-lab
 #
 # Refuses to run if .env is missing — you must populate prod values first.
 set -euo pipefail

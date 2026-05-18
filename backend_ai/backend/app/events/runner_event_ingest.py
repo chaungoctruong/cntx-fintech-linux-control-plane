@@ -320,6 +320,34 @@ class RunnerEventIngestService:
             0.0,
             float(getattr(settings, "RUNNER_HEARTBEAT_WRITE_THROTTLE_SEC", 5.0) or 5.0),
         )
+        self._last_publish_warning_at = 0.0
+
+    async def _publish_event_best_effort(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Publish to Redis stream without failing durable event ingest.
+
+        Runner state is already stored in PostgreSQL before this call. Redis
+        streams power live observers/replay telemetry, so a short Redis blip
+        should not make Windows receive HTTP 503 and mark the runner unhealthy.
+        """
+
+        try:
+            stream_id = await self._publisher.publish_event(payload)
+            return {"published": True, "stream_id": stream_id}
+        except Exception as exc:
+            now = time.monotonic()
+            if now - self._last_publish_warning_at >= 60.0:
+                self._last_publish_warning_at = now
+                _log.warning(
+                    "runner_event.redis_publish_skipped event_type=%s runner=%s error=%s",
+                    payload.get("event_type"),
+                    payload.get("runner_id"),
+                    exc,
+                )
+            return {
+                "published": False,
+                "stream_id": "",
+                "warning": f"redis_publish_skipped:{exc.__class__.__name__}",
+            }
 
     def _fail_start_deployment_after_bootstrap_failure(
         self,
@@ -1321,7 +1349,7 @@ class RunnerEventIngestService:
             payload=event_model.payload,
             trace_id=event_model.trace_id,
         )
-        await self._publisher.publish_event(
+        publish_result = await self._publish_event_best_effort(
             {
                 "event_id": event_model.event_id,
                 "event_type": event_model.event_type.value,
@@ -1336,6 +1364,8 @@ class RunnerEventIngestService:
                 "trace_id": event_model.trace_id or "",
             }
         )
+        if not bool(publish_result.get("published")):
+            event = {**dict(event or {}), "redis_publish_warning": publish_result.get("warning")}
         return event
 
     async def ingest_event(
@@ -2130,7 +2160,7 @@ class RunnerEventIngestService:
             source_stream_id=None,
         )
 
-        await self._publisher.publish_event(
+        publish_result = await self._publish_event_best_effort(
             {
                 "event_id": normalized_event_id,
                 "event_type": event_type_value,
@@ -2145,4 +2175,6 @@ class RunnerEventIngestService:
                 "trace_id": event_model.trace_id or "",
             }
         )
+        if not bool(publish_result.get("published")):
+            event = {**dict(event or {}), "redis_publish_warning": publish_result.get("warning")}
         return event

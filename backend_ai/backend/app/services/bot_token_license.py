@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from app.services.bot_tokens.catalog import BotTradingLicenseCatalog, LicensedBotPackage, normalize_bot_identity
+from app.services.bot_tokens.crypto import (
+    BotTokenCryptoError,
+    generate_raw_token,
+    hash_token,
+    hash_token_candidates,
+)
 from app.store import Store
 
 
@@ -19,14 +25,16 @@ def _utc_now() -> datetime:
 
 
 def _hash_token(raw_token: str) -> str:
-    token = str(raw_token or "").strip()
-    if not token:
-        raise BotTokenLicenseError("bot_token_required")
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+    try:
+        return hash_token(raw_token)
+    except BotTokenCryptoError as exc:
+        raise BotTokenLicenseError(str(exc) or "bot_token_hash_failed") from exc
+    except Exception as exc:
+        raise BotTokenLicenseError(str(exc) or "bot_token_hash_failed") from exc
 
 
 def _norm_identity(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+    return normalize_bot_identity(value)
 
 
 def _as_aware(value: Any) -> Optional[datetime]:
@@ -49,6 +57,29 @@ def _json_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
+def _json_list(value: Any) -> list[Any]:
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return []
+        if isinstance(parsed, list):
+            return parsed
+    return []
+
+
+def _json_int_set(value: Any) -> set[int]:
+    out: set[int] = set()
+    for item in _json_list(value):
+        try:
+            out.add(int(item))
+        except Exception:
+            continue
+    return out
+
+
 def _format_entitlement(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "entitlement_id": str(row.get("entitlement_id") or ""),
@@ -67,11 +98,205 @@ def _format_entitlement(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _iso_dt(value: Any) -> Optional[str]:
+    dt = _as_aware(value)
+    return dt.isoformat() if dt is not None else None
+
+
+def _token_customer_label(row: dict[str, Any]) -> str:
+    note = str(row.get("issued_to_note") or "").strip()
+    if note:
+        return note
+    metadata = _json_dict(row.get("metadata_json"))
+    label = str(metadata.get("customer_label") or "").strip()
+    return label or "Không tên"
+
+
+def _ceil_positive_days(start: Optional[datetime], end: Optional[datetime]) -> int:
+    start_dt = _as_aware(start)
+    end_dt = _as_aware(end)
+    if start_dt is None or end_dt is None or end_dt <= start_dt:
+        return 0
+    seconds = int((end_dt - start_dt).total_seconds())
+    return max(1, (seconds + 86_399) // 86_400)
+
+
+def _billing_period_bounds(scope: str, *, now: datetime) -> tuple[datetime, datetime]:
+    if str(scope or "").strip().lower() == "month":
+        return datetime(now.year, now.month, 1, tzinfo=timezone.utc), now
+    return datetime(1970, 1, 1, tzinfo=timezone.utc), now
+
+
+def _token_billing_window(
+    row: dict[str, Any],
+    *,
+    period_start: datetime,
+    period_end: datetime,
+) -> tuple[Optional[datetime], Optional[datetime], int]:
+    # Billing starts only after the customer activates the code in Mini App.
+    entitlement_start = _as_aware(row.get("entitlement_starts_at")) or _as_aware(row.get("redeemed_at"))
+    if entitlement_start is None:
+        return None, None, 0
+
+    end_candidates = [
+        period_end,
+        _as_aware(row.get("entitlement_expires_at")),
+        _as_aware(row.get("entitlement_stopped_at")),
+        _as_aware(row.get("revoked_at")),
+    ]
+    valid_ends = [dt for dt in end_candidates if dt is not None]
+    billing_start = max(entitlement_start, period_start)
+    billing_end = min(valid_ends) if valid_ends else period_end
+    return billing_start, billing_end, _ceil_positive_days(billing_start, billing_end)
+
+
+def _product_token_runtime_status(row: dict[str, Any], *, now: datetime) -> tuple[str, str]:
+    token_status = str(row.get("status") or "").strip().lower()
+    entitlement_status = str(row.get("entitlement_status") or "").strip().lower()
+    entitlement_expires_at = _as_aware(row.get("entitlement_expires_at"))
+    deployment_status = str(row.get("deployment_status") or "").strip().lower()
+    desired_state = str(row.get("deployment_desired_state") or "").strip().lower()
+    health_status = str(row.get("deployment_health_status") or "").strip().lower()
+    redeem_expires_at = _as_aware(row.get("redeem_expires_at"))
+
+    if token_status == "revoked" or entitlement_status == "revoked":
+        return "revoked", "Đã khóa"
+    if token_status == "expired" or entitlement_status == "expired":
+        return "expired", "Hết hạn"
+    if token_status == "issued":
+        if redeem_expires_at is not None and redeem_expires_at <= now:
+            return "expired", "Hết hạn"
+        return "issued", "Chưa kích hoạt"
+    if entitlement_expires_at is not None and entitlement_expires_at <= now:
+        return "expired", "Hết hạn"
+    if token_status == "redeemed" or row.get("redeemed_at") is not None:
+        running_states = {"start_requested", "starting", "running", "listening"}
+        running_health = {"running", "executor_ready", "recovering", "degraded"}
+        if desired_state == "running" and (
+            deployment_status in running_states or health_status in running_health
+        ):
+            return "running", "Đang dùng bot"
+        return "redeemed", "Đã kích hoạt"
+    return "unknown", "Chưa rõ trạng thái"
+
+
+def _format_partner_token_report_row(
+    row: dict[str, Any],
+    *,
+    now: datetime,
+    period_start: datetime,
+    period_end: datetime,
+) -> dict[str, Any]:
+    status_code, status_label = _product_token_runtime_status(row, now=now)
+    duration_days = int(row.get("duration_days") or 0)
+    customer_label = _token_customer_label(row)
+    entitlement_expires_at = _as_aware(row.get("entitlement_expires_at"))
+    entitlement_starts_at = _as_aware(row.get("entitlement_starts_at"))
+    entitlement_stopped_at = _as_aware(row.get("entitlement_stopped_at"))
+    issued_at = _as_aware(row.get("issued_at"))
+    billing_start, billing_end, billing_days = _token_billing_window(
+        row,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    return {
+        "token_id": str(row.get("token_id") or ""),
+        "partner_id": str(row.get("partner_id") or ""),
+        "bot_code": str(row.get("bot_code") or ""),
+        "duration_days": duration_days,
+        "billing_days": max(0, billing_days),
+        "billing_start_at": billing_start.isoformat() if billing_start is not None else None,
+        "billing_end_at": billing_end.isoformat() if billing_end is not None else None,
+        "customer_label": customer_label,
+        "token_status": str(row.get("status") or ""),
+        "status_code": status_code,
+        "status_label": status_label,
+        "issued_at": issued_at.isoformat() if issued_at is not None else None,
+        "redeem_expires_at": _iso_dt(row.get("redeem_expires_at")),
+        "redeemed_at": _iso_dt(row.get("redeemed_at")),
+        "redeemed_by_telegram_id": row.get("redeemed_by_telegram_id"),
+        "bound_user_id": row.get("bound_user_id"),
+        "bound_account_id": row.get("bound_account_id"),
+        "bound_deployment_id": row.get("bound_deployment_id"),
+        "revoked_at": _iso_dt(row.get("revoked_at")),
+        "revoke_reason": row.get("revoke_reason"),
+        "entitlement_id": row.get("entitlement_id"),
+        "entitlement_status": row.get("entitlement_status"),
+        "entitlement_starts_at": entitlement_starts_at.isoformat()
+        if entitlement_starts_at is not None
+        else None,
+        "entitlement_expires_at": entitlement_expires_at.isoformat()
+        if entitlement_expires_at is not None
+        else None,
+        "entitlement_stopped_at": entitlement_stopped_at.isoformat()
+        if entitlement_stopped_at is not None
+        else None,
+        "deployment_id": row.get("entitlement_deployment_id") or row.get("bound_deployment_id"),
+        "deployment_status": row.get("deployment_status"),
+        "deployment_desired_state": row.get("deployment_desired_state"),
+        "deployment_health_status": row.get("deployment_health_status"),
+        "is_activated": bool(row.get("redeemed_at") is not None or row.get("entitlement_id")),
+        "is_running": status_code == "running",
+        "is_revoked": status_code == "revoked",
+        "is_expired": status_code == "expired",
+    }
+
+
+def _partner_token_report_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
+    counts = {
+        "issued": 0,
+        "redeemed": 0,
+        "running": 0,
+        "expired": 0,
+        "revoked": 0,
+        "unknown": 0,
+    }
+    by_customer: dict[str, dict[str, Any]] = {}
+    total_days = 0
+    for item in items:
+        status_code = str(item.get("status_code") or "unknown")
+        counts[status_code] = int(counts.get(status_code, 0)) + 1
+        days = int(item.get("billing_days") or 0)
+        total_days += days
+        customer = str(item.get("customer_label") or "Không tên").strip() or "Không tên"
+        bucket = by_customer.setdefault(
+            customer,
+            {
+                "customer_label": customer,
+                "token_count": 0,
+                "total_days": 0,
+                "issued": 0,
+                "redeemed": 0,
+                "running": 0,
+                "expired": 0,
+                "revoked": 0,
+                "unknown": 0,
+            },
+        )
+        bucket["token_count"] = int(bucket["token_count"]) + 1
+        bucket["total_days"] = int(bucket["total_days"]) + days
+        bucket[status_code] = int(bucket.get(status_code, 0)) + 1
+    return {
+        "total_tokens": len(items),
+        "total_customers": len(by_customer),
+        "billable_customers": sum(
+            1 for item in by_customer.values() if int(item.get("total_days") or 0) > 0
+        ),
+        "total_days": total_days,
+        "status_counts": counts,
+        "by_customer": sorted(
+            by_customer.values(),
+            key=lambda item: (-int(item.get("total_days") or 0), str(item.get("customer_label") or "").lower()),
+        ),
+    }
+
+
 class BotTokenLicenseService:
     """PostgreSQL-backed token entitlement bridge for Mini App MT5 bot access."""
 
     def __init__(self, store: Store) -> None:
         self.store = store
+        self._catalog = BotTradingLicenseCatalog()
 
     def ensure_schema(self) -> None:
         def _do(_con: Any, cur: Any) -> None:
@@ -163,14 +388,47 @@ class BotTokenLicenseService:
                 "CREATE INDEX IF NOT EXISTS idx_bot_token_entitlements_deployment "
                 "ON bot_token_entitlements(deployment_id) WHERE deployment_id IS NOT NULL"
             )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bot_access_tokens_partner_status "
+                "ON bot_access_tokens(partner_id, status, issued_at DESC)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bot_token_partners_status "
+                "ON bot_token_partners(status, partner_id)"
+            )
 
         self.store._with_retry_locked(_do)
 
+    def _resolve_requested_bot(self, *, bot_name: str, bot_code: Optional[str]) -> LicensedBotPackage:
+        package = self._catalog.resolve(bot_code, bot_name)
+        if package is None:
+            raise BotTokenLicenseError("bot_token_bot_package_not_found")
+        return package
+
+    def _resolve_token_bot(self, token_bot_code: Any) -> LicensedBotPackage:
+        package = self._catalog.resolve(token_bot_code)
+        if package is None:
+            raise BotTokenLicenseError("bot_token_bot_package_not_found")
+        return package
+
     def _bot_matches(self, token_bot_code: Any, *, bot_name: str, bot_code: Optional[str]) -> bool:
-        token_identity = _norm_identity(token_bot_code)
-        allowed = {_norm_identity(bot_name), _norm_identity(bot_code)}
+        try:
+            token_bot = self._resolve_token_bot(token_bot_code)
+            requested_bot = self._resolve_requested_bot(bot_name=bot_name, bot_code=bot_code)
+        except BotTokenLicenseError:
+            return False
+        return _norm_identity(token_bot.code) == _norm_identity(requested_bot.code)
+
+    def _partner_allows_bot(self, partner: dict[str, Any], package: LicensedBotPackage) -> bool:
+        allowed = {_norm_identity(item) for item in _json_list(partner.get("allowed_bot_codes"))}
         allowed.discard("")
-        return bool(token_identity and token_identity in allowed)
+        if not allowed:
+            return True
+        return any(identity in allowed for identity in package.identities)
+
+    def _partner_allows_duration(self, partner: dict[str, Any], duration_days: int) -> bool:
+        allowed = _json_int_set(partner.get("allowed_duration_days")) or {1, 3, 7, 30}
+        return int(duration_days) in allowed
 
     def claim_token(
         self,
@@ -184,15 +442,19 @@ class BotTokenLicenseService:
     ) -> dict[str, Any]:
         self.ensure_schema()
         checked_at = _utc_now()
-        token_hash = _hash_token(raw_token)
+        requested_bot = self._resolve_requested_bot(bot_name=bot_name, bot_code=bot_code)
+        try:
+            token_hashes = hash_token_candidates(raw_token)
+        except BotTokenCryptoError as exc:
+            raise BotTokenLicenseError(str(exc) or "bot_token_required") from exc
         account_id = int(account_id)
         user_id = int(user_id)
         telegram_id = str(telegram_id)
 
         def _do(_con: Any, cur: Any) -> dict[str, Any]:
             cur.execute(
-                "SELECT * FROM bot_access_tokens WHERE token_hash = %s LIMIT 1 FOR UPDATE",
-                (token_hash,),
+                "SELECT * FROM bot_access_tokens WHERE token_hash = ANY(%s::text[]) LIMIT 1 FOR UPDATE",
+                (token_hashes,),
             )
             token = dict(cur.fetchone() or {})
             if not token:
@@ -216,7 +478,8 @@ class BotTokenLicenseService:
                 )
                 raise BotTokenLicenseError("bot_token_expired")
 
-            if not self._bot_matches(token.get("bot_code"), bot_name=bot_name, bot_code=bot_code):
+            token_bot = self._resolve_token_bot(token.get("bot_code"))
+            if _norm_identity(token_bot.code) != _norm_identity(requested_bot.code):
                 raise BotTokenLicenseError("bot_token_wrong_bot")
 
             cur.execute(
@@ -256,6 +519,41 @@ class BotTokenLicenseService:
             duration_days = int(token.get("duration_days") or 0)
             if duration_days not in {1, 3, 7, 30}:
                 raise BotTokenLicenseError("bot_token_duration_invalid")
+            if not self._partner_allows_bot(partner, requested_bot):
+                raise BotTokenLicenseError("bot_token_partner_bot_not_allowed")
+            if not self._partner_allows_duration(partner, duration_days):
+                raise BotTokenLicenseError("bot_token_partner_duration_not_allowed")
+
+            max_active_tokens = partner.get("max_active_tokens")
+            if max_active_tokens is not None:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)::INT AS active_count
+                    FROM bot_token_entitlements
+                    WHERE partner_id = %s
+                      AND status = 'active'
+                      AND expires_at > %s
+                    """,
+                    (partner.get("partner_id"), checked_at),
+                )
+                active_count = int((cur.fetchone() or {}).get("active_count") or 0)
+                if active_count >= int(max_active_tokens):
+                    raise BotTokenLicenseError("bot_token_partner_active_limit_reached")
+
+            max_tokens_per_day = partner.get("max_tokens_per_day")
+            if max_tokens_per_day is not None:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)::INT AS redeemed_today
+                    FROM bot_access_tokens
+                    WHERE partner_id = %s
+                      AND redeemed_at >= date_trunc('day', NOW())
+                    """,
+                    (partner.get("partner_id"),),
+                )
+                redeemed_today = int((cur.fetchone() or {}).get("redeemed_today") or 0)
+                if redeemed_today >= int(max_tokens_per_day):
+                    raise BotTokenLicenseError("bot_token_partner_daily_limit_reached")
 
             entitlement_id = f"ent_{secrets.token_urlsafe(12)}"
             expires_at = checked_at + timedelta(days=duration_days)
@@ -263,6 +561,9 @@ class BotTokenLicenseService:
                 "source": "miniapp",
                 "bot_name": bot_name,
                 "bot_code": bot_code,
+                "licensed_bot_code": requested_bot.code,
+                "licensed_bot_version": requested_bot.version,
+                "package_path": requested_bot.package_path,
             }
 
             cur.execute(
@@ -295,7 +596,7 @@ class BotTokenLicenseService:
                     telegram_id,
                     user_id,
                     account_id,
-                    token.get("bot_code"),
+                    requested_bot.code,
                     checked_at,
                     expires_at,
                     json.dumps(metadata, ensure_ascii=False),
@@ -391,14 +692,444 @@ class BotTokenLicenseService:
                     metadata_json = COALESCE(metadata_json, '{}'::jsonb) || %s::jsonb,
                     updated_at = NOW()
                 WHERE entitlement_id = %s
+                  AND status = 'active'
+                  AND expires_at > NOW()
+                  AND (deployment_id IS NULL OR deployment_id = %s)
                 """,
                 (
                     int(deployment_id),
                     json.dumps({"deployment_bound_at": _utc_now().isoformat()}, ensure_ascii=False),
                     str(entitlement_id),
+                    int(deployment_id),
                 ),
             )
             if int(cur.rowcount or 0) < 1:
-                raise BotTokenLicenseError("bot_token_entitlement_not_found")
+                raise BotTokenLicenseError("bot_token_entitlement_bind_failed")
 
         self.store._with_retry_locked(_do, tries=1)
+
+    def upsert_partner(
+        self,
+        *,
+        partner_code: str,
+        display_name: str,
+        partner_id: Optional[str] = None,
+        telegram_id: Optional[str] = None,
+        allowed_bot_codes: Optional[list[str]] = None,
+        allowed_duration_days: Optional[list[int]] = None,
+        max_active_tokens: Optional[int] = None,
+        max_tokens_per_day: Optional[int] = None,
+        expires_at: Optional[datetime] = None,
+        created_by_admin_telegram_id: Optional[str] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        self.ensure_schema()
+        code = re.sub(r"[^a-z0-9_]+", "_", str(partner_code or "").strip().lower()).strip("_")
+        if not code:
+            raise BotTokenLicenseError("bot_token_partner_code_required")
+        partner_id_s = str(partner_id or f"partner_{code}").strip()
+        display_name_s = str(display_name or code).strip()
+        requested_codes = allowed_bot_codes if allowed_bot_codes is not None else []
+        canonical_allowed: list[str] = []
+        for item in requested_codes:
+            package = self._catalog.resolve(item)
+            if package is None:
+                raise BotTokenLicenseError("bot_token_bot_package_not_found")
+            if package.code not in canonical_allowed:
+                canonical_allowed.append(package.code)
+        durations_set: set[int] = set()
+        for day in allowed_duration_days or [1, 3, 7, 30]:
+            try:
+                day_i = int(day)
+            except Exception:
+                continue
+            if day_i in {1, 3, 7, 30}:
+                durations_set.add(day_i)
+        durations = sorted(durations_set)
+        if not durations:
+            raise BotTokenLicenseError("bot_token_duration_invalid")
+
+        def _do(_con: Any, cur: Any) -> dict[str, Any]:
+            cur.execute(
+                """
+                INSERT INTO bot_token_partners (
+                    partner_id, partner_code, display_name, telegram_id, status,
+                    allowed_bot_codes, allowed_duration_days,
+                    max_active_tokens, max_tokens_per_day, expires_at,
+                    metadata_json, created_by_admin_telegram_id, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, 'active', %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s, NOW(), NOW())
+                ON CONFLICT (partner_id) DO UPDATE SET
+                    partner_code = EXCLUDED.partner_code,
+                    display_name = EXCLUDED.display_name,
+                    telegram_id = EXCLUDED.telegram_id,
+                    allowed_bot_codes = EXCLUDED.allowed_bot_codes,
+                    allowed_duration_days = EXCLUDED.allowed_duration_days,
+                    max_active_tokens = EXCLUDED.max_active_tokens,
+                    max_tokens_per_day = EXCLUDED.max_tokens_per_day,
+                    expires_at = EXCLUDED.expires_at,
+                    metadata_json = EXCLUDED.metadata_json,
+                    updated_at = NOW()
+                RETURNING *
+                """,
+                (
+                    partner_id_s,
+                    code,
+                    display_name_s,
+                    str(telegram_id).strip() if telegram_id else None,
+                    json.dumps(canonical_allowed, ensure_ascii=False),
+                    json.dumps(durations, ensure_ascii=False),
+                    max_active_tokens,
+                    max_tokens_per_day,
+                    expires_at,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                    str(created_by_admin_telegram_id).strip() if created_by_admin_telegram_id else None,
+                ),
+            )
+            return dict(cur.fetchone() or {})
+
+        return self.store._with_retry_locked(_do, tries=1)
+
+    def issue_token(
+        self,
+        *,
+        partner_id: str,
+        bot_code: str,
+        duration_days: int,
+        issued_by_telegram_id: Optional[str] = None,
+        issued_to_note: Optional[str] = None,
+        redeem_expires_at: Optional[datetime] = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        self.ensure_schema()
+        package = self._resolve_token_bot(bot_code)
+        duration = int(duration_days)
+        if duration not in {1, 3, 7, 30}:
+            raise BotTokenLicenseError("bot_token_duration_invalid")
+
+        raw_token = generate_raw_token(bot_code=package.code, duration_days=duration)
+        token_hash = _hash_token(raw_token)
+        token_id = f"tok_{secrets.token_urlsafe(12)}"
+
+        def _do(_con: Any, cur: Any) -> dict[str, Any]:
+            cur.execute(
+                "SELECT * FROM bot_token_partners WHERE partner_id = %s LIMIT 1 FOR UPDATE",
+                (str(partner_id),),
+            )
+            partner = dict(cur.fetchone() or {})
+            if not partner:
+                raise BotTokenLicenseError("bot_token_partner_not_found")
+            if str(partner.get("status") or "").strip().lower() != "active":
+                raise BotTokenLicenseError("bot_token_partner_locked")
+            if not self._partner_allows_bot(partner, package):
+                raise BotTokenLicenseError("bot_token_partner_bot_not_allowed")
+            if not self._partner_allows_duration(partner, duration):
+                raise BotTokenLicenseError("bot_token_partner_duration_not_allowed")
+
+            cur.execute(
+                """
+                INSERT INTO bot_access_tokens (
+                    token_id, token_hash, partner_id, bot_code, duration_days,
+                    status, issued_by_telegram_id, issued_to_note,
+                    redeem_expires_at, metadata_json, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, 'issued', %s, %s, %s, %s::jsonb, NOW(), NOW())
+                RETURNING token_id, partner_id, bot_code, duration_days, status, issued_at, redeem_expires_at
+                """,
+                (
+                    token_id,
+                    token_hash,
+                    str(partner_id),
+                    package.code,
+                    duration,
+                    str(issued_by_telegram_id).strip() if issued_by_telegram_id else None,
+                    str(issued_to_note or "").strip() or None,
+                    redeem_expires_at,
+                    json.dumps(metadata or {}, ensure_ascii=False),
+                ),
+            )
+            row = dict(cur.fetchone() or {})
+            row["raw_token"] = raw_token
+            row["bot_name"] = package.name
+            row["package_path"] = package.package_path
+            return row
+
+        return self.store._with_retry_locked(_do, tries=1)
+
+    def expire_due_entitlements(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        self.ensure_schema()
+        batch_size = max(1, min(int(limit or 100), 1000))
+
+        def _do(_con: Any, cur: Any) -> list[dict[str, Any]]:
+            cur.execute(
+                """
+                WITH due AS (
+                    SELECT id
+                    FROM bot_token_entitlements
+                    WHERE status = 'active'
+                      AND expires_at <= NOW()
+                    ORDER BY expires_at ASC, id ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE bot_token_entitlements e
+                SET status = 'expired',
+                    stop_reason = COALESCE(stop_reason, 'bot_token_expired'),
+                    metadata_json = COALESCE(metadata_json, '{}'::jsonb) || %s::jsonb,
+                    updated_at = NOW()
+                FROM due
+                WHERE e.id = due.id
+                RETURNING e.*
+                """,
+                (
+                    batch_size,
+                    json.dumps({"expired_by": "backend_reconciler", "expired_at": _utc_now().isoformat()}),
+                ),
+            )
+            return [_format_entitlement(dict(row)) for row in cur.fetchall()]
+
+        return self.store._with_retry_locked(_do, tries=1)
+
+    def list_expired_deployments_needing_stop(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        self.ensure_schema()
+        batch_size = max(1, min(int(limit or 100), 1000))
+
+        def _do(_con: Any, cur: Any) -> list[dict[str, Any]]:
+            cur.execute(
+                """
+                SELECT *
+                FROM bot_token_entitlements
+                WHERE status = 'expired'
+                  AND deployment_id IS NOT NULL
+                  AND stop_command_id IS NULL
+                  AND expires_at <= NOW()
+                ORDER BY expires_at ASC, id ASC
+                LIMIT %s
+                """,
+                (batch_size,),
+            )
+            return [_format_entitlement(dict(row)) for row in cur.fetchall()]
+
+        return self.store._with_retry_read(_do, tries=1)
+
+    def record_entitlement_stop_requested(
+        self,
+        *,
+        entitlement_id: str,
+        stop_command_id: Optional[str],
+        reason: str = "bot_token_expired",
+    ) -> None:
+        self.ensure_schema()
+
+        def _do(_con: Any, cur: Any) -> None:
+            cur.execute(
+                """
+                UPDATE bot_token_entitlements
+                SET stop_command_id = COALESCE(%s, stop_command_id),
+                    stopped_at = COALESCE(stopped_at, NOW()),
+                    stop_reason = %s,
+                    updated_at = NOW()
+                WHERE entitlement_id = %s
+                """,
+                (str(stop_command_id).strip() if stop_command_id else None, str(reason or "bot_token_expired"), str(entitlement_id)),
+            )
+
+        self.store._with_retry_locked(_do, tries=1)
+
+    def revoke_token(
+        self,
+        *,
+        token_id: str,
+        revoked_by_telegram_id: Optional[str] = None,
+        reason: str = "partner_revoke",
+        expected_partner_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Revoke a product activation token and any active entitlements it created.
+
+        This method only mutates license state. The caller is responsible for
+        dispatching STOP_BOT for returned entitlements that are bound to a
+        running deployment.
+        """
+
+        self.ensure_schema()
+        token_id_s = str(token_id or "").strip()
+        if not token_id_s:
+            raise BotTokenLicenseError("bot_token_required")
+        expected_partner_id_s = str(expected_partner_id or "").strip()
+        reason_s = str(reason or "partner_revoke").strip()[:200]
+        revoked_by_s = str(revoked_by_telegram_id).strip() if revoked_by_telegram_id else None
+        metadata_patch = {
+            "revoked_by": "token_bot",
+            "revoked_reason": reason_s,
+            "revoked_at": _utc_now().isoformat(),
+        }
+
+        def _do(_con: Any, cur: Any) -> dict[str, Any]:
+            cur.execute(
+                """
+                SELECT *
+                FROM bot_access_tokens
+                WHERE token_id = %s
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (token_id_s,),
+            )
+            token = dict(cur.fetchone() or {})
+            if not token:
+                raise BotTokenLicenseError("bot_token_not_found")
+            if expected_partner_id_s and str(token.get("partner_id") or "") != expected_partner_id_s:
+                raise BotTokenLicenseError("bot_token_partner_mismatch")
+
+            cur.execute(
+                """
+                UPDATE bot_access_tokens
+                SET status = 'revoked',
+                    revoked_at = COALESCE(revoked_at, NOW()),
+                    revoked_by_telegram_id = COALESCE(%s, revoked_by_telegram_id),
+                    revoke_reason = COALESCE(%s, revoke_reason),
+                    metadata_json = COALESCE(metadata_json, '{}'::jsonb) || %s::jsonb,
+                    updated_at = NOW()
+                WHERE token_id = %s
+                  AND status <> 'revoked'
+                """,
+                (
+                    revoked_by_s,
+                    reason_s,
+                    json.dumps(metadata_patch, ensure_ascii=False),
+                    token_id_s,
+                ),
+            )
+
+            cur.execute(
+                """
+                UPDATE bot_token_entitlements
+                SET status = 'revoked',
+                    stopped_at = COALESCE(stopped_at, NOW()),
+                    stop_reason = COALESCE(stop_reason, %s),
+                    metadata_json = COALESCE(metadata_json, '{}'::jsonb) || %s::jsonb,
+                    updated_at = NOW()
+                WHERE token_id = %s
+                  AND status = 'active'
+                RETURNING *
+                """,
+                (
+                    reason_s,
+                    json.dumps(metadata_patch, ensure_ascii=False),
+                    token_id_s,
+                ),
+            )
+            entitlements = [_format_entitlement(dict(row)) for row in cur.fetchall()]
+            return {
+                "token_id": token_id_s,
+                "status": "revoked",
+                "revoked_entitlements": entitlements,
+            }
+
+        return self.store._with_retry_locked(_do, tries=1)
+
+    def list_partner_tokens(
+        self,
+        *,
+        partner_id: str,
+        scope: str = "all",
+        query: Optional[str] = None,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        """Return partner-facing token report with real activation/runtime state."""
+
+        self.ensure_schema()
+        partner_id_s = str(partner_id or "").strip()
+        if not partner_id_s:
+            raise BotTokenLicenseError("bot_token_partner_required")
+        scope_s = str(scope or "all").strip().lower()
+        if scope_s not in {"all", "month"}:
+            scope_s = "all"
+        query_s = str(query or "").strip()
+        limit_i = max(1, min(int(limit or 500), 500))
+        now = _utc_now()
+        period_start, period_end = _billing_period_bounds(scope_s, now=now)
+
+        def _do(_con: Any, cur: Any) -> dict[str, Any]:
+            where = ["t.partner_id = %s"]
+            params: list[Any] = [partner_id_s]
+            if scope_s == "month":
+                where.append(
+                    """
+                    (
+                        (t.issued_at >= %s AND t.issued_at <= %s)
+                        OR EXISTS (
+                            SELECT 1
+                            FROM bot_token_entitlements ee
+                            WHERE ee.token_id = t.token_id
+                              AND ee.starts_at < %s
+                              AND ee.expires_at > %s
+                        )
+                        OR (t.revoked_at IS NOT NULL AND t.revoked_at >= %s AND t.revoked_at <= %s)
+                    )
+                    """
+                )
+                params.extend([period_start, period_end, period_end, period_start, period_start, period_end])
+            if query_s:
+                needle = f"%{query_s}%"
+                where.append(
+                    """
+                    (
+                        t.token_id ILIKE %s
+                        OR COALESCE(t.issued_to_note, '') ILIKE %s
+                        OR t.bot_code ILIKE %s
+                    )
+                    """
+                )
+                params.extend([needle, needle, needle])
+            params.append(limit_i)
+            cur.execute(
+                f"""
+                SELECT
+                    t.*,
+                    e.entitlement_id,
+                    e.status AS entitlement_status,
+                    e.starts_at AS entitlement_starts_at,
+                    e.expires_at AS entitlement_expires_at,
+                    e.stopped_at AS entitlement_stopped_at,
+                    e.deployment_id AS entitlement_deployment_id,
+                    d.status AS deployment_status,
+                    d.desired_state AS deployment_desired_state,
+                    d.health_status AS deployment_health_status
+                FROM bot_access_tokens t
+                LEFT JOIN LATERAL (
+                    SELECT *
+                    FROM bot_token_entitlements e
+                    WHERE e.token_id = t.token_id
+                    ORDER BY e.created_at DESC, e.id DESC
+                    LIMIT 1
+                ) e ON TRUE
+                LEFT JOIN bot_deployments d ON d.id = COALESCE(e.deployment_id, t.bound_deployment_id)
+                WHERE {" AND ".join(where)}
+                ORDER BY t.issued_at DESC, t.id DESC
+                LIMIT %s
+                """,
+                tuple(params),
+            )
+            items = [
+                _format_partner_token_report_row(
+                    dict(row),
+                    now=now,
+                    period_start=period_start,
+                    period_end=period_end,
+                )
+                for row in cur.fetchall()
+            ]
+            return {
+                "partner_id": partner_id_s,
+                "scope": scope_s,
+                "query": query_s or None,
+                "billing_policy": "activated_overlap_by_day",
+                "period_start": period_start.isoformat(),
+                "period_end": period_end.isoformat(),
+                "items": items,
+                "summary": _partner_token_report_summary(items),
+                "generated_at": now.isoformat(),
+            }
+
+        return self.store._with_retry_read(_do, tries=1)

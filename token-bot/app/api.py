@@ -151,6 +151,14 @@ def admin_get_package(bot_id: str, request: Request):
 @router.post("/admin/tokens", response_model=TokenIssueResponse, dependencies=[Depends(_admin_guard)])
 def issue_token(payload: TokenIssueRequest, request: Request):
     settings = request.app.state.settings
+    if not getattr(settings, "enable_legacy_jwt_tokens", False):
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                "legacy JWT token issuing is disabled. "
+                "Use the Telegram partner flow to create Mini App activation codes."
+            ),
+        )
     ts = request.app.state.token_service
     sf = request.app.state.session_factory
     reg = request.app.state.registry

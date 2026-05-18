@@ -6,11 +6,12 @@ cd "$ROOT_DIR"
 
 ENV_PATH="${ENV_PATH:-.env}"
 READY_URL="${READY_URL:-http://127.0.0.1:8001/ready}"
+BACKEND_SERVICE="${BACKEND_SERVICE:-cntx-lab}"
 
 log() { printf '[restart-all] %s\n' "$*"; }
 die() { printf '[restart-all] ERROR: %s\n' "$*" >&2; exit 1; }
 
-[[ "${1:-}" == "--yes" ]] || die "this restarts db/redis/hubbot/spider-app/token-bot; rerun: ops/restart-all.sh --yes"
+[[ "${1:-}" == "--yes" ]] || die "this restarts db/redis/hubbot/$BACKEND_SERVICE/token-bot; rerun: ops/restart-all.sh --yes"
 [[ -f "$ENV_PATH" ]] || die "$ENV_PATH not found"
 command -v docker >/dev/null 2>&1 || die "docker is not installed"
 docker compose version >/dev/null 2>&1 || die "docker compose is not available"
@@ -44,10 +45,10 @@ log "restarting infrastructure: db redis"
 wait_service db healthy
 wait_service redis healthy
 
-log "restarting application services: hubbot spider-app token-bot"
-"${COMPOSE[@]}" restart hubbot spider-app token-bot-api token-bot-tg
+log "restarting application services: hubbot $BACKEND_SERVICE token-bot"
+"${COMPOSE[@]}" restart hubbot "$BACKEND_SERVICE" token-bot-api token-bot-tg
 wait_service hubbot running
-wait_service spider-app healthy
+wait_service "$BACKEND_SERVICE" healthy
 wait_service token-bot-api healthy
 wait_service token-bot-tg running
 

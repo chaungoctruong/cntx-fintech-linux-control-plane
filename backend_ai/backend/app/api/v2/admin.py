@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field
 from app.core.internal_auth import require_backend_api_key
 from app.api.v2.control_plane_deps import service_dep, translate_control_plane_error
 from app.ai.training_data import AITrainingDataStore
+from app.services.bot_token_license import BotTokenLicenseError, BotTokenLicenseService
+from app.services.bot_tokens.catalog import BotTradingLicenseCatalog
 from app.services.control_plane_service import MT5ControlPlaneService
 from app.services.store_service import get_process_store
 from app.settings import settings
@@ -23,6 +25,10 @@ def store_dep() -> Any:
     return get_process_store()
 
 
+def bot_token_license_dep(store: Any = Depends(store_dep)) -> BotTokenLicenseService:
+    return BotTokenLicenseService(store)
+
+
 class TokenExpiryStopRequest(BaseModel):
     telegram_id: str = Field(min_length=1)
     deployment_id: int = Field(gt=0)
@@ -30,6 +36,28 @@ class TokenExpiryStopRequest(BaseModel):
     reason: str = Field(default="bot_token_expired", max_length=200)
     bot_code: Optional[str] = None
     account_id: Optional[int] = Field(default=None, gt=0)
+
+
+class BotTokenPartnerUpsertRequest(BaseModel):
+    partner_code: str = Field(min_length=1, max_length=80)
+    display_name: str = Field(min_length=1, max_length=160)
+    partner_id: Optional[str] = Field(default=None, max_length=120)
+    telegram_id: Optional[str] = Field(default=None, max_length=80)
+    allowed_bot_codes: list[str] = Field(default_factory=list)
+    allowed_duration_days: list[int] = Field(default_factory=lambda: [1, 3, 7, 30])
+    max_active_tokens: Optional[int] = Field(default=None, ge=0)
+    max_tokens_per_day: Optional[int] = Field(default=None, ge=0)
+    created_by_admin_telegram_id: Optional[str] = Field(default=None, max_length=80)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class BotTokenIssueRequest(BaseModel):
+    partner_id: str = Field(min_length=1, max_length=120)
+    bot_code: str = Field(min_length=1, max_length=120)
+    duration_days: int = Field(ge=1)
+    issued_by_telegram_id: Optional[str] = Field(default=None, max_length=80)
+    issued_to_note: Optional[str] = Field(default=None, max_length=240)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AITrainingReviewRequest(BaseModel):
@@ -164,6 +192,71 @@ async def admin_audit_cleanup(
         "scanned_users": int(result.get("scanned_users") or 0),
         "dry_run": bool(result.get("dry_run", dry_run)),
     }
+
+
+@router.get("/bot-tokens/bots")
+async def admin_bot_token_bots(
+    _: dict = Depends(require_backend_api_key),
+) -> dict:
+    return {"items": BotTradingLicenseCatalog().list_packages()}
+
+
+@router.post("/bot-tokens/partners")
+async def admin_bot_token_upsert_partner(
+    payload: BotTokenPartnerUpsertRequest,
+    _: dict = Depends(require_backend_api_key),
+    licenses: BotTokenLicenseService = Depends(bot_token_license_dep),
+) -> dict:
+    try:
+        partner = licenses.upsert_partner(
+            partner_code=payload.partner_code,
+            display_name=payload.display_name,
+            partner_id=payload.partner_id,
+            telegram_id=payload.telegram_id,
+            allowed_bot_codes=payload.allowed_bot_codes,
+            allowed_duration_days=payload.allowed_duration_days,
+            max_active_tokens=payload.max_active_tokens,
+            max_tokens_per_day=payload.max_tokens_per_day,
+            metadata=payload.metadata,
+            created_by_admin_telegram_id=payload.created_by_admin_telegram_id,
+        )
+    except BotTokenLicenseError as exc:
+        raise translate_control_plane_error(ValueError(str(exc))) from exc
+    return {
+        "partner_id": partner.get("partner_id"),
+        "partner_code": partner.get("partner_code"),
+        "display_name": partner.get("display_name"),
+        "status": partner.get("status"),
+        "allowed_bot_codes": partner.get("allowed_bot_codes"),
+        "allowed_duration_days": partner.get("allowed_duration_days"),
+        "max_active_tokens": partner.get("max_active_tokens"),
+        "max_tokens_per_day": partner.get("max_tokens_per_day"),
+    }
+
+
+@router.post("/bot-tokens/issue")
+async def admin_bot_token_issue(
+    payload: BotTokenIssueRequest,
+    _: dict = Depends(require_backend_api_key),
+    licenses: BotTokenLicenseService = Depends(bot_token_license_dep),
+) -> dict:
+    """Issue a one-time bot access token.
+
+    `raw_token` is returned only once. Store it outside backend logs and send it
+    to the buyer through a private channel.
+    """
+    try:
+        issued = licenses.issue_token(
+            partner_id=payload.partner_id,
+            bot_code=payload.bot_code,
+            duration_days=payload.duration_days,
+            issued_by_telegram_id=payload.issued_by_telegram_id,
+            issued_to_note=payload.issued_to_note,
+            metadata=payload.metadata,
+        )
+    except BotTokenLicenseError as exc:
+        raise translate_control_plane_error(ValueError(str(exc))) from exc
+    return issued
 
 
 @router.post("/token-expiry/stop-deployment")

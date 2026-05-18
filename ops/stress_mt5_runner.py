@@ -612,7 +612,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--accounts-file", default=str(DEFAULT_ACCOUNTS_FILE), help="CSV with login,server columns.")
     parser.add_argument("--compose-env-file", default=str(ROOT / ".env"), help="Docker Compose env file.")
     parser.add_argument("--compose-file", default=str(ROOT / "docker-compose.yml"), help="Docker Compose file.")
-    parser.add_argument("--service", default="spider-app", help="Backend Compose service name.")
+    parser.add_argument("--service", default="cntx-lab", help="Backend Compose service name.")
     parser.add_argument("--runner-id", default="runner-win-01", help="Target Windows runner id.")
     parser.add_argument("--owner-mode", choices=["per-account", "single"], default=os.getenv("STRESS_OWNER_MODE", "per-account"), help="Use one synthetic user per account, or one owner for all accounts.")
     parser.add_argument("--telegram-id", default=os.getenv("STRESS_TELEGRAM_ID", ""), help="Owner Telegram id for --owner-mode single. Defaults to first ADMIN_TELEGRAM_IDS inside backend.")

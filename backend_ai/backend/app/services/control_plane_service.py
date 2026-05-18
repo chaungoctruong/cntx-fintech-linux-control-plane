@@ -49,6 +49,7 @@ from app.security import CryptoBox
 from app.services.runner_gsalgo_state import GsAlgoBackendStateService
 from app.services.store_service import get_process_store
 from app.services.tradingview_position_resolver import resolve_close_positions
+from app.services.tradingview_symbols import canonical_tradingview_symbol
 from app.settings import settings
 
 log = logging.getLogger(__name__)
@@ -1938,53 +1939,14 @@ class MT5ControlPlaneService:
         return dict(raw) if isinstance(raw, dict) else {}
 
     @classmethod
-    def _tradingview_symbol_map(cls, *sources: Any) -> dict[str, str]:
-        merged: dict[str, str] = {}
-        for source in sources:
-            cfg = cls._json_object(source)
-            candidates: list[Any] = [cfg.get("symbol_map")]
-            symbols = cfg.get("symbols")
-            if isinstance(symbols, dict):
-                candidates.append(symbols.get("symbol_map"))
-            trading = cfg.get("trading")
-            if isinstance(trading, dict):
-                candidates.append(trading.get("symbol_map"))
-            for candidate in candidates:
-                if not isinstance(candidate, dict):
-                    continue
-                for raw_src, raw_dst in candidate.items():
-                    src = str(raw_src or "").strip()
-                    dst = str(raw_dst or "").strip()
-                    if src and dst:
-                        merged[src] = dst
-                        merged[src.upper()] = dst
-                        merged[src.lower()] = dst
-        return merged
-
-    @staticmethod
-    def _broker_default_symbol_config(*, broker: Any, server: Any) -> dict[str, Any]:
-        broker_s = str(broker or "").strip().lower()
-        server_s = str(server or "").strip().lower()
-        text = f"{broker_s} {server_s}"
-        symbol_map: dict[str, str] = {}
-        if "exness" in text:
-            symbol_map["XAUUSD"] = "XAUUSDm"
-        elif "dbg" in text:
-            symbol_map["XAUUSD"] = "XAUUSD.G"
-        return {"symbols": {"symbol_map": symbol_map}} if symbol_map else {}
-
-    @classmethod
     def _map_tradingview_symbol(cls, symbol: str, *sources: Any) -> str:
+        # Linux control-plane stays broker-agnostic: it sends canonical
+        # TradingView symbols (for example XAUUSD). Broker suffix mapping
+        # belongs to the Windows runner because it owns MT5/server context.
         symbol_s = str(symbol or "").strip()
         if not symbol_s:
             return ""
-        symbol_map = cls._tradingview_symbol_map(*sources)
-        return str(
-            symbol_map.get(symbol_s)
-            or symbol_map.get(symbol_s.upper())
-            or symbol_map.get(symbol_s.lower())
-            or symbol_s
-        ).strip()
+        return canonical_tradingview_symbol(symbol_s)
 
     @staticmethod
     def _stable_order_magic(*, account_id: int, deployment_id: int, bot_code: str) -> int:
@@ -2411,16 +2373,7 @@ class MT5ControlPlaneService:
                 deployment_id=deployment_id,
                 bot_code=bot_code,
             )
-            order_symbol = self._map_tradingview_symbol(
-                symbol,
-                self._broker_default_symbol_config(
-                    broker=sub.get("broker"),
-                    server=sub.get("server"),
-                ),
-                sub.get("account_risk_policy_json"),
-                sub.get("subscription_metadata"),
-                sub.get("deployment_config_json"),
-            )
+            order_symbol = self._map_tradingview_symbol(symbol)
 
             if kind == "PLACE_ORDER":
                 trace_id = f"tv_bcast:{alert_id}:{account_id}:place_order"

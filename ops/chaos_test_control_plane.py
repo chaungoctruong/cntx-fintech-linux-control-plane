@@ -99,9 +99,9 @@ def scenario_readonly(args: argparse.Namespace, env: dict[str, str]) -> dict[str
 
 def scenario_backend_restart(args: argparse.Namespace, env: dict[str, str]) -> dict[str, Any]:
     if not args.execute:
-        return {"dry_run": True, "would_run": "docker compose restart spider-app"}
+        return {"dry_run": True, "would_run": "docker compose restart cntx-lab"}
     before = scenario_readonly(args, env)
-    restart = run_compose(["restart", "spider-app"], timeout=180)
+    restart = run_compose(["restart", "cntx-lab"], timeout=180)
     ready = wait_ready(args.backend_url, timeout_sec=90)
     after = scenario_readonly(args, env)
     return {"before": before, "restart": restart, "ready_after_restart": ready, "after": after}

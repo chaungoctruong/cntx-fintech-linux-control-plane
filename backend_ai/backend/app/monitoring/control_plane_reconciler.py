@@ -6,6 +6,7 @@ import time
 from typing import Any, Optional
 
 from app.orchestration.runner_failover import RunnerFailoverService
+from app.monitoring.runtime_housekeeping import RuntimeHousekeepingService
 from app.repositories.control_plane_repository import ControlPlaneRepository
 from app.services.store_service import get_process_store
 from app.settings import settings
@@ -45,11 +46,13 @@ class ControlPlaneReconcilerService:
     def __init__(self, repo: Optional[ControlPlaneRepository] = None) -> None:
         self._repo = repo or ControlPlaneRepository(get_process_store())
         self._runner_failover = RunnerFailoverService(self._repo)
+        self._housekeeping = RuntimeHousekeepingService(self._repo)
         self._run_count = 0
         self._last_started_at = 0
         self._last_success_at = 0
         self._last_error: str | None = None
         self._last_result: dict[str, int] = {}
+        self._last_housekeeping_at = 0
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -132,6 +135,23 @@ class ControlPlaneReconcilerService:
             failover_result = {f"runner_failover_{key}": int(value or 0) for key, value in failover.items()}
             result = {**dict(result), **failover_result}
             self._last_result = dict(result)
+        if bool(getattr(settings, "RUNTIME_HOUSEKEEPING_ENABLED", True)):
+            now = int(time.time())
+            interval = max(60, int(getattr(settings, "RUNTIME_HOUSEKEEPING_INTERVAL_SEC", 3600) or 3600))
+            if now - int(self._last_housekeeping_at or 0) >= interval:
+                self._last_housekeeping_at = now
+                try:
+                    housekeeping = await self._housekeeping.run_once()
+                    housekeeping_result = {
+                        f"housekeeping_{key}": int(value or 0)
+                        for key, value in housekeeping.items()
+                        if isinstance(value, (int, bool))
+                    }
+                    result = {**dict(result), **housekeeping_result}
+                    self._last_result = dict(result)
+                except Exception as exc:
+                    self._last_error = str(exc)
+                    log.warning("Runtime housekeeping iteration failed: %s", exc)
         return result
 
     async def run_forever(self, stop_event: asyncio.Event) -> None:

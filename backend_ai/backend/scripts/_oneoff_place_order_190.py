@@ -1,4 +1,4 @@
-"""One-off: dispatch a tiny PLACE_ORDER on deployment 190 (account 17, XAUUSDm, buy, 0.01)."""
+"""One-off: dispatch a tiny PLACE_ORDER on deployment 190 (account 17, XAUUSD, buy, 0.01)."""
 from __future__ import annotations
 
 import asyncio
@@ -18,7 +18,7 @@ from app.services.control_plane_service import get_control_plane_service  # noqa
 async def main() -> int:
     service = get_control_plane_service()
     deployment_id = 190
-    symbol = "XAUUSDm"
+    symbol = "XAUUSD"
     side = "buy"
     volume = 0.01
 

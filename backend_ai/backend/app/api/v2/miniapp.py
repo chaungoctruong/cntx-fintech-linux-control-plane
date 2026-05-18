@@ -58,7 +58,14 @@ def bot_token_license_dep(request: Request) -> BotTokenLicenseService:
 def _translate_bot_token_error(exc: Exception) -> HTTPException:
     detail = str(exc) or exc.__class__.__name__
     status_code = status.HTTP_403_FORBIDDEN
-    if detail in {"bot_token_not_found", "bot_token_already_used", "bot_token_expired", "bot_token_revoked"}:
+    if detail in {
+        "bot_token_not_found",
+        "bot_token_already_used",
+        "bot_token_expired",
+        "bot_token_revoked",
+        "bot_token_bot_package_not_found",
+        "bot_token_duration_invalid",
+    }:
         status_code = status.HTTP_400_BAD_REQUEST
     return HTTPException(status_code=status_code, detail=detail)
 

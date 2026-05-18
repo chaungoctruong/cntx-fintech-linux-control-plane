@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import re
 from typing import Any
 
+from app.services.tradingview_symbols import trading_symbols_match
+
 
 @dataclass(frozen=True)
 class ResolvedClosePosition:
@@ -62,10 +64,6 @@ def position_snapshot_volume(row: dict[str, Any]) -> float | None:
     return None
 
 
-def _norm_symbol(value: Any) -> str:
-    return re.sub(r"[^A-Z0-9]", "", str(value or "").strip().upper())
-
-
 def _close_kind_side(close_kind: Any) -> str:
     raw = str(close_kind or "").strip().upper()
     if raw in {"CLOSE_BUY", "CLOSE_LONG"}:
@@ -90,7 +88,7 @@ def _matches_close(row: dict[str, Any], *, symbol: str, close_kind: str) -> bool
     payload = position_snapshot_payload(row)
     if symbol:
         row_symbol = str(row.get("symbol") or payload.get("symbol") or "").strip()
-        if _norm_symbol(row_symbol) != _norm_symbol(symbol):
+        if not trading_symbols_match(row_symbol, symbol):
             return False
     wanted_side = _close_kind_side(close_kind)
     if wanted_side:

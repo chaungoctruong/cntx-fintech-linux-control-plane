@@ -3,8 +3,8 @@
 #
 # Usage:
 #   ops/compose-dev.sh up -d
-#   ops/compose-dev.sh logs -f spider-app
-#   ops/compose-dev.sh restart spider-app
+#   ops/compose-dev.sh logs -f cntx-lab
+#   ops/compose-dev.sh restart cntx-lab
 #
 # Both `--env-file` (compose interpolation) and ENV_FILE (service env_file)
 # point at the same file so LOCAL_* vars and container env stay in sync.

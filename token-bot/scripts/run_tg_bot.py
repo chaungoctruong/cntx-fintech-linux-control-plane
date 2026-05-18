@@ -13,6 +13,10 @@ def main():
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
     )
+    # Telegram Bot API URLs contain the bot token. Keep noisy HTTP client logs
+    # out of production logs so secrets do not leak through getUpdates lines.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     settings = Settings()
     if not settings.telegram_bot_token:
         raise SystemExit(

@@ -49,6 +49,26 @@ export function formatBotDisplayName(value?: string | null): string {
   return raw;
 }
 
+export function formatBotProfileClass(value?: string | null): string {
+  const normalized = normalizeBotIdentity(value).replace(/[^a-z0-9]/g, "");
+  if (!normalized) {
+    return "Cấu hình mặc định";
+  }
+  if (["normal", "standard", "default", "basic"].includes(normalized)) {
+    return "Cấu hình tiêu chuẩn";
+  }
+  if (["vip", "premium", "pro"].includes(normalized)) {
+    return "Cấu hình nâng cao";
+  }
+  if (["lowrisk", "safe", "conservative"].includes(normalized)) {
+    return "Cấu hình thận trọng";
+  }
+  if (["highrisk", "aggressive"].includes(normalized)) {
+    return "Cấu hình tăng trưởng";
+  }
+  return `Cấu hình ${String(value || "").trim()}`;
+}
+
 export function entitlementMatchesBot(
   entitlement: MT5BotTokenEntitlement,
   bot: MT5BotCatalogItem | null
@@ -176,14 +196,14 @@ export function humanizeDeploymentProgress(
   }
 
   if (status === "start_requested") {
-    if (health === "starting") return "Đang bật bot, vui lòng đợi thêm chút...";
-    return "Đang bắt đầu, vui lòng đợi thêm chút...";
+    if (health === "starting") return "Đang bật bot, đợi thêm chút...";
+    return "Đang bắt đầu, đợi thêm chút...";
   }
 
   if (status === "starting") {
     if (health === "executor_preparing") return "Đang mở terminal và kết nối sàn...";
     if (health === "executor_ready") return "Bot đã sẵn sàng, đang chờ tín hiệu...";
-    if (health === "starting") return "Đang bật bot, vui lòng đợi thêm chút...";
+    if (health === "starting") return "Đang bật bot, đợi thêm chút...";
     return "Đang khởi động bot...";
   }
 
@@ -191,7 +211,7 @@ export function humanizeDeploymentProgress(
     if (health === "executor_stopping") return "Đang đóng lệnh và tắt bot...";
     if (health === "config_update_restart_requested") return "Đang tắt để cập nhật cài đặt...";
     if (health === "replacement_stop_requested") return "Đang chuyển sang phiên mới...";
-    if (health === "stop_requested") return "Đang tắt bot, vui lòng đợi thêm chút...";
+    if (health === "stop_requested") return "Đang tắt bot, đợi thêm chút...";
     return "Đang tắt bot...";
   }
 

@@ -54,7 +54,7 @@ KEYWORD_FILES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (("sticky slot", "slot"), ("runtime/sticky_slot.md",)),
     (("deployment", "start bot", "stop bot"), ("runtime/deployment_lifecycle.md",)),
     (("common error", "authorization failed", "order_send", "autotrading"), ("runtime/common_errors.md", "common_mt5_errors.md")),
-    (("xauusd", "gold", "vang"), ("trading/xauusd.md",)),
+    (("xauusd", "gold", "vang"), ("trading/xau_usd.md",)),
     (("eurusd",), ("trading/eurusd.md",)),
     (("lot",), ("trading/lot_calculation.md", "lot_margin_spread_swap.md")),
     (("swap", "qua dem", "overnight"), ("trading/swap_explainer.md", "lot_margin_spread_swap.md")),

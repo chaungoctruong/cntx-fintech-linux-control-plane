@@ -2,6 +2,7 @@
 
 import {
   entitlementMatchesBot,
+  formatBotProfileClass,
   formatBotDisplayName,
   getLatestDeploymentForAccount,
   isActiveDeploymentStatus,
@@ -80,7 +81,7 @@ export function useMt5BotDerivedState({
     selectedDeployment?.bot_name || selectedDeployment?.bot_code
       ? selectedDeploymentBotName
       : formatBotDisplayName(selectedBot?.display_name || selectedBot?.bot_name) || "Chưa chọn bot";
-  const selectedBotProfile = selectedDeployment?.profile_class || selectedBot?.profile_class || "Chưa có profile";
+  const selectedBotProfile = formatBotProfileClass(selectedDeployment?.profile_class || selectedBot?.profile_class);
   const activeBotEntitlement =
     selectedAccount == null
       ? null
@@ -92,7 +93,7 @@ export function useMt5BotDerivedState({
         ) ?? null;
   const botAccessReady = mt5FullAccess || Boolean(activeBotEntitlement);
   const actionHint = telegramUserHasOtherActiveBot
-    ? "Telegram ID này đang có bot hoạt động. Hãy tắt bot hiện tại trước khi bật bot khác."
+    ? "Tài khoản Telegram này đang có bot hoạt động. Tắt bot hiện tại trước khi bật bot khác."
     : getActionHint({
         selectedAccount,
         selectedBot,

@@ -12,6 +12,15 @@ from app.services.control_plane_service import MT5ControlPlaneService
 router = APIRouter(prefix="/public/tradingview", tags=["public-tradingview"])
 log = logging.getLogger(__name__)
 
+_TRADINGVIEW_SIGNAL_ALIASES = {
+    "gsalarm-xauusd": "gsalgovip-xauusd",
+}
+
+
+def _canonical_tradingview_signal_id(signal_id: str) -> str:
+    raw = str(signal_id or "").strip()
+    return _TRADINGVIEW_SIGNAL_ALIASES.get(raw.lower(), raw)
+
 
 def _tradingview_secret_header(*, x_secret: str | None, authorization: str | None) -> str:
     explicit = str(x_secret or "").strip()
@@ -61,12 +70,14 @@ async def _dispatch_broadcast_request(
     path_signal_id: str = "",
 ) -> dict[str, Any]:
     body = await _json_object_body(request)
-    signal_id = str(path_signal_id or "").strip()
+    signal_id = _canonical_tradingview_signal_id(path_signal_id)
     if signal_id:
         body_signal_id = str(body.get("signal_id") or "").strip()
-        if body_signal_id and body_signal_id != signal_id:
+        if body_signal_id and _canonical_tradingview_signal_id(body_signal_id) != signal_id:
             raise HTTPException(status_code=400, detail="tradingview_signal_id_mismatch")
         body = {**body, "signal_id": signal_id}
+    elif body.get("signal_id"):
+        body = {**body, "signal_id": _canonical_tradingview_signal_id(str(body.get("signal_id") or ""))}
     try:
         return await service.dispatch_tradingview_broadcast(
             body=body,
@@ -153,7 +164,7 @@ async def tradingview_broadcast_for_signal(
     """Dedicated TradingView URL for one signal_id.
 
     Example:
-      /api/v2/public/tradingview/broadcast/gsalgovip-xauusd
+      /api/v2/public/tradingview/broadcast/Gsalarm-xauusd
 
     The JSON body may omit signal_id. If it includes signal_id, it must match
     the path to avoid accidentally routing a signal to the wrong product.

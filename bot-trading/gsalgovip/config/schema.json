@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://cntx.labs/spider/bot-trading/gsalgovip/config.schema.json",
-  "title": "GsAlgoVIP Config Schema",
-  "description": "Public, secret-free configuration contract for the GsAlgoVIP bot package. Secrets (WEBHOOK_SECRET, MT5_PASSWORD, TELEGRAM_*) MUST come from platform runtime context, never from this file.",
+  "title": "Gs Algo Config Schema",
+  "description": "Public, secret-free configuration contract for the Gs Algo bot package. Secrets (WEBHOOK_SECRET, MT5_PASSWORD, TELEGRAM_*) MUST come from platform runtime context, never from this file.",
   "type": "object",
   "additionalProperties": false,
   "required": [

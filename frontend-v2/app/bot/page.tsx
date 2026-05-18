@@ -122,11 +122,11 @@ const brokerPresets: BrokerPreset[] = [
 ];
 
 const IC_MARKETS_API_LANE_COPY = {
-  title: "IC Markets API Lane",
-  lead: "Hạ tầng thực thi tốc độ cao dành cho bot API, scalping và chiến lược HFT có kiểm soát.",
+  title: "IC Markets API",
+  lead: "Kết nối tốc độ cao cho bot API, scalping và chiến lược cần phản hồi nhanh.",
   paragraphs: [
-    "API Lane được thiết kế như một tuyến giao dịch riêng, nơi tín hiệu, lệnh và quản trị rủi ro được xử lý qua lớp API thay vì phụ thuộc hoàn toàn vào EA hoặc terminal MT5 truyền thống. Cách tiếp cận này giúp giảm độ trễ trung gian, tăng tốc độ phản hồi và hỗ trợ các chiến lược cần xử lý tín hiệu liên tục ở cấp mili-giây.",
-    "Phù hợp cho scalping, signal automation, copy execution, bot tần suất cao và các mô hình giao dịch cần tốc độ thực thi ổn định, kiểm soát lệnh chính xác và khả năng giám sát rủi ro theo thời gian thực.",
+    "Kết nối này xử lý tín hiệu, lệnh và quản trị rủi ro qua API, giúp giảm độ trễ và phản hồi nhanh hơn so với cách vận hành MT5 truyền thống.",
+    "Phù hợp cho scalping, bot tín hiệu, copy execution và các chiến lược cần tốc độ thực thi ổn định, kiểm soát lệnh rõ ràng và giám sát rủi ro theo thời gian thực.",
   ],
 };
 
@@ -151,10 +151,10 @@ type CTraderOnboardingTarget = "account_list" | "selection" | "control";
 
 const MT5_LOGIN_SLOT_PHASE_LABEL: Record<Mt5LoginSlotPhase, string> = {
   SUBMITTED: "Đang lưu thông tin...",
-  ASSIGNED: "Đang chuẩn bị account...",
+  ASSIGNED: "Đang chuẩn bị tài khoản...",
   LOGIN_IN_PROGRESS: "Đang đăng nhập MT5...",
-  READY: "Đã lưu account thành công.",
-  FAILED: "MT5 báo lỗi đăng nhập.",
+  READY: "Đã lưu tài khoản thành công.",
+  FAILED: "Không đăng nhập được MT5.",
 };
 
 type FormState = {
@@ -167,43 +167,79 @@ type FormState = {
 
 function getErrorMessage(error: unknown): string {
   const backendCode = getBackendErrorCode(error);
+  if (backendCode === "login_slot_poll_timeout") {
+    return "Đăng nhập MT5 mất nhiều thời gian hơn bình thường. Đợi ít phút rồi thử lại.";
+  }
+  if (backendCode === "login_reservation_id_missing") {
+    return "Hệ thống chưa tạo được phiên đăng nhập MT5. Đợi ít phút rồi thử lại.";
+  }
+  if (backendCode === "mt5_login_failed") {
+    return "Không đăng nhập được MT5. Kiểm tra server, số tài khoản và mật khẩu rồi thử lại.";
+  }
   if (backendCode === "account_quota_exceeded") {
-    return "Bạn đã đạt giới hạn số tài khoản MT5 của gói hiện tại. Hãy xóa tài khoản cũ hoặc liên hệ hỗ trợ để mở thêm slot.";
+    return "Gói hiện tại đã đạt giới hạn tài khoản MT5. Xóa tài khoản cũ hoặc liên hệ hỗ trợ để mở thêm.";
   }
   if (error instanceof Error) {
     const detail = error.message.trim();
+    const normalizedDetail = detail.toLowerCase().replace(/[-\s]+/g, "_");
+    if (
+      normalizedDetail.includes("login_slot_timeout") ||
+      normalizedDetail.includes("terminal_log_ready_timeout") ||
+      normalizedDetail.includes("log_ready_timeout")
+    ) {
+      return "Đăng nhập MT5 mất nhiều thời gian hơn bình thường. Đợi ít phút rồi thử lại.";
+    }
+    if (
+      normalizedDetail.includes("login_returned_false") ||
+      normalizedDetail.includes("login_mismatch") ||
+      normalizedDetail.includes("invalid_account") ||
+      normalizedDetail.includes("invalid_password") ||
+      normalizedDetail.includes("authorization_failed") ||
+      normalizedDetail.includes("mt5_login_failed")
+    ) {
+      return "Không đăng nhập được MT5. Kiểm tra server, số tài khoản và mật khẩu rồi thử lại.";
+    }
+    if (
+      normalizedDetail.includes("runner_full") ||
+      normalizedDetail.includes("no_scheduler_candidate") ||
+      normalizedDetail.includes("no_available_unreserved_slot") ||
+      normalizedDetail.includes("no_healthy_slot_available") ||
+      normalizedDetail.includes("no_available_healthy_slot")
+    ) {
+      return "Hệ thống đang hết phiên MT5 trống. Đợi ít phút rồi thử lại.";
+    }
     if (detail === "account_quota_exceeded") {
-      return "Bạn đã đạt giới hạn số tài khoản MT5 của gói hiện tại. Hãy xóa tài khoản cũ hoặc liên hệ hỗ trợ để mở thêm slot.";
+      return "Gói hiện tại đã đạt giới hạn tài khoản MT5. Xóa tài khoản cũ hoặc liên hệ hỗ trợ để mở thêm.";
     }
     if (detail === "account_discovery_in_progress") {
-      return "Hệ thống đang đồng bộ tài khoản cTrader. Vui lòng chờ vài giây rồi thử lại.";
+      return "Hệ thống đang đồng bộ tài khoản cTrader. Chờ vài giây rồi thử lại.";
     }
     if (detail === "ctrader_token_rate_limited") {
-      return "cTrader đang giới hạn tần suất xác thực. Vui lòng đợi một chút rồi thử lại.";
+      return "cTrader đang giới hạn tần suất xác thực. Đợi một chút rồi thử lại.";
     }
     if (detail === "ctrader_backend_timeout") {
-      return "Kết nối tới cTrader đang chậm. Vui lòng thử lại sau ít phút.";
+      return "Kết nối tới cTrader đang chậm. Thử lại sau ít phút.";
     }
     if (detail === "ctrader_backend_unreachable") {
-      return "Lane cTrader tạm thời chưa phản hồi. Vui lòng thử lại sau.";
+      return "Kết nối cTrader tạm thời chưa phản hồi. Thử lại sau ít phút.";
     }
     if (detail === "ctrader_service_timeout") {
-      return "Dịch vụ cTrader đang phản hồi chậm. Vui lòng thử lại sau ít phút.";
+      return "Dịch vụ cTrader đang phản hồi chậm. Thử lại sau ít phút.";
     }
     if (detail === "ctrader_service_unavailable") {
-      return "Dịch vụ cTrader đang tạm gián đoạn. Vui lòng thử lại sau.";
+      return "Dịch vụ cTrader đang tạm gián đoạn. Thử lại sau ít phút.";
     }
     if (detail === "deployment_already_active") {
-      return "Tài khoản này đã có deployment cTrader beta đang bật.";
+      return "Tài khoản này đang có bot cTrader beta hoạt động.";
     }
     if (detail === "deployment_not_running") {
-      return "Deployment cTrader hiện không ở trạng thái đang chạy.";
+      return "Bot cTrader hiện không ở trạng thái đang chạy.";
     }
     if (detail === "deployment_not_found") {
-      return "Deployment cTrader không còn tồn tại. Hãy làm mới trạng thái rồi thử lại.";
+      return "Không còn thấy phiên bot cTrader này. Làm mới trạng thái rồi thử lại.";
     }
     if (detail === "deployment_already_active_with_different_config") {
-      return "Tài khoản này đã có deployment beta với cấu hình khác. Hãy dừng deployment cũ trước.";
+      return "Tài khoản này đang có bot beta với cấu hình khác. Dừng bot cũ trước.";
     }
     if (detail === "contract_bot_not_found") {
       return "Bot cTrader này hiện không còn khả dụng trong public beta.";
@@ -212,22 +248,22 @@ function getErrorMessage(error: unknown): string {
       return "Bot mẫu không thể bật trong môi trường public.";
     }
     if (detail === "deployment_symbol_missing") {
-      return "Deployment cTrader này chưa có symbol cấu hình để đánh giá.";
+      return "Bot cTrader này chưa có mã giao dịch để đánh giá.";
     }
     if (detail === "ctrader_symbol_not_found") {
-      return "Không tìm thấy symbol cấu hình trên tài khoản cTrader hiện tại.";
+      return "Không tìm thấy mã giao dịch trên tài khoản cTrader hiện tại.";
     }
     if (detail === "ctrader_symbol_name_required") {
-      return "Bot cTrader đang thiếu symbol cấu hình để lấy dữ liệu thị trường.";
+      return "Bot cTrader đang thiếu mã giao dịch để lấy dữ liệu thị trường.";
     }
     if (detail.includes("does not exist")) {
-      return "Kết nối hoặc tài khoản đã thay đổi. Hãy làm mới danh sách và thử lại.";
+      return "Kết nối hoặc tài khoản đã thay đổi. Làm mới danh sách rồi thử lại.";
     }
     if (detail.includes("OAuth callback state could not be validated")) {
-      return "Phiên kết nối cTrader đã hết hạn. Hãy quay lại và kết nối lại từ đầu.";
+      return "Phiên kết nối cTrader đã hết hạn. Quay lại và kết nối lại từ đầu.";
     }
     if (detail.startsWith("ctrader_backend_")) {
-      return "Dịch vụ cTrader đang tạm gián đoạn. Vui lòng thử lại sau.";
+      return "Dịch vụ cTrader đang tạm gián đoạn. Thử lại sau ít phút.";
     }
     return detail;
   }
@@ -245,11 +281,11 @@ function formatBrokerLabel(value?: string | null): string {
 function formatCTraderLimitationLabel(value: string): string {
   switch (value) {
     case "session_pool_multi_worker_coordination_not_implemented":
-      return "Runtime cTrader chưa mở điều phối đa worker.";
+      return "cTrader chưa mở chế độ chạy nhiều phiên cùng lúc.";
     case "bot_execution_orchestrator_not_implemented":
       return "Public beta hiện hỗ trợ arm, đánh giá thủ công và audit; vòng tự trade liên tục vẫn chưa mở.";
     case "template_only_contract_catalog":
-      return "Catalog hiện chỉ có bot mẫu, chưa có bot public khả dụng.";
+      return "Danh sách hiện chỉ có bot mẫu, chưa có bot public khả dụng.";
     case "no_ctrader_contract_bots_found":
       return "Chưa có bot cTrader public nào sẵn sàng.";
     default:
@@ -454,7 +490,7 @@ function formatDateLabel(value?: string | null): string {
 
 function formatExpiryLabel(value?: string | null): string {
   if (!value) {
-    return "Không rõ hạn token";
+    return "Không rõ hạn mã";
   }
 
   const parsed = new Date(value);
@@ -1336,7 +1372,7 @@ export default function BotPage() {
     if (loadingMt5Bots) {
       setNotice({
         tone: "info",
-        message: "Đang tải danh sách bot. Vui lòng chờ một chút.",
+        message: "Đang tải danh sách bot. Chờ một chút.",
       });
       return;
     }
@@ -1344,7 +1380,7 @@ export default function BotPage() {
     if (!selectedMt5Bot) {
       setNotice({
         tone: "error",
-        message: "Vui lòng chọn bot trước khi đăng nhập tài khoản MT5.",
+        message: "Chọn bot trước khi đăng nhập tài khoản MT5.",
       });
       return;
     }
@@ -1352,7 +1388,7 @@ export default function BotPage() {
     if (mt5BotTokenRequired && !mt5BotToken) {
       setNotice({
         tone: "error",
-        message: "Vui lòng nhập token bot trước khi đăng nhập tài khoản MT5.",
+        message: "Nhập mã kích hoạt trước khi đăng nhập tài khoản MT5.",
       });
       return;
     }
@@ -1376,7 +1412,7 @@ export default function BotPage() {
     if (!payload.broker) {
       setNotice({
         tone: "error",
-        message: "Vui lòng chọn sàn giao dịch trước khi kết nối tài khoản MT5.",
+        message: "Chọn sàn giao dịch trước khi kết nối tài khoản MT5.",
       });
       return;
     }
@@ -1384,7 +1420,7 @@ export default function BotPage() {
     if (!payload.server || !payload.login || !payload.password) {
       setNotice({
         tone: "error",
-        message: "Vui lòng nhập đầy đủ server, tài khoản và mật khẩu MT5.",
+        message: "Nhập đầy đủ server, số tài khoản và mật khẩu MT5.",
       });
       return;
     }
@@ -1405,7 +1441,7 @@ export default function BotPage() {
         : await requestMt5AccountLoginSlot({ account_id: connected.account_id });
       const loginReservationId = Number(loginSlotStarted.login_reservation_id ?? loginSlotStarted.id ?? 0);
       if (!loginReservationId) {
-        throw new BackendAPIError("Backend không trả login_reservation_id sau khi giữ slot đăng nhập.", {
+        throw new BackendAPIError("Hệ thống chưa tạo được phiên đăng nhập MT5. Đợi ít phút rồi thử lại.", {
           status: 502,
           code: "login_reservation_id_missing",
         });
@@ -1435,7 +1471,7 @@ export default function BotPage() {
           if (!mt5FullAccess && !claimedEntitlementId) {
             setNotice({
               tone: "error",
-              message: "Token đã được kiểm tra nhưng chưa mở được quyền bot. Vui lòng thử lại.",
+              message: "Mã đã được kiểm tra nhưng chưa mở được quyền bot. Thử lại sau ít phút.",
             });
             return;
           }
@@ -1483,7 +1519,7 @@ export default function BotPage() {
     if (!telegramTenantUserId) {
       setNotice({
         tone: "error",
-        message: "Lane cTrader cần Telegram user id. Hãy mở mini app trực tiếp trong Telegram rồi thử lại.",
+        message: "Mở Mini App trực tiếp trong Telegram rồi thử lại.",
       });
       return;
     }
@@ -1525,7 +1561,7 @@ export default function BotPage() {
     if (!telegramTenantUserId || !ctraderConnection) {
       setNotice({
         tone: "error",
-        message: "Chưa có connection cTrader để làm mới token.",
+        message: "Chưa có kết nối cTrader để làm mới.",
       });
       return;
     }
@@ -1604,7 +1640,7 @@ export default function BotPage() {
     if (!selectedCTraderAccount) {
       setNotice({
         tone: "error",
-        message: "Hãy chọn một tài khoản trước.",
+        message: "Chọn một tài khoản trước.",
       });
       return;
     }
@@ -1638,7 +1674,7 @@ export default function BotPage() {
       writeStoredCTraderAccountId(telegramTenantUserId, selectedCTraderAccount.id);
       setNotice({
         tone: "success",
-        message: "Đã lưu account.",
+        message: "Đã lưu tài khoản.",
       });
     } catch (error) {
       setNotice({
@@ -1659,7 +1695,7 @@ export default function BotPage() {
     if (!activeCTraderDeployment) {
       setNotice({
         tone: "error",
-        message: "Hãy bật deployment cTrader beta trước khi đánh giá.",
+        message: "Bật bot cTrader beta trước khi đánh giá.",
       });
       return;
     }
@@ -1698,7 +1734,7 @@ export default function BotPage() {
     if (!ctraderConnection || !selectedCTraderAccount) {
       setNotice({
         tone: "error",
-        message: "Hãy kết nối và chọn tài khoản cTrader trước.",
+        message: "Kết nối và chọn tài khoản cTrader trước.",
       });
       return;
     }
@@ -1749,7 +1785,7 @@ export default function BotPage() {
         tone: "success",
         message:
           result.start_status === "already_armed"
-            ? "Deployment cTrader beta đã được bật trước đó."
+            ? "Bot cTrader beta đã được bật trước đó."
             : "Đã bật bot cho tài khoản này.",
       });
     } catch (error) {
@@ -1928,7 +1964,7 @@ export default function BotPage() {
 	                          <div className="flex items-center gap-2 text-cyan-100">
 	                            <Bot className="h-4 w-4" strokeWidth={1.9} />
 	                            <p className="text-sm font-semibold uppercase tracking-[0.18em]">
-	                              {mt5BotTokenRequired ? "Chọn bot và token" : "Chọn bot"}
+	                              {mt5BotTokenRequired ? "Chọn bot và mã" : "Chọn bot"}
 	                            </p>
 	                          </div>
 
@@ -1946,8 +1982,8 @@ export default function BotPage() {
                                       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                                         <span>
                                           {mt5Bots.length > 0
-                                            ? "Chưa tải được bản mới của danh sách bot. Mini App đang giữ danh sách đã tải để không làm mất token."
-                                            : "Chưa tải được danh sách bot. Token vẫn được khóa cho tới khi chọn được bot."}
+                                            ? "Chưa tải được danh sách bot mới. Mini App vẫn giữ dữ liệu gần nhất để không gián đoạn thao tác."
+                                            : "Chưa tải được danh sách bot. Mã kích hoạt và nút bật bot sẽ mở lại khi danh sách sẵn sàng."}
                                         </span>
                                         <button
                                           type="button"
@@ -1999,21 +2035,21 @@ export default function BotPage() {
                                   {mt5BotTokenRequired ? (
                                     <label className="space-y-2">
                                       <span className="text-xs font-semibold uppercase tracking-[0.18em] text-cyber-muted">
-                                        Token bot
+                                        Mã kích hoạt bot
                                       </span>
                                       <input
                                         className={`${inputClassName} disabled:cursor-not-allowed disabled:opacity-70`}
                                         type="password"
                                         value={mt5BotTokenInput}
                                         onChange={(event) => setMt5BotTokenInput(event.target.value)}
-                                        placeholder={selectedMt5Bot ? "Dán token bạn nhận được" : "Chọn bot trước rồi nhập token"}
+                                        placeholder={selectedMt5Bot ? "Dán mã kích hoạt bạn nhận được" : "Chọn bot trước rồi nhập mã"}
                                         autoComplete="off"
                                         disabled={!selectedMt5Bot}
                                       />
                                     </label>
                                   ) : (
                                     <div className="rounded-2xl border border-emerald-300/20 bg-emerald-300/10 px-4 py-3 text-sm leading-6 text-emerald-100">
-                                      User này đã được mở quyền Mini App, không cần nhập token.
+                                      Tài khoản Telegram này đã được mở quyền, không cần nhập mã.
                                     </div>
                                   )}
                                 </div>
@@ -2029,8 +2065,8 @@ export default function BotPage() {
 	                          </div>
 	                          <p className="mt-2 text-sm leading-6 text-cyber-muted">
 	                            {mt5BotTokenRequired
-	                              ? "Hoàn tất bot và token trước, sau đó nhập thông tin MT5 để lưu account."
-	                              : "Chọn bot trước, sau đó nhập thông tin MT5 để lưu account."}
+	                              ? "Chọn bot và nhập mã kích hoạt, sau đó đăng nhập MT5."
+	                              : "Chọn bot trước, sau đó đăng nhập MT5."}
 	                          </p>
 	                        </div>
 
@@ -2301,7 +2337,7 @@ export default function BotPage() {
                             <div>
                               <p className="text-sm font-semibold text-white">{brokerDisplayName}</p>
                               <p className="mt-1 text-xs text-emerald-100">
-                                {ctraderConnection.status || "active"} · {ctraderAccounts.length} account
+                                {ctraderConnection.status || "Đang hoạt động"} · {ctraderAccounts.length} tài khoản
                               </p>
                             </div>
                             <button
@@ -2318,7 +2354,7 @@ export default function BotPage() {
                               ) : (
                                 <>
                                   <RefreshCcw className="h-4 w-4" strokeWidth={1.9} />
-                                  Sync
+                                  Làm mới
                                 </>
                               )}
                             </button>
@@ -2332,7 +2368,7 @@ export default function BotPage() {
                               <div className="flex items-center justify-between gap-3">
                                 <div>
                                   <p className="text-sm font-semibold uppercase tracking-[0.18em] text-cyan-100">
-                                    3. Chọn account
+                                    3. Chọn tài khoản
                                   </p>
                                 </div>
                                 <span className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-100">
@@ -2382,7 +2418,7 @@ export default function BotPage() {
                                       <div className="flex items-start justify-between gap-3">
                                         <div className="min-w-0">
                                           <p className="font-semibold text-white">
-                                            {account.broker_name || "cTrader account"}
+                                            {account.broker_name || "Tài khoản cTrader"}
                                           </p>
                                           <p className="mt-1 text-xs leading-5 text-cyber-muted">
                                             Login {account.account_number || "N/A"} · ID {account.external_account_id}
