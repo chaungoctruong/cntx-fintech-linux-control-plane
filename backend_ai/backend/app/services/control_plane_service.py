@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import logging
+import re
 from functools import lru_cache
 import secrets
 import time
@@ -24,6 +25,11 @@ from app.events.runner_event_ingest import RunnerEventIngestService
 from app.models.control_plane import ACTIVE_DEPLOYMENT_STATUSES, CommandType
 from app.monitoring.control_plane_metrics import ControlPlaneMetricsService
 from app.monitoring.control_plane_reconciler import ControlPlaneReconcilerService
+from app.orchestration.broker_routing import (
+    broker_route_policy_from_settings,
+    canonical_broker_key,
+    parse_broker_aliases,
+)
 from app.orchestration.deployment_config import (
     TRADING_CONFIG_SCHEMA_VERSION,
     TRADING_CONFIG_KEY,
@@ -67,7 +73,7 @@ _ADMIN_QUOTA_LIMITS = {
 }
 _DBG_MARKETS_FIXED_SERVER = "DBGMarkets-Live"
 _GSALGO_DISPLAY_NAME = "Gs Algo"
-_GSALGO_DISPLAY_IDENTITIES = {"gsalgo", "gsalgomt5bot"}
+_GSALGO_DISPLAY_IDENTITIES = {"gsalgovip", "gsalgo", "gsalgomt5bot"}
 
 
 def _bot_control_cooldown_sec() -> int:
@@ -527,6 +533,71 @@ def _filter_runner_bot_catalog_payload(value: Any) -> Any:
             if str(item.get("bot_code") or item.get("bot_id") or "").strip()
         ]
     return catalog
+
+
+def _bot_supported_broker_keys(bot: Optional[dict[str, Any]]) -> set[str]:
+    if not bot:
+        return set()
+    aliases = parse_broker_aliases(getattr(settings, "MT5_BROKER_ROUTE_ALIASES", ""))
+    out: set[str] = set()
+    sources: list[dict[str, Any]] = []
+    for source in (
+        bot,
+        bot.get("resource_hints"),
+        bot.get("runtime_env"),
+        bot.get("metadata"),
+        bot.get("metadata_json"),
+    ):
+        if isinstance(source, dict):
+            sources.append(source)
+
+    for source in sources:
+        for key in (
+            "supported_brokers",
+            "supported_broker_keys",
+            "broker_keys",
+            "brokers",
+            "allowed_brokers",
+            "allowed_broker_keys",
+        ):
+            raw_value = source.get(key)
+            values = _as_string_list(raw_value)
+            if not values and isinstance(raw_value, str):
+                values = [part.strip() for part in re.split(r"[,|\n;]+", raw_value) if part.strip()]
+            for item in values:
+                if item == "*":
+                    out.add("*")
+                    continue
+                broker_key = canonical_broker_key(item, aliases)
+                if broker_key:
+                    out.add(broker_key)
+    return out
+
+
+def _bot_supports_account_broker(bot: Optional[dict[str, Any]], account: Optional[dict[str, Any]]) -> bool:
+    allowed = _bot_supported_broker_keys(bot)
+    if not allowed or "*" in allowed:
+        return True
+    policy = broker_route_policy_from_settings(account=account or {}, settings_obj=settings)
+    aliases = policy.aliases or {
+        key: frozenset(values)
+        for key, values in parse_broker_aliases(getattr(settings, "MT5_BROKER_ROUTE_ALIASES", "")).items()
+    }
+    candidates = {
+        policy.route_key,
+        canonical_broker_key((account or {}).get("broker"), aliases),
+        canonical_broker_key((account or {}).get("server"), aliases),
+        canonical_broker_key(
+            f"{(account or {}).get('broker') or ''} {(account or {}).get('server') or ''}",
+            aliases,
+        ),
+    }
+    return bool(allowed.intersection({item for item in candidates if item}))
+
+
+def _raise_if_bot_broker_incompatible(bot: Optional[dict[str, Any]], account: Optional[dict[str, Any]]) -> None:
+    if not _bot_supports_account_broker(bot, account):
+        raise OrchestrationPolicyError("bot_not_available_for_broker")
 
 
 def _runner_catalog_is_authoritative(bot_catalog: Any) -> bool:
@@ -1177,6 +1248,7 @@ class MT5ControlPlaneService:
         decision = self._deployment_manager._pick_slot(
             account_id=int(account_id),
             bot={"profile_class": "normal", "strategy_tags": [], "resource_hints": {}},
+            account=account,
         )
         if not decision.ok:
             raise OrchestrationPolicyError(decision.reason or "no_scheduler_candidate")
@@ -1427,6 +1499,7 @@ class MT5ControlPlaneService:
             raise ValueError("bot_reserved_for_backend_ctrader")
         if not _is_user_visible_catalog_bot(bot):
             raise ValueError("bot_not_found")
+        _raise_if_bot_broker_incompatible(bot, account)
 
         active = self._repo.get_active_deployment_for_account(account_id=int(account_id))
         if not active:
@@ -1438,6 +1511,7 @@ class MT5ControlPlaneService:
             bot=bot,
             slots=slots,
             sticky_binding=sticky,
+            broker_route=broker_route_policy_from_settings(account=account, settings_obj=settings),
         )
         selected = dict(preview.get("selected") or {})
         ok = bool(preview.get("ok"))
@@ -1469,6 +1543,10 @@ class MT5ControlPlaneService:
     def select_bot(self, *, telegram_id: str, username: Optional[str], account_id: int, bot_name: str, bot_config_overrides: dict[str, Any]) -> dict[str, Any]:
         user = self.ensure_user(telegram_id=telegram_id, username=username)
         bot = self._assert_user_can_access_bot(bot_name=bot_name)
+        account = self._repo.get_account(account_id=account_id, user_id=int(user["id"]))
+        if not account:
+            raise OrchestrationPolicyError("account_not_found")
+        _raise_if_bot_broker_incompatible(bot, account)
         effective_config = normalize_deployment_config(bot=bot, config=bot_config_overrides)
         draft = self._deployment_manager.select_bot(
             user_id=int(user["id"]),
@@ -1517,6 +1595,7 @@ class MT5ControlPlaneService:
         account = self._repo.get_account(account_id=account_id, user_id=int(user["id"]))
         if not account:
             raise OrchestrationPolicyError("account_not_found")
+        _raise_if_bot_broker_incompatible(bot, account)
         is_admin = _is_admin_telegram_id(telegram_id)
         active_for_account = self._repo.get_active_deployment_for_account(account_id=int(account_id))
         active_status = str((active_for_account or {}).get("status") or "").strip().lower()

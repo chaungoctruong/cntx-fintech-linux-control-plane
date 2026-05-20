@@ -40,5 +40,15 @@ class Settings(BaseSettings):
     backend_url: str | None = None
     backend_internal_key: str | None = None
 
+    partner_weekly_billing_enabled: bool = True
+    partner_billing_timezone: str = "Asia/Ho_Chi_Minh"
+    partner_billing_cycle_days: int = 30
+    partner_billing_notice_weekday: int = 6  # Sunday, Python weekday()
+    partner_billing_notice_hour: int = 18
+    partner_user_fee_usd: int = 15
+    partner_support_block_size: int = 15
+    partner_support_fee_usd: int = 150
+    partner_infra_fee_usd: int = 100
+
     def admin_id_set(self) -> set[int]:
         return {int(x.strip()) for x in self.tg_admin_user_ids.split(",") if x.strip()}

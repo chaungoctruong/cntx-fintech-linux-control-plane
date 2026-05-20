@@ -9,6 +9,7 @@ from app.core.error_log import log_agent_event
 from app.core.redis_client import get_resolved_redis_write_url
 from app.events.command_router import CommandRouterService
 from app.models.control_plane import CommandType
+from app.orchestration.broker_routing import BrokerRoutePolicy, broker_route_policy_from_settings
 from app.orchestration.deployment_config import TRADING_CONFIG_SCHEMA_VERSION, normalize_deployment_config
 from app.orchestration.scheduler import SchedulerDecision, choose_slot_for_account
 from app.repositories.control_plane_repository import ControlPlaneRepository
@@ -247,7 +248,16 @@ class DeploymentManagerService:
         draft["bot"] = bot
         return draft
 
-    def _pick_slot(self, *, account_id: int, bot: dict[str, Any]) -> SchedulerDecision:
+    def _pick_slot(
+        self,
+        *,
+        account_id: int,
+        bot: dict[str, Any],
+        account: dict[str, Any] | None = None,
+        broker_route: BrokerRoutePolicy | None = None,
+    ) -> SchedulerDecision:
+        if broker_route is None and account:
+            broker_route = broker_route_policy_from_settings(account=account, settings_obj=settings)
         slots = _inject_runner_queue_depths(self._repo.list_slots())
         sticky = self._repo.get_current_binding(account_id=account_id)
         return choose_slot_for_account(
@@ -255,6 +265,7 @@ class DeploymentManagerService:
             bot=bot,
             slots=slots,
             sticky_binding=sticky,
+            broker_route=broker_route,
         )
 
     def _start_payload(
@@ -576,7 +587,7 @@ class DeploymentManagerService:
             raise OrchestrationPolicyError("start_transition_in_progress")
 
         self._repo.prepare_sticky_slot_for_reuse(account_id=int(queued["account_id"]))
-        decision = self._pick_slot(account_id=int(queued["account_id"]), bot=bot or {})
+        decision = self._pick_slot(account_id=int(queued["account_id"]), bot=bot or {}, account=account)
         if not decision.ok:
             raise OrchestrationPolicyError(decision.reason or "no_scheduler_candidate")
 
@@ -785,7 +796,7 @@ class DeploymentManagerService:
                 sticky_reused=True,
             )
         else:
-            decision = self._pick_slot(account_id=int(account["id"]), bot=bot or {})
+            decision = self._pick_slot(account_id=int(account["id"]), bot=bot or {}, account=account)
         if not decision.ok and decision.reason == "sticky_slot_unavailable":
             # Public START can arrive in the small window after BOT_STOPPED
             # persisted but before slot projection has fully settled. Reconcile
@@ -796,7 +807,7 @@ class DeploymentManagerService:
             if pending_command:
                 raise OrchestrationPolicyError("start_transition_in_progress")
             self._repo.prepare_sticky_slot_for_reuse(account_id=int(account["id"]))
-            decision = self._pick_slot(account_id=int(account["id"]), bot=bot or {})
+            decision = self._pick_slot(account_id=int(account["id"]), bot=bot or {}, account=account)
             if not decision.ok and decision.reason == "sticky_slot_unavailable":
                 pending_command = self._repo.get_pending_account_start_stop_command(account_id=int(account["id"]))
                 if pending_command:

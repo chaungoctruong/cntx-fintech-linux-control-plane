@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from app.orchestration.broker_routing import BrokerRoutePolicy, runner_slot_supports_broker_route
 from app.risk.orchestration_policy import requires_dedicated_runner
 
 RUNNER_ACTIVE_LIMIT_DEFAULT = 10
@@ -769,6 +770,7 @@ def _slot_block_reason(
     dedicated_required: bool,
     now_dt: datetime,
     heartbeat_ttl_sec: int,
+    broker_route: BrokerRoutePolicy | None = None,
     same_account_sticky_slot: bool = False,
 ) -> Optional[str]:
     if not _slot_within_effective_capacity(slot):
@@ -806,6 +808,8 @@ def _slot_block_reason(
         return queue_reason
     if not _runner_supports_requested_bot(slot, bot):
         return "bot_not_available_on_runner"
+    if not runner_slot_supports_broker_route(slot, broker_route):
+        return "no_compatible_runner_for_broker"
 
     allowed = {str(item).strip().lower() for item in (slot.get("allowed_profile_classes") or []) if str(item).strip()}
     if allowed and requested_profile not in allowed:
@@ -855,6 +859,7 @@ def choose_slot_for_account(
     sticky_binding: Optional[dict[str, Any]],
     now: Optional[datetime] = None,
     heartbeat_ttl_sec: int = 120,
+    broker_route: BrokerRoutePolicy | None = None,
 ) -> SchedulerDecision:
     ranked = rank_slots_for_account(
         account_id=account_id,
@@ -863,6 +868,7 @@ def choose_slot_for_account(
         sticky_binding=sticky_binding,
         now=now,
         heartbeat_ttl_sec=heartbeat_ttl_sec,
+        broker_route=broker_route,
     )
     if ranked:
         return ranked[0]
@@ -882,6 +888,7 @@ def choose_slot_for_account(
                     dedicated_required=dedicated_required,
                     now_dt=now_dt,
                     heartbeat_ttl_sec=heartbeat_ttl_sec,
+                    broker_route=broker_route,
                     same_account_sticky_slot=_slot_matches_sticky_binding(
                         slot,
                         sticky_binding,
@@ -895,6 +902,7 @@ def choose_slot_for_account(
                     "slot_resident_worker_missing",
                     "runner_full",
                     "runner_queue_backlog",
+                    "no_compatible_runner_for_broker",
                     "bot_not_available_on_runner",
                 }:
                     return SchedulerDecision(ok=False, reason=reason)
@@ -912,6 +920,7 @@ def choose_slot_for_account(
                 dedicated_required=requires_dedicated_runner(bot),
                 now_dt=now or datetime.now(timezone.utc),
                 heartbeat_ttl_sec=heartbeat_ttl_sec,
+                broker_route=broker_route,
             )
         ]
         if reason
@@ -921,6 +930,7 @@ def choose_slot_for_account(
         "windows_runtime_unhealthy",
         "slot_not_ipc_ready",
         "slot_resident_worker_missing",
+        "no_compatible_runner_for_broker",
         "runner_full",
         "runner_queue_backlog",
         "runner_offline",
@@ -941,6 +951,7 @@ def rank_slots_for_account(
     sticky_binding: Optional[dict[str, Any]],
     now: Optional[datetime] = None,
     heartbeat_ttl_sec: int = 120,
+    broker_route: BrokerRoutePolicy | None = None,
 ) -> list[SchedulerDecision]:
     now_dt = now or datetime.now(timezone.utc)
     requested_profile = str(bot.get("profile_class") or "normal").strip().lower() or "normal"
@@ -955,6 +966,7 @@ def rank_slots_for_account(
             dedicated_required=dedicated_required,
             now_dt=now_dt,
             heartbeat_ttl_sec=heartbeat_ttl_sec,
+            broker_route=broker_route,
             same_account_sticky_slot=_slot_matches_sticky_binding(
                 slot,
                 sticky_binding,
@@ -1040,6 +1052,7 @@ def preview_slots_for_account(
     sticky_binding: Optional[dict[str, Any]],
     now: Optional[datetime] = None,
     heartbeat_ttl_sec: int = 120,
+    broker_route: BrokerRoutePolicy | None = None,
 ) -> dict[str, Any]:
     """Read-only scheduler preview for ops/UI before dispatching work."""
     now_dt = now or datetime.now(timezone.utc)
@@ -1052,6 +1065,7 @@ def preview_slots_for_account(
         sticky_binding=sticky_binding,
         now=now_dt,
         heartbeat_ttl_sec=heartbeat_ttl_sec,
+        broker_route=broker_route,
     )
     selected = ranked[0] if ranked else choose_slot_for_account(
         account_id=account_id,
@@ -1060,6 +1074,7 @@ def preview_slots_for_account(
         sticky_binding=sticky_binding,
         now=now_dt,
         heartbeat_ttl_sec=heartbeat_ttl_sec,
+        broker_route=broker_route,
     )
     blocked_slots: list[dict[str, Any]] = []
     for slot in slots:
@@ -1071,6 +1086,7 @@ def preview_slots_for_account(
             dedicated_required=dedicated_required,
             now_dt=now_dt,
             heartbeat_ttl_sec=heartbeat_ttl_sec,
+            broker_route=broker_route,
             same_account_sticky_slot=_slot_matches_sticky_binding(
                 slot,
                 sticky_binding,

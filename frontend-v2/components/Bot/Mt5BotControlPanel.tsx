@@ -131,6 +131,7 @@ export default function Mt5BotControlPanel({
     activeBotEntitlement,
     botAccessReady,
     actionHint,
+    brokerBots,
   } = useMt5BotDerivedState({
     selectedBroker,
     selectedAccountId,
@@ -231,25 +232,25 @@ export default function Mt5BotControlPanel({
   }, [filteredAccounts, selectedAccountId]);
 
   useEffect(() => {
-    if (!bots.length) {
+    if (!brokerBots.length) {
       setSelectedBotName("");
       return;
     }
 
-    if (selectedDeployment?.bot_name && bots.some((bot) => bot.bot_name === selectedDeployment.bot_name)) {
+    if (selectedDeployment?.bot_name && brokerBots.some((bot) => bot.bot_name === selectedDeployment.bot_name)) {
       setSelectedBotName(selectedDeployment.bot_name);
       return;
     }
 
-    if (preferredBotName && bots.some((bot) => bot.bot_name === preferredBotName)) {
+    if (preferredBotName && brokerBots.some((bot) => bot.bot_name === preferredBotName)) {
       setSelectedBotName(preferredBotName);
       return;
     }
 
-    if (!bots.some((bot) => bot.bot_name === selectedBotName)) {
-      setSelectedBotName(bots[0]?.bot_name ?? "");
+    if (!brokerBots.some((bot) => bot.bot_name === selectedBotName)) {
+      setSelectedBotName(brokerBots[0]?.bot_name ?? "");
     }
-  }, [bots, preferredBotName, selectedBotName, selectedDeployment?.bot_name]);
+  }, [brokerBots, preferredBotName, selectedBotName, selectedDeployment?.bot_name]);
 
   useEffect(() => {
     void loadBotTokenEntitlements(selectedAccount?.id ?? null, { silentErrors: true });
@@ -386,19 +387,27 @@ export default function Mt5BotControlPanel({
                 <span className="text-xs font-semibold uppercase tracking-[0.18em] text-cyber-muted">
                   Chọn bot
                 </span>
-                <button
-                  type="button"
-                  className={`${selectClassName} flex min-h-[50px] items-center gap-2 text-left font-semibold disabled:cursor-not-allowed disabled:opacity-60`}
-                  disabled={controlsLocked}
-                  onClick={() => {
-                    if (!selectedBot) return;
-                    setSelectedBotName(selectedBot.bot_name);
-                    onSelectedBotChange?.(selectedBot.bot_name);
+                <select
+                  className={`${selectClassName} min-h-[50px] font-semibold disabled:cursor-not-allowed disabled:opacity-60`}
+                  value={selectedBot?.bot_name ?? ""}
+                  disabled={controlsLocked || brokerBots.length === 0}
+                  onChange={(event) => {
+                    setSelectedBotName(event.target.value);
+                    onSelectedBotChange?.(event.target.value);
                   }}
                 >
-                  <span>{selectedBot?.display_name || "Gs Algo"}</span>
-                </button>
+                  {brokerBots.map((bot) => (
+                    <option key={bot.bot_id || bot.bot_name} value={bot.bot_name}>
+                      {bot.display_name}
+                    </option>
+                  ))}
+                </select>
               </label>
+              {brokerBots.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-white/10 bg-transparent px-4 py-3 text-xs leading-5 text-cyber-muted">
+                  Chưa có bot nào khả dụng cho sàn {selectedBroker}.
+                </div>
+              ) : null}
               {botCatalogError ? (
                 <div className="rounded-2xl border border-amber-300/20 bg-amber-300/10 px-4 py-3 text-xs leading-5 text-amber-100">
                   {bots.length > 0

@@ -155,7 +155,7 @@ async def token_bot_internal_list_partner_tokens(
     partner_id: str,
     scope: str = Query(default="all"),
     query: Optional[str] = Query(default=None, max_length=120),
-    limit: int = Query(default=500, ge=1, le=500),
+    limit: int = Query(default=500, ge=1, le=5000),
     _: None = Depends(require_internal_key),
     licenses: BotTokenLicenseService = Depends(bot_token_license_dep),
 ) -> dict[str, Any]:

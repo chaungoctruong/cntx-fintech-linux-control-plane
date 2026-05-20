@@ -3,7 +3,10 @@ import base64
 import html
 import json
 import logging
+import math
 from datetime import datetime, timedelta
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -24,7 +27,16 @@ from .config import Settings
 from .crypto import BotCipher
 from .db import ensure_schema_patches, make_engine, make_session_factory
 from . import force_stop_retry
-from .models import Base, Partner, PartnerBotGrant, Token
+from .models import (
+    Base,
+    Partner,
+    PartnerBillingNotice,
+    PartnerBillingSnapshot,
+    PartnerBotGrant,
+    PartnerMember,
+    PartnerPaymentProof,
+    Token,
+)
 from . import state_mirror
 from .token_service import TokenService
 
@@ -34,15 +46,160 @@ log = logging.getLogger("token-bot.tg")
 
 # ───────────────────────── helpers ─────────────────────────
 
+PARTNER_MEMBER_ROLES = {"owner", "operator", "accountant", "viewer"}
+PARTNER_ROLE_LABELS = {
+    "owner": "Chủ đối tác",
+    "operator": "Vận hành",
+    "accountant": "Kế toán",
+    "viewer": "Chỉ xem",
+}
+PARTNER_ROLE_PERMISSIONS = {
+    "token_write": {"owner", "operator"},
+    "billing_pay": {"owner", "accountant"},
+    "billing_view": {"owner", "operator", "accountant", "viewer"},
+    "view": {"owner", "operator", "accountant", "viewer"},
+}
+
+
+def _normalize_partner_member_role(role: str | None) -> str:
+    value = str(role or "").strip().lower()
+    return value if value in PARTNER_MEMBER_ROLES else "operator"
+
+
+def _partner_role_label(role: str | None) -> str:
+    return PARTNER_ROLE_LABELS.get(_normalize_partner_member_role(role), "Vận hành")
+
+
+def _partner_can(member_role: str | None, permission: str) -> bool:
+    return _normalize_partner_member_role(member_role) in PARTNER_ROLE_PERMISSIONS.get(permission, set())
+
+
+def _partner_permission_denied_text(member_role: str | None, action_text: str) -> str:
+    return (
+        f"Vai trò hiện tại của bạn là <b>{_h(_partner_role_label(member_role))}</b>.\n"
+        f"Vai trò này chưa được phép {action_text}."
+    )
+
+
+def _member_label_from_parts(
+    telegram_user_id: int | str | None,
+    telegram_username: str | None = None,
+    role: str | None = None,
+) -> str:
+    username = str(telegram_username or "").strip().lstrip("@")
+    tg_id = str(telegram_user_id or "").strip()
+    base = f"@{username}" if username else (f"tg:{tg_id}" if tg_id else "Không rõ")
+    role_label = _partner_role_label(role)
+    return f"{base} ({role_label})"
+
+
+def _partner_member_label_map(s: Session, partner_id: str) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    partner = s.get(Partner, partner_id)
+    if partner and partner.telegram_user_id:
+        labels[str(partner.telegram_user_id)] = _member_label_from_parts(
+            partner.telegram_user_id,
+            partner.telegram_username,
+            "owner",
+        )
+    members = (
+        s.query(PartnerMember)
+        .filter_by(partner_id=partner_id)
+        .order_by(PartnerMember.created_at.asc())
+        .all()
+    )
+    for member in members:
+        labels[str(member.telegram_user_id)] = _member_label_from_parts(
+            member.telegram_user_id,
+            member.telegram_username,
+            member.role,
+        )
+    return labels
+
+
+def _partner_actor_label(
+    labels: dict[str, str],
+    telegram_user_id: int | str | None,
+    telegram_username: str | None = None,
+    role: str | None = None,
+) -> str:
+    tg_id = str(telegram_user_id or "").strip()
+    if tg_id and tg_id in labels:
+        return labels[tg_id]
+    return _member_label_from_parts(tg_id or None, telegram_username, role)
+
+
+def _sync_owner_member(s: Session, partner: Partner) -> PartnerMember | None:
+    if not partner.telegram_user_id:
+        return None
+    member = (
+        s.query(PartnerMember)
+        .filter_by(partner_id=partner.id, telegram_user_id=partner.telegram_user_id)
+        .first()
+    )
+    if member is None:
+        member = PartnerMember(
+            partner_id=partner.id,
+            telegram_user_id=partner.telegram_user_id,
+            telegram_username=partner.telegram_username,
+            role="owner",
+            active=True,
+            note="legacy_owner",
+        )
+        s.add(member)
+    else:
+        member.role = "owner"
+        member.active = True
+        member.revoked_at = None
+        if partner.telegram_username and not member.telegram_username:
+            member.telegram_username = partner.telegram_username
+    return member
+
+
+def _partner_member_role_sync(
+    s: Session,
+    *,
+    partner_id: str,
+    telegram_user_id: int,
+) -> str | None:
+    partner = s.get(Partner, partner_id)
+    if not partner or not partner.active:
+        return None
+    if partner.telegram_user_id == telegram_user_id:
+        _sync_owner_member(s, partner)
+        return "owner"
+    member = (
+        s.query(PartnerMember)
+        .filter_by(partner_id=partner_id, telegram_user_id=telegram_user_id, active=True)
+        .first()
+    )
+    if member:
+        return _normalize_partner_member_role(member.role)
+    return None
+
+
 def _role(ctx: ContextTypes.DEFAULT_TYPE, tg_id: int) -> tuple[str, Partner | None]:
     settings: Settings = ctx.application.bot_data["settings"]
     if tg_id in settings.admin_id_set():
         return "admin", None
     sf = ctx.application.bot_data["session_factory"]
     with sf() as s:
+        member = (
+            s.query(PartnerMember)
+            .join(Partner, PartnerMember.partner_id == Partner.id)
+            .filter(PartnerMember.telegram_user_id == tg_id)
+            .filter(PartnerMember.active == True)  # noqa: E712
+            .filter(Partner.active == True)  # noqa: E712
+            .order_by(PartnerMember.created_at.desc())
+            .first()
+        )
+        if member and member.partner:
+            return "partner", member.partner
         p = s.query(Partner).filter_by(telegram_user_id=tg_id, active=True).first()
-    if p:
-        return "partner", p
+        if p:
+            _sync_owner_member(s, p)
+            s.commit()
+            return "partner", p
     return "stranger", None
 
 
@@ -50,35 +207,55 @@ async def _async_role(ctx, tg_id):
     return await asyncio.to_thread(_role, ctx, tg_id)
 
 
+async def _async_partner_member_role(ctx, partner: Partner, tg_id: int) -> str | None:
+    sf = ctx.application.bot_data["session_factory"]
+
+    def db_q():
+        with sf() as s:
+            role = _partner_member_role_sync(s, partner_id=partner.id, telegram_user_id=tg_id)
+            s.commit()
+            return role
+
+    return await asyncio.to_thread(db_q)
+
+
 def _admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("👥 Danh sách đối tác", callback_data="menu:partners")],
             [InlineKeyboardButton("➕ Thêm đối tác", callback_data="menu:add_partner")],
+            [InlineKeyboardButton("👤 Thêm member đối tác", callback_data="menu:add_member")],
             [InlineKeyboardButton("🤖 Kho bot đã mã hóa", callback_data="menu:bots")],
             [InlineKeyboardButton("🔑 Cấp quyền bot cho đối tác", callback_data="menu:grant")],
             [InlineKeyboardButton("🚫 Hủy quyền", callback_data="menu:revokegrant")],
             [InlineKeyboardButton("📜 Mã đã cấp", callback_data="menu:tokens")],
+            [InlineKeyboardButton("💳 Bill chờ duyệt", callback_data="menu:billing")],
         ]
     )
 
 
-def _partner_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def _partner_menu(member_role: str | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("🤖 Bot của tôi", callback_data="pmenu:mybots")],
+        [InlineKeyboardButton("🔎 Tra cứu", callback_data="pmenu:search")],
+    ]
+    if member_role is None or _partner_can(member_role, "token_write"):
+        rows.insert(1, [InlineKeyboardButton("🎫 Tạo mã", callback_data="pmenu:issue")])
+        rows.append(
+            [
+                InlineKeyboardButton("♻️ Gia hạn", callback_data="pmenu:renew"),
+                InlineKeyboardButton("🚫 Khóa khách", callback_data="pmenu:lock"),
+            ]
+        )
+    rows.append(
         [
-            [InlineKeyboardButton("🤖 Bot của tôi", callback_data="pmenu:mybots")],
-            [InlineKeyboardButton("🎫 Tạo mã cho khách", callback_data="pmenu:issue")],
-            [InlineKeyboardButton("🔎 Tra cứu khách / mã", callback_data="pmenu:search")],
-            [
-                InlineKeyboardButton("♻️ Gia hạn mã", callback_data="pmenu:renew"),
-                InlineKeyboardButton("🚫 Khóa bot khách", callback_data="pmenu:lock"),
-            ],
-            [
-                InlineKeyboardButton("📜 Mã đã cấp", callback_data="pmenu:mytokens"),
-                InlineKeyboardButton("📊 Báo cáo tháng", callback_data="ptok_sum:month"),
-            ],
+            InlineKeyboardButton("📜 Mã đã cấp", callback_data="pmenu:mytokens"),
+            InlineKeyboardButton("📊 Báo cáo", callback_data="ptok_sum:month"),
         ]
     )
+    if member_role is None or _partner_can(member_role, "billing_view"):
+        rows.append([InlineKeyboardButton("💳 Công nợ", callback_data="pbill:summary")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _back_to_admin() -> InlineKeyboardMarkup:
@@ -99,6 +276,18 @@ def _fmt_partner_short(p: Partner) -> str:
 
 def _h(value) -> str:
     return html.escape(str(value or ""), quote=False)
+
+
+def _json_list(value) -> list:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
 
 
 async def _safe_edit_message_text(q, *args, **kwargs):
@@ -184,7 +373,11 @@ def _is_backend_product_token(tk: Token | object) -> bool:
 
 
 async def _partner_allowed_bot_ids(ctx, partner: Partner) -> list[str]:
-    sf = ctx.application.bot_data["session_factory"]
+    return await _partner_allowed_bot_ids_from_bot_data(ctx.application.bot_data, partner)
+
+
+async def _partner_allowed_bot_ids_from_bot_data(bot_data: dict, partner: Partner) -> list[str]:
+    sf = bot_data["session_factory"]
 
     def db_q():
         with sf() as s:
@@ -199,7 +392,15 @@ async def _partner_allowed_bot_ids(ctx, partner: Partner) -> list[str]:
 
 
 async def _sync_product_partner(ctx, partner: Partner, allowed_bot_ids: list[str]) -> bool:
-    bc: BackendClient | None = ctx.application.bot_data.get("backend_client")
+    return await _sync_product_partner_from_bot_data(ctx.application.bot_data, partner, allowed_bot_ids)
+
+
+async def _sync_product_partner_from_bot_data(
+    bot_data: dict,
+    partner: Partner,
+    allowed_bot_ids: list[str],
+) -> bool:
+    bc: BackendClient | None = bot_data.get("backend_client")
     if bc is None or not bc.enabled:
         return False
     synced = await bc.upsert_product_partner(
@@ -219,11 +420,28 @@ async def _backend_partner_token_report(
     query: str | None = None,
     limit: int = 500,
 ):
-    bc: BackendClient | None = ctx.application.bot_data.get("backend_client")
+    return await _backend_partner_token_report_from_bot_data(
+        ctx.application.bot_data,
+        partner,
+        scope=scope,
+        query=query,
+        limit=limit,
+    )
+
+
+async def _backend_partner_token_report_from_bot_data(
+    bot_data: dict,
+    partner: Partner,
+    *,
+    scope: str = "all",
+    query: str | None = None,
+    limit: int = 500,
+):
+    bc: BackendClient | None = bot_data.get("backend_client")
     if bc is None or not bc.enabled:
         return None
-    allowed_bot_ids = await _partner_allowed_bot_ids(ctx, partner)
-    if not await _sync_product_partner(ctx, partner, allowed_bot_ids):
+    allowed_bot_ids = await _partner_allowed_bot_ids_from_bot_data(bot_data, partner)
+    if not await _sync_product_partner_from_bot_data(bot_data, partner, allowed_bot_ids):
         return None
     return await bc.list_partner_tokens(
         partner_id=partner.id,
@@ -284,6 +502,677 @@ def _backend_items_by_filter(items: list[dict], filter_kind: str) -> list[dict]:
     return list(items)
 
 
+def _billing_tz(settings: Settings) -> ZoneInfo:
+    try:
+        return ZoneInfo(str(settings.partner_billing_timezone or "Asia/Ho_Chi_Minh"))
+    except Exception:
+        return ZoneInfo("Asia/Ho_Chi_Minh")
+
+
+def _billing_local_now(settings: Settings) -> datetime:
+    return datetime.now(_billing_tz(settings))
+
+
+def _billing_cycle_days(settings: Settings) -> int:
+    return max(1, int(getattr(settings, "partner_billing_cycle_days", 30) or 30))
+
+
+def _billing_day_start(value: datetime, tz: ZoneInfo) -> datetime:
+    local = value.astimezone(tz)
+    return datetime(local.year, local.month, local.day, tzinfo=tz)
+
+
+def _billing_period_bounds(settings: Settings, now: datetime) -> tuple[datetime, datetime]:
+    return now - timedelta(days=_billing_cycle_days(settings)), now
+
+
+def _billing_period_key(period_start: datetime, period_end: datetime) -> str:
+    return f"{period_start:%Y-%m-%d}_{period_end:%Y-%m-%d}"
+
+
+def _billing_month_key(now: datetime, *, settings: Settings | None = None) -> str:
+    if settings is None:
+        return now.strftime("%Y-%m")
+    start, _ = _billing_period_bounds(settings, now)
+    return _billing_period_key(start, now)
+
+
+def _billing_week_key(now: datetime) -> str:
+    year, week, _ = now.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def _usd(amount: int | float | None) -> str:
+    return f"{int(amount or 0):,} USD"
+
+
+def _parse_iso_dt(value) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=ZoneInfo("UTC"))
+    return dt
+
+
+def _billing_charge_for_counts(
+    bot_data: dict,
+    *,
+    user_fee_units: int,
+    support_active_users: int,
+) -> dict[str, int]:
+    settings: Settings = bot_data["settings"]
+    user_count = max(0, int(user_fee_units or 0))
+    support_count = max(0, int(support_active_users or 0))
+    block_size = max(1, int(settings.partner_support_block_size or 15))
+    blocks = math.ceil(support_count / block_size) if support_count > 0 else 0
+    user_fee = user_count * max(0, int(settings.partner_user_fee_usd or 0))
+    support_fee = blocks * max(0, int(settings.partner_support_fee_usd or 0))
+    infra_fee = blocks * max(0, int(settings.partner_infra_fee_usd or 0))
+    total = user_fee + support_fee + infra_fee
+    return {
+        "billable_users": user_count,
+        "support_active_users": support_count,
+        "block_size": block_size,
+        "blocks": blocks,
+        "user_fee_usd": user_fee,
+        "support_fee_usd": support_fee,
+        "infra_fee_usd": infra_fee,
+        "total_fee_usd": total,
+    }
+
+
+def _billing_charge_for_count(bot_data: dict, billable_users: int) -> dict[str, int]:
+    return _billing_charge_for_counts(
+        bot_data,
+        user_fee_units=billable_users,
+        support_active_users=billable_users,
+    )
+
+
+def _billable_user_key(item: dict) -> str:
+    for key in ("bound_user_id", "redeemed_by_telegram_id", "bound_account_id", "token_id"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            return f"{key}:{value.lower()}"
+    return ""
+
+
+def _billable_fee_unit_key(item: dict) -> str:
+    for key in ("entitlement_id", "token_id"):
+        value = str(item.get(key) or "").strip()
+        if value:
+            return f"{key}:{value.lower()}"
+    return _billable_user_key(item)
+
+
+def _billable_seat_key(item: dict) -> str:
+    bot_code = str(item.get("bot_code") or "").strip().lower()
+    for user_field in ("bound_user_id", "redeemed_by_telegram_id", "bound_account_id"):
+        user_value = str(item.get(user_field) or "").strip().lower()
+        if user_value and bot_code:
+            return f"{user_field}:{user_value}:bot:{bot_code}"
+    for deployment_field in ("deployment_id", "bound_deployment_id"):
+        deployment_value = str(item.get(deployment_field) or "").strip().lower()
+        if deployment_value:
+            return f"{deployment_field}:{deployment_value}"
+    user_key = _billable_user_key(item)
+    if user_key and bot_code:
+        return f"{user_key}:bot:{bot_code}"
+    return user_key
+
+
+def _billable_activation_dt(item: dict) -> datetime | None:
+    return _parse_iso_dt(item.get("entitlement_starts_at") or item.get("redeemed_at"))
+
+
+def _billable_window_end_dt(item: dict, *, default_days: int) -> datetime | None:
+    activated_at = _billable_activation_dt(item)
+    if activated_at is None:
+        return None
+    natural_end = _parse_iso_dt(item.get("entitlement_expires_at") or item.get("billing_end_at"))
+    if natural_end is None:
+        try:
+            duration_days = int(item.get("duration_days") or default_days)
+        except Exception:
+            duration_days = default_days
+        natural_end = activated_at + timedelta(days=max(1, duration_days))
+    stopped_at = _parse_iso_dt(item.get("entitlement_stopped_at") or item.get("revoked_at"))
+    if stopped_at is not None and stopped_at < natural_end:
+        return stopped_at
+    return natural_end
+
+
+def _billing_window_overlaps(
+    item: dict,
+    *,
+    period_start: datetime,
+    period_end: datetime,
+    default_days: int,
+) -> bool:
+    tz = period_start.tzinfo if isinstance(period_start.tzinfo, ZoneInfo) else ZoneInfo("UTC")
+    activated_at = _billable_activation_dt(item)
+    end_at = _billable_window_end_dt(item, default_days=default_days)
+    if activated_at is None or end_at is None:
+        return False
+    support_start = _billing_day_start(activated_at, tz)
+    support_end = _billing_day_start(end_at, tz)
+    return (
+        support_start < period_end
+        and support_end > period_start
+    )
+
+
+def _tag_billing_item(item: dict, *, charge_kind: str, period_key: str) -> dict:
+    tagged = dict(item)
+    tagged["_billing_charge_kind"] = charge_kind
+    tagged["_billing_period_key"] = period_key
+    return tagged
+
+
+def _billing_charge_detail_key(item: dict) -> str:
+    period_key = str(item.get("_billing_period_key") or "")
+    charge_kind = str(item.get("_billing_charge_kind") or "")
+    if charge_kind == "user_fee":
+        base_key = _billable_fee_unit_key(item)
+    elif charge_kind == "support":
+        base_key = _billable_seat_key(item)
+    else:
+        base_key = _billable_fee_unit_key(item) or _billable_seat_key(item)
+    return f"{period_key}:{charge_kind}:{base_key}"
+
+
+def _billable_month_items(
+    report: dict,
+    *,
+    period_start: datetime | None = None,
+    period_end: datetime | None = None,
+) -> list[dict]:
+    items: list[dict] = []
+    for item in list((report or {}).get("items") or []):
+        activated_at = _billable_activation_dt(item)
+        if activated_at is None or not _billable_fee_unit_key(item):
+            continue
+        if period_start is not None and activated_at < period_start:
+            continue
+        if period_end is not None and activated_at > period_end:
+            continue
+        # User starts counting as soon as Mini App entitlement is activated,
+        # regardless of whether they run the bot later.
+        items.append(item)
+    return items
+
+
+def _billable_month_user_count(
+    report: dict,
+    *,
+    period_start: datetime | None = None,
+    period_end: datetime | None = None,
+) -> int:
+    return len(
+        {
+            _billable_fee_unit_key(item)
+            for item in _billable_month_items(report, period_start=period_start, period_end=period_end)
+        }
+    )
+
+
+def _billing_cycle_anchor(
+    settings: Settings,
+    report: dict,
+    now: datetime,
+    stored_anchor: datetime | None = None,
+) -> datetime:
+    tz = _billing_tz(settings)
+    if stored_anchor is not None:
+        if stored_anchor.tzinfo is None:
+            return stored_anchor.replace(tzinfo=tz)
+        return stored_anchor.astimezone(tz)
+    activated_dates: list[datetime] = []
+    for item in list((report or {}).get("items") or []):
+        activated_at = _billable_activation_dt(item)
+        if activated_at is None or not _billable_fee_unit_key(item):
+            continue
+        activated_dates.append(activated_at.astimezone(tz))
+    if not activated_dates:
+        base = now.astimezone(tz)
+    else:
+        base = min(activated_dates)
+    return datetime(base.year, base.month, base.day, tzinfo=tz)
+
+
+def _has_billable_activation(report: dict) -> bool:
+    for item in list((report or {}).get("items") or []):
+        if _billable_activation_dt(item) is not None and _billable_fee_unit_key(item):
+            return True
+    return False
+
+
+async def _partner_billing_anchor_from_bot_data(
+    bot_data: dict,
+    *,
+    partner_id: str,
+    report: dict,
+    now: datetime,
+) -> datetime | None:
+    settings: Settings = bot_data["settings"]
+    if not _has_billable_activation(report):
+        return None
+    sf = bot_data["session_factory"]
+
+    def db_q() -> datetime | None:
+        with sf() as s:
+            partner = s.get(Partner, partner_id)
+            if not partner:
+                return None
+            if partner.billing_anchor_at is not None:
+                return partner.billing_anchor_at
+            anchor = _billing_cycle_anchor(settings, report, now)
+            partner.billing_anchor_at = anchor.replace(tzinfo=None)
+            s.commit()
+            return partner.billing_anchor_at
+
+    return await asyncio.to_thread(db_q)
+
+
+def _cycle_index_for_dt(anchor: datetime, value: datetime, cycle_days: int) -> int:
+    seconds = max(0, int((value - anchor).total_seconds()))
+    cycle_seconds = max(1, int(cycle_days) * 86_400)
+    return seconds // cycle_seconds
+
+
+def _billing_cycle_summary(
+    bot_data: dict,
+    report: dict,
+    *,
+    now: datetime,
+    confirmed_paid_usd: int,
+    stored_anchor: datetime | None = None,
+) -> dict:
+    settings: Settings = bot_data["settings"]
+    tz = _billing_tz(settings)
+    cycle_days = _billing_cycle_days(settings)
+    anchor = _billing_cycle_anchor(settings, report, now, stored_anchor=stored_anchor)
+    now_local = now.astimezone(tz)
+    current_index = _cycle_index_for_dt(anchor, now_local, cycle_days)
+    current_start = anchor + timedelta(days=current_index * cycle_days)
+    current_end = current_start + timedelta(days=cycle_days)
+
+    cycle_user_fee_items: dict[int, dict[str, dict]] = {}
+    cycle_user_fee_first_seen: dict[tuple[int, str], datetime] = {}
+    cycle_support_items: dict[int, dict[str, dict]] = {}
+    cycle_support_latest_end: dict[tuple[int, str], datetime] = {}
+    for item in list((report or {}).get("items") or []):
+        fee_key = _billable_fee_unit_key(item)
+        seat_key = _billable_seat_key(item)
+        activated_at = _billable_activation_dt(item)
+        if not fee_key or not seat_key or activated_at is None:
+            continue
+        activated_local = activated_at.astimezone(tz)
+        if activated_local > now_local:
+            continue
+        activation_index = _cycle_index_for_dt(anchor, activated_local, cycle_days)
+        if activation_index <= current_index:
+            first_key = (activation_index, fee_key)
+            previous = cycle_user_fee_first_seen.get(first_key)
+            if previous is None or activated_local < previous:
+                cycle_user_fee_first_seen[first_key] = activated_local
+                period_key = _billing_period_key(
+                    anchor + timedelta(days=activation_index * cycle_days),
+                    anchor + timedelta(days=(activation_index + 1) * cycle_days),
+                )
+                cycle_user_fee_items.setdefault(activation_index, {})[fee_key] = _tag_billing_item(
+                    item,
+                    charge_kind="user_fee",
+                    period_key=period_key,
+                )
+
+        end_at = _billable_window_end_dt(item, default_days=cycle_days)
+        if end_at is None:
+            continue
+        end_local = end_at.astimezone(tz)
+        support_start_local = _billing_day_start(activated_local, tz)
+        support_end_local = _billing_day_start(end_local, tz)
+        if support_end_local <= support_start_local or support_end_local <= anchor:
+            continue
+        first_support_index = max(0, _cycle_index_for_dt(anchor, support_start_local, cycle_days))
+        last_support_index = min(
+            current_index,
+            _cycle_index_for_dt(anchor, support_end_local - timedelta(microseconds=1), cycle_days),
+        )
+        for idx in range(first_support_index, last_support_index + 1):
+            start = anchor + timedelta(days=idx * cycle_days)
+            end = start + timedelta(days=cycle_days)
+            if not _billing_window_overlaps(
+                item,
+                period_start=start,
+                period_end=end,
+                default_days=cycle_days,
+            ):
+                continue
+            support_key = (idx, seat_key)
+            previous_end = cycle_support_latest_end.get(support_key)
+            if previous_end is not None and previous_end >= support_end_local:
+                continue
+            cycle_support_latest_end[support_key] = support_end_local
+            cycle_support_items.setdefault(idx, {})[seat_key] = _tag_billing_item(
+                item,
+                charge_kind="support",
+                period_key=_billing_period_key(start, end),
+            )
+
+    cycle_summaries: list[dict] = []
+    accrued_total = 0
+    previous_total = 0
+    current_user_fee_items = list(cycle_user_fee_items.get(current_index, {}).values())
+    current_support_items = list(cycle_support_items.get(current_index, {}).values())
+    current_amounts = _billing_charge_for_counts(
+        bot_data,
+        user_fee_units=len(current_user_fee_items),
+        support_active_users=len(current_support_items),
+    )
+    for idx in range(current_index + 1):
+        start = anchor + timedelta(days=idx * cycle_days)
+        end = start + timedelta(days=cycle_days)
+        period_key = _billing_period_key(start, end)
+        user_fee_items = list(cycle_user_fee_items.get(idx, {}).values())
+        support_items = list(cycle_support_items.get(idx, {}).values())
+        amounts = _billing_charge_for_counts(
+            bot_data,
+            user_fee_units=len(user_fee_items),
+            support_active_users=len(support_items),
+        )
+        detail_seen: set[str] = set()
+        detail_items: list[dict] = []
+        for detail_item in [*user_fee_items, *support_items]:
+            detail_key = _billing_charge_detail_key(detail_item)
+            if detail_key in detail_seen:
+                continue
+            detail_seen.add(detail_key)
+            detail_items.append(detail_item)
+        accrued_total += int(amounts["total_fee_usd"])
+        if idx < current_index:
+            previous_total += int(amounts["total_fee_usd"])
+        cycle_summaries.append(
+            {
+                "index": idx,
+                "period_start": start,
+                "period_end": end,
+                "period_key": period_key,
+                "items": detail_items,
+                "user_fee_items": user_fee_items,
+                "support_items": support_items,
+                **amounts,
+            }
+        )
+
+    paid = max(0, int(confirmed_paid_usd or 0))
+    previous_due = max(0, previous_total - paid)
+    return {
+        "cycle_anchor": anchor,
+        "cycle_index": current_index,
+        "period_start": current_start,
+        "period_end": current_end,
+        "billing_month": _billing_period_key(current_start, current_end),
+        "cycle_days": cycle_days,
+        "cycle_summaries": cycle_summaries,
+        "current_cycle_items": [
+            item
+            for summary in cycle_summaries[current_index:current_index + 1]
+            for item in list(summary.get("items") or [])
+        ],
+        "current_user_fee_items": current_user_fee_items,
+        "current_support_items": current_support_items,
+        "all_billable_items": [
+            item
+            for summary in cycle_summaries
+            for item in list(summary.get("items") or [])
+        ],
+        "previous_total_usd": previous_total,
+        "previous_due_usd": previous_due,
+        "current_cycle_total_usd": int(current_amounts["total_fee_usd"]),
+        "monthly_total_usd": int(current_amounts["total_fee_usd"]),
+        "accrued_total_usd": accrued_total,
+        "confirmed_paid_usd": paid,
+        "amount_due_usd": max(0, accrued_total - paid),
+        **current_amounts,
+    }
+
+
+def _issuer_info_from_item(item: dict, issuer_map: dict[str, dict] | None = None) -> dict:
+    issuer_map = issuer_map or {}
+    token_id = str(item.get("token_id") or "").strip()
+    local = issuer_map.get(token_id) or {}
+    issuer_id = item.get("issued_by_telegram_id") or local.get("issued_by_telegram_id")
+    issuer_username = item.get("issued_by_username") or local.get("issued_by_username")
+    issuer_label = item.get("issuer_label") or local.get("issuer_label")
+    if not issuer_label:
+        issuer_label = _member_label_from_parts(issuer_id, issuer_username)
+    return {
+        "issued_by_telegram_id": str(issuer_id or "").strip() or None,
+        "issued_by_username": str(issuer_username or "").strip() or None,
+        "issuer_label": issuer_label,
+    }
+
+
+def _billing_detail_from_backend_item(item: dict, issuer_map: dict[str, dict] | None = None) -> dict:
+    issuer = _issuer_info_from_item(item, issuer_map)
+    return {
+        "user_key": _billable_user_key(item),
+        "token_id": item.get("token_id"),
+        "customer_label": item.get("customer_label"),
+        "bot_code": item.get("bot_code"),
+        "charge_kind": item.get("_billing_charge_kind"),
+        "billing_period_key": item.get("_billing_period_key"),
+        "activated_at": item.get("entitlement_starts_at") or item.get("redeemed_at"),
+        "expires_at": item.get("entitlement_expires_at"),
+        "status_code": item.get("status_code"),
+        **issuer,
+    }
+
+
+def _group_billing_details(items: list[dict]) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    by_issuer: dict[str, int] = {}
+    by_bot: dict[str, int] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        issuer = str(item.get("issuer_label") or item.get("issued_by_telegram_id") or "Không rõ")
+        bot = str(item.get("bot_code") or "?")
+        by_issuer[issuer] = by_issuer.get(issuer, 0) + 1
+        by_bot[bot] = by_bot.get(bot, 0) + 1
+    return (
+        sorted(by_issuer.items(), key=lambda it: (-it[1], it[0].lower())),
+        sorted(by_bot.items(), key=lambda it: (-it[1], it[0].lower())),
+    )
+
+
+async def _token_issuer_map_from_bot_data(
+    bot_data: dict,
+    *,
+    partner_id: str,
+    token_ids: list[str],
+) -> dict[str, dict]:
+    ids = [str(token_id or "").strip() for token_id in token_ids if str(token_id or "").strip()]
+    if not ids:
+        return {}
+    sf = bot_data["session_factory"]
+
+    def db_q() -> dict[str, dict]:
+        with sf() as s:
+            labels = _partner_member_label_map(s, partner_id)
+            rows = (
+                s.query(Token)
+                .filter(Token.partner_id == partner_id)
+                .filter(Token.jti.in_(ids[:500]))
+                .all()
+            )
+            result: dict[str, dict] = {}
+            for tk in rows:
+                issuer_id = tk.issued_by_telegram_id
+                issuer_username = tk.issued_by_username
+                result[tk.jti] = {
+                    "issued_by_telegram_id": str(issuer_id or "").strip() or None,
+                    "issued_by_username": issuer_username,
+                    "issuer_label": _partner_actor_label(labels, issuer_id, issuer_username),
+                }
+            return result
+
+    return await asyncio.to_thread(db_q)
+
+
+async def _partner_member_label_map_from_bot_data(bot_data: dict, partner_id: str) -> dict[str, str]:
+    sf = bot_data["session_factory"]
+
+    def db_q() -> dict[str, str]:
+        with sf() as s:
+            return _partner_member_label_map(s, partner_id)
+
+    return await asyncio.to_thread(db_q)
+
+
+async def _confirmed_paid_for_partner(
+    bot_data: dict,
+    *,
+    partner_id: str,
+) -> int:
+    sf = bot_data["session_factory"]
+
+    def db_q() -> int:
+        with sf() as s:
+            query = (
+                s.query(PartnerPaymentProof)
+                .filter_by(partner_id=partner_id, status="confirmed")
+            )
+            rows = query.all()
+            return sum(int(row.amount_confirmed_usd or row.amount_due_snapshot_usd or 0) for row in rows)
+
+    return await asyncio.to_thread(db_q)
+
+
+async def _pending_payment_count(
+    bot_data: dict,
+    *,
+    partner_id: str,
+) -> int:
+    sf = bot_data["session_factory"]
+
+    def db_q() -> int:
+        with sf() as s:
+            query = (
+                s.query(PartnerPaymentProof)
+                .filter_by(partner_id=partner_id, status="submitted")
+            )
+            return query.count()
+
+    return await asyncio.to_thread(db_q)
+
+
+async def _partner_billing_snapshot_from_bot_data(bot_data: dict, partner: Partner) -> dict | None:
+    settings: Settings = bot_data["settings"]
+    now = _billing_local_now(settings)
+    report = await _backend_partner_token_report_from_bot_data(
+        bot_data,
+        partner,
+        scope="all",
+        limit=5000,
+    )
+    if report is None:
+        return None
+    billing_anchor = await _partner_billing_anchor_from_bot_data(
+        bot_data,
+        partner_id=partner.id,
+        report=report,
+        now=now,
+    )
+    confirmed_paid = await _confirmed_paid_for_partner(
+        bot_data,
+        partner_id=partner.id,
+    )
+    pending_count = await _pending_payment_count(
+        bot_data,
+        partner_id=partner.id,
+    )
+    amounts = _billing_cycle_summary(
+        bot_data,
+        report,
+        now=now,
+        confirmed_paid_usd=confirmed_paid,
+        stored_anchor=billing_anchor,
+    )
+    return {
+        "partner_id": partner.id,
+        "partner_name": partner.name,
+        "week_key": _billing_week_key(now),
+        "generated_at": now,
+        "pending_payment_count": pending_count,
+        "report": report,
+        **amounts,
+    }
+
+
+async def _partner_billing_snapshot(ctx, partner: Partner) -> dict | None:
+    return await _partner_billing_snapshot_from_bot_data(ctx.application.bot_data, partner)
+
+
+def _partner_billing_text(snapshot: dict, *, title: str = "💳 Công nợ tuần") -> str:
+    billing_month = str(snapshot.get("billing_month") or "")
+    period_start = snapshot.get("period_start")
+    period_end = snapshot.get("period_end")
+    cycle_days = int(snapshot.get("cycle_days") or 30)
+    billable_users = int(snapshot.get("billable_users") or 0)
+    support_active_users = int(snapshot.get("support_active_users") or 0)
+    block_size = int(snapshot.get("block_size") or 15)
+    blocks = int(snapshot.get("blocks") or 0)
+    pending_count = int(snapshot.get("pending_payment_count") or 0)
+    due = int(snapshot.get("amount_due_usd") or 0)
+    previous_due = int(snapshot.get("previous_due_usd") or 0)
+    return (
+        f"<b>{title}</b>\n"
+        f"Chu kỳ tính phí: <b>{cycle_days} ngày</b>\n"
+        f"Từ: <b>{period_start:%Y-%m-%d}</b> đến <b>{period_end:%Y-%m-%d}</b>\n"
+        f"Mã chu kỳ: <code>{_h(billing_month)}</code>\n"
+        f"Lượt user active/renew trong chu kỳ: <b>{billable_users}</b>\n"
+        f"User còn hạn tính support/hạ tầng: <b>{support_active_users}</b>\n"
+        f"Block support/hạ tầng: <b>{blocks}</b> block / {block_size} user còn hạn\n\n"
+        f"Phí user active/renew: <b>{_usd(snapshot.get('user_fee_usd'))}</b>\n"
+        f"Support/kỹ thuật: <b>{_usd(snapshot.get('support_fee_usd'))}</b>\n"
+        f"Hạ tầng: <b>{_usd(snapshot.get('infra_fee_usd'))}</b>\n\n"
+        f"Tổng chu kỳ hiện tại: <b>{_usd(snapshot.get('current_cycle_total_usd'))}</b>\n"
+        f"Nợ chu kỳ trước còn treo: <b>{_usd(previous_due)}</b>\n"
+        f"Tổng đã phát sinh: <b>{_usd(snapshot.get('accrued_total_usd'))}</b>\n"
+        f"Đã admin xác nhận: <b>{_usd(snapshot.get('confirmed_paid_usd'))}</b>\n"
+        f"Còn cần thanh toán: <b>{_usd(due)}</b>\n"
+        f"Bill đang chờ duyệt: <b>{pending_count}</b>\n\n"
+        f"<i>Phí user tính theo lượt active/renew. Support/hạ tầng tính theo user còn hạn giao với chu kỳ server "
+        f"{cycle_days} ngày; nợ cũ không tự mất khi sang chu kỳ mới.</i>"
+    )
+
+
+def _partner_billing_keyboard(snapshot: dict, member_role: str | None = None) -> InlineKeyboardMarkup:
+    kb: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("📄 Xem chi tiết khách", callback_data="pbill:customers")],
+        [InlineKeyboardButton("🧾 Lịch sử đã thanh toán", callback_data="pbill:history")],
+    ]
+    if int(snapshot.get("amount_due_usd") or 0) > 0 and (
+        member_role is None or _partner_can(member_role, "billing_pay")
+    ):
+        kb.append(
+            [
+                InlineKeyboardButton(
+                    "✅ Tôi đã chuyển khoản",
+                    callback_data=f"pbill_pay:{snapshot['billing_month']}:{snapshot['week_key']}",
+                )
+            ]
+        )
+    kb.append([InlineKeyboardButton("⬅️ Menu", callback_data="pmenu:home")])
+    return InlineKeyboardMarkup(kb)
+
+
 async def _is_admin(ctx, tg_id) -> bool:
     settings: Settings = ctx.application.bot_data["settings"]
     return tg_id in settings.admin_id_set()
@@ -304,17 +1193,19 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     elif role == "partner":
         stats = await _async_partner_stats(ctx, partner)
+        member_role = await _async_partner_member_role(ctx, partner, u.id)
         await update.message.reply_text(
             f"👋 Xin chào đối tác <b>{u.full_name}</b>\n"
             f"Mã đối tác: <code>{partner.id}</code>\n\n"
+            f"Vai trò của bạn: <b>{_h(_partner_role_label(member_role))}</b>\n\n"
             f"📊 <b>Tổng quan</b>\n"
             f"  ✅ Mã đang mở: <b>{stats['active']}</b>\n"
             f"  🟢 Khách đang dùng bot: <b>{stats['running']}</b>\n"
-            f"  📅 Khách tính phí tháng này: <b>{stats['billable_customers']}</b>\n"
+            f"  📅 Lượt user tính phí chu kỳ này: <b>{stats['billable_customers']}</b>\n"
             f"  🚫 Đã khóa: <b>{stats['locked']}</b>\n\n"
             f"Chọn chức năng:",
             parse_mode=ParseMode.HTML,
-            reply_markup=_partner_menu(),
+            reply_markup=_partner_menu(member_role),
         )
     else:
         await update.message.reply_text(
@@ -336,19 +1227,26 @@ async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    role, _ = await _async_role(ctx, update.effective_user.id)
+    role, partner = await _async_role(ctx, update.effective_user.id)
     if role == "admin":
         await update.message.reply_text("Menu chính:", reply_markup=_admin_menu())
     elif role == "partner":
-        await update.message.reply_text("Menu chính:", reply_markup=_partner_menu())
+        member_role = await _async_partner_member_role(ctx, partner, update.effective_user.id)
+        await update.message.reply_text("Menu chính:", reply_markup=_partner_menu(member_role))
     else:
         await update.message.reply_text("Bạn chưa có quyền.")
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
-    role, _ = await _async_role(ctx, update.effective_user.id)
-    kb = _admin_menu() if role == "admin" else (_partner_menu() if role == "partner" else None)
+    role, partner = await _async_role(ctx, update.effective_user.id)
+    if role == "admin":
+        kb = _admin_menu()
+    elif role == "partner":
+        member_role = await _async_partner_member_role(ctx, partner, update.effective_user.id)
+        kb = _partner_menu(member_role)
+    else:
+        kb = None
     await _safe_reply_text(update.message, "Đã hủy thao tác.", reply_markup=kb)
 
 
@@ -380,6 +1278,10 @@ async def cb_admin_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _show_tokens_admin(q, ctx)
         return
 
+    if action == "billing":
+        await _show_pending_payment_proofs_admin(q, ctx)
+        return
+
     if action == "add_partner":
         ctx.user_data["awaiting"] = "add_partner_tg_id"
         await _safe_edit_message_text(q,
@@ -387,6 +1289,10 @@ async def cb_admin_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Gõ /cancel để hủy.",
             parse_mode=ParseMode.HTML,
         )
+        return
+
+    if action == "add_member":
+        await _show_member_pick_partner(q, ctx)
         return
 
     if action == "grant":
@@ -410,6 +1316,9 @@ async def _show_partners(q, ctx):
                     s.query(PartnerBotGrant)
                     .filter_by(partner_id=p.id, revoked=False)
                     .count(),
+                    s.query(PartnerMember)
+                    .filter_by(partner_id=p.id, active=True)
+                    .count(),
                 )
                 for p in partners
             ]
@@ -423,11 +1332,14 @@ async def _show_partners(q, ctx):
         )
         return
     lines = ["<b>👥 Danh sách đối tác</b>"]
-    for p, g in rows:
+    for p, g, member_count in rows:
         status = "✅" if p.active else "🚫"
+        logical_members = member_count
+        if p.telegram_user_id and logical_members <= 0:
+            logical_members = 1
         lines.append(
             f"{status} <code>{p.id}</code> — {p.name}\n"
-            f"   Telegram: {p.telegram_user_id or '-'}  · quyền bot: {g}"
+            f"   Owner: {p.telegram_user_id or '-'} · member: {logical_members} · quyền bot: {g}"
         )
     await _safe_edit_message_text(q,
         "\n".join(lines),
@@ -537,6 +1449,98 @@ async def cb_admin_tokens_filter(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     if kind not in {"all", "active", "expired", "revoked"}:
         kind = "all"
     await _show_tokens_admin(q, ctx, filter_kind=kind)
+
+
+async def _show_pending_payment_proofs_admin(q, ctx):
+    sf = ctx.application.bot_data["session_factory"]
+
+    def db_q():
+        with sf() as s:
+            rows = (
+                s.query(PartnerPaymentProof)
+                .filter_by(status="submitted")
+                .order_by(PartnerPaymentProof.submitted_at.desc())
+                .limit(20)
+                .all()
+            )
+            return [
+                {
+                    "id": row.id,
+                    "partner_id": row.partner_id,
+                    "partner_name": row.partner.name if row.partner else row.partner_id,
+                    "billing_month": row.billing_month,
+                    "week_key": row.week_key,
+                    "amount": row.amount_due_snapshot_usd,
+                    "submitted_at": row.submitted_at,
+                }
+                for row in rows
+            ]
+
+    rows = await asyncio.to_thread(db_q)
+    lines = ["<b>💳 Bill chuyển khoản chờ duyệt</b>"]
+    kb: list[list[InlineKeyboardButton]] = []
+    if not rows:
+        lines.append("\nKhông có bill nào đang chờ admin xác nhận.")
+    for row in rows:
+        lines.append(
+            f"• #{row['id']} · <b>{_h(row['partner_name'])}</b> "
+            f"({row['partner_id']}) · {_h(row['billing_month'])} · {_usd(row['amount'])}"
+        )
+        kb.append(
+            [
+                InlineKeyboardButton(f"✅ Xác nhận #{row['id']}", callback_data=f"pbill_confirm:{row['id']}"),
+                InlineKeyboardButton(f"❌ Từ chối #{row['id']}", callback_data=f"pbill_reject:{row['id']}"),
+            ]
+        )
+    kb.append([InlineKeyboardButton("⬅️ Menu chính", callback_data="menu:home")])
+    await _safe_edit_message_text(q, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+
+
+# ───── Partner member flow (admin) ─────
+
+async def _show_member_pick_partner(q, ctx):
+    sf = ctx.application.bot_data["session_factory"]
+
+    def db_q():
+        with sf() as s:
+            return s.query(Partner).filter_by(active=True).order_by(Partner.created_at.desc()).all()
+
+    partners = await asyncio.to_thread(db_q)
+    if not partners:
+        await _safe_edit_message_text(q, "Chưa có đối tác nào. Thêm đối tác trước.", reply_markup=_back_to_admin())
+        return
+    kb = [
+        [InlineKeyboardButton(_fmt_partner_short(p), callback_data=f"member_p:{p.id}")]
+        for p in partners[:30]
+    ]
+    kb.append([InlineKeyboardButton("⬅️ Quay lại", callback_data="menu:home")])
+    await _safe_edit_message_text(
+        q,
+        "<b>👤 Thêm member đối tác</b>\n\nChọn team đối tác cần thêm người:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+
+async def cb_member_pick_partner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not await _is_admin(ctx, update.effective_user.id):
+        return
+    partner_id = q.data.split(":", 1)[1]
+    ctx.user_data["member_partner_id"] = partner_id
+    ctx.user_data["awaiting"] = "add_member_text"
+    await _safe_edit_message_text(
+        q,
+        "<b>👤 Thêm member đối tác</b>\n\n"
+        f"Đối tác: <code>{_h(partner_id)}</code>\n"
+        "Gửi theo mẫu:\n"
+        "<code>TELEGRAM_ID role</code>\n\n"
+        "Role hợp lệ: <code>owner</code>, <code>operator</code>, <code>accountant</code>, <code>viewer</code>.\n"
+        "Nếu bỏ role, hệ thống mặc định là <code>operator</code>.\n\n"
+        "Ví dụ: <code>123456789 operator</code>",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 # ───── Grant flow (admin) ─────
@@ -801,11 +1805,12 @@ async def cb_partner_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if role != "partner":
         await _safe_edit_message_text(q, "Chỉ đối tác đã đăng ký mới dùng được chức năng này.")
         return
+    member_role = await _async_partner_member_role(ctx, partner, update.effective_user.id)
     action = q.data.split(":", 1)[1]
 
     if action == "home":
         ctx.user_data.clear()
-        await _safe_edit_message_text(q, "Menu:", reply_markup=_partner_menu())
+        await _safe_edit_message_text(q, "Menu:", reply_markup=_partner_menu(member_role))
         return
 
     if action == "mybots":
@@ -817,6 +1822,14 @@ async def cb_partner_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "lock":
+        if not _partner_can(member_role, "token_write"):
+            await _safe_edit_message_text(
+                q,
+                _partner_permission_denied_text(member_role, "khóa bot khách"),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_back_to_partner(),
+            )
+            return
         await _show_partner_lock_tokens(q, ctx, partner)
         return
 
@@ -833,6 +1846,14 @@ async def cb_partner_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "issue":
+        if not _partner_can(member_role, "token_write"):
+            await _safe_edit_message_text(
+                q,
+                _partner_permission_denied_text(member_role, "tạo mã cho khách"),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_back_to_partner(),
+            )
+            return
         ctx.user_data["awaiting"] = "issue_user_label"
         ctx.user_data["issue_partner_id"] = partner.id
         await _safe_edit_message_text(q,
@@ -846,6 +1867,14 @@ async def cb_partner_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "renew":
+        if not _partner_can(member_role, "token_write"):
+            await _safe_edit_message_text(
+                q,
+                _partner_permission_denied_text(member_role, "gia hạn mã"),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_back_to_partner(),
+            )
+            return
         await _show_renew_pick_token(q, ctx, partner)
         return
 
@@ -883,18 +1912,21 @@ async def _show_partner_bots(q, ctx, partner: Partner):
 
 
 async def _async_partner_stats(ctx, partner: Partner) -> dict[str, int]:
-    backend_report = await _backend_partner_token_report(ctx, partner, scope="month", limit=500)
-    if backend_report is not None:
-        summary = dict(backend_report.get("summary") or {})
-        counts = _backend_token_counts(summary)
+    snapshot = await _partner_billing_snapshot(ctx, partner)
+    if snapshot is not None:
+        support_items = list(snapshot.get("current_support_items") or [])
+        running = sum(1 for item in support_items if str(item.get("status_code") or "") == "running")
+        revoked = sum(1 for item in support_items if str(item.get("status_code") or "") == "revoked")
+        expired = sum(1 for item in support_items if str(item.get("status_code") or "") == "expired")
+        support_active_users = int(snapshot.get("support_active_users") or 0)
         return {
-            "active": counts["issued"] + counts["redeemed"] + counts["running"],
-            "running": counts["running"],
-            "billable_customers": int(summary.get("billable_customers") or 0),
-            "billing_days": int(summary.get("total_days") or 0),
+            "active": max(0, support_active_users - revoked - expired),
+            "running": running,
+            "billable_customers": int(snapshot.get("billable_users") or 0),
+            "billing_days": 0,
             "expiring_soon": 0,
-            "expired": counts["expired"],
-            "locked": counts["revoked"],
+            "expired": expired,
+            "locked": revoked,
         }
 
     sf = ctx.application.bot_data["session_factory"]
@@ -1126,7 +2158,7 @@ async def _show_partner_summary_from_backend(q, report: dict, scope: str = "mont
     await _safe_edit_message_text(q, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
 
 
-async def _show_backend_token_detail(q, item: dict):
+async def _show_backend_token_detail(q, item: dict, member_role: str | None = None):
     code = str(item.get("status_code") or "")
     expires_at = item.get("entitlement_expires_at") or item.get("redeem_expires_at")
     text = (
@@ -1145,10 +2177,11 @@ async def _show_backend_token_detail(q, item: dict):
         text += f"\nTài khoản: <code>{_h(item.get('bound_account_id'))}</code>"
     kb: list[list[InlineKeyboardButton]] = []
     token_id = str(item.get("token_id") or "")
-    if token_id and code != "issued":
-        kb.append([InlineKeyboardButton("♻️ Gia hạn", callback_data=f"renew_t:{token_id}")])
-    if token_id and code not in {"revoked", "expired"}:
-        kb.append([InlineKeyboardButton("🚫 Khóa bot của khách", callback_data=f"ptok_rv:{token_id}")])
+    if _partner_can(member_role, "token_write"):
+        if token_id and code != "issued":
+            kb.append([InlineKeyboardButton("♻️ Gia hạn", callback_data=f"renew_t:{token_id}")])
+        if token_id and code not in {"revoked", "expired"}:
+            kb.append([InlineKeyboardButton("🚫 Khóa bot của khách", callback_data=f"ptok_rv:{token_id}")])
     kb.append([InlineKeyboardButton("⬅️ Danh sách", callback_data="pmenu:mytokens")])
     kb.append([InlineKeyboardButton("🏠 Menu", callback_data="pmenu:home")])
     await _safe_edit_message_text(q, text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
@@ -1466,11 +2499,12 @@ async def cb_partner_token_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     role, partner = await _async_role(ctx, update.effective_user.id)
     if role != "partner":
         return
+    member_role = await _async_partner_member_role(ctx, partner, update.effective_user.id)
     jti = q.data.split(":", 1)[1]
     backend_report = await _backend_partner_token_report(ctx, partner, scope="all", query=jti, limit=20)
     for item in list((backend_report or {}).get("items") or []):
         if str(item.get("token_id") or "") == jti:
-            await _show_backend_token_detail(q, item)
+            await _show_backend_token_detail(q, item, member_role)
             return
 
     sf = ctx.application.bot_data["session_factory"]
@@ -1534,9 +2568,9 @@ async def cb_partner_token_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         not info["revoked"] or info["expires_at"] >= now - timedelta(days=7)
     )
     can_revoke = not info["revoked"] and info["expires_at"] >= now
-    if can_renew:
+    if can_renew and _partner_can(member_role, "token_write"):
         kb.append([InlineKeyboardButton("♻️ Gia hạn", callback_data=f"renew_t:{info['jti']}")])
-    if can_revoke:
+    if can_revoke and _partner_can(member_role, "token_write"):
         kb.append([InlineKeyboardButton("🚫 Khóa bot của khách", callback_data=f"ptok_rv:{info['jti']}")])
     kb.append([InlineKeyboardButton("⬅️ Danh sách", callback_data="pmenu:mytokens")])
     kb.append([InlineKeyboardButton("🏠 Menu", callback_data="pmenu:home")])
@@ -1551,6 +2585,15 @@ async def cb_partner_token_revoke(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     await q.answer()
     role, partner = await _async_role(ctx, update.effective_user.id)
     if role != "partner":
+        return
+    member_role = await _async_partner_member_role(ctx, partner, update.effective_user.id)
+    if not _partner_can(member_role, "token_write"):
+        await _safe_edit_message_text(
+            q,
+            _partner_permission_denied_text(member_role, "khóa bot khách"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_back_to_partner(),
+        )
         return
     jti = q.data.split(":", 1)[1]
     backend_report = await _backend_partner_token_report(ctx, partner, scope="all", query=jti, limit=20)
@@ -1626,6 +2669,15 @@ async def cb_partner_token_revoke_confirm(update: Update, ctx: ContextTypes.DEFA
     await q.answer()
     role, partner = await _async_role(ctx, update.effective_user.id)
     if role != "partner":
+        return
+    member_role = await _async_partner_member_role(ctx, partner, update.effective_user.id)
+    if not _partner_can(member_role, "token_write"):
+        await _safe_edit_message_text(
+            q,
+            _partner_permission_denied_text(member_role, "khóa bot khách"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_back_to_partner(),
+        )
         return
     jti = q.data.split(":", 1)[1]
     sf = ctx.application.bot_data["session_factory"]
@@ -1726,12 +2778,837 @@ async def cb_partner_token_revoke_confirm(update: Update, ctx: ContextTypes.DEFA
     await _safe_edit_message_text(q, msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
 
 
+# ───────────────────────── weekly partner billing ─────────────────────────
+
+async def _partner_billing_chat_ids_from_bot_data(bot_data: dict, partner_id: str) -> list[int]:
+    sf = bot_data["session_factory"]
+
+    def db_q() -> list[int]:
+        with sf() as s:
+            partner = s.get(Partner, partner_id)
+            if not partner or not partner.active:
+                return []
+            chat_ids: list[int] = []
+            if partner.telegram_user_id:
+                chat_ids.append(int(partner.telegram_user_id))
+            members = (
+                s.query(PartnerMember)
+                .filter_by(partner_id=partner_id, active=True)
+                .filter(PartnerMember.role.in_(["owner", "accountant"]))
+                .all()
+            )
+            for member in members:
+                chat_ids.append(int(member.telegram_user_id))
+            unique: list[int] = []
+            for chat_id in chat_ids:
+                if chat_id not in unique:
+                    unique.append(chat_id)
+            return unique
+
+    return await asyncio.to_thread(db_q)
+
+
+async def _show_partner_billing(q, ctx, partner: Partner):
+    snapshot = await _partner_billing_snapshot(ctx, partner)
+    if snapshot is None:
+        await _safe_edit_message_text(
+            q,
+            "Hệ thống công nợ chưa sẵn sàng. Vui lòng thử lại sau vài phút.",
+            reply_markup=_back_to_partner(),
+        )
+        return
+    member_role = await _async_partner_member_role(ctx, partner, q.from_user.id) if q.from_user else None
+    await _safe_edit_message_text(
+        q,
+        _partner_billing_text(snapshot),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_partner_billing_keyboard(snapshot, member_role),
+    )
+
+
+async def _show_partner_billing_customers(q, ctx, partner: Partner):
+    snapshot = await _partner_billing_snapshot(ctx, partner)
+    if snapshot is None:
+        await _safe_edit_message_text(q, "Chưa lấy được dữ liệu công nợ.", reply_markup=_back_to_partner())
+        return
+    user_fee_items = list(
+        snapshot.get("current_user_fee_items")
+        or _billable_month_items(
+            snapshot.get("report") or {},
+            period_start=snapshot.get("period_start"),
+            period_end=snapshot.get("period_end"),
+        )
+    )
+    support_items = list(snapshot.get("current_support_items") or [])
+    all_items = [*user_fee_items, *support_items]
+    issuer_map = await _token_issuer_map_from_bot_data(
+        ctx.application.bot_data,
+        partner_id=partner.id,
+        token_ids=[str(item.get("token_id") or "") for item in all_items],
+    )
+    member_labels = await _partner_member_label_map_from_bot_data(ctx.application.bot_data, partner.id)
+    detail_items: list[dict] = []
+    lines = [
+        f"<b>📄 Chi tiết khách tính phí</b>",
+        f"Chu kỳ: <code>{_h(snapshot.get('billing_month'))}</code>",
+        "<i>Phí user theo lượt active/renew; block support/hạ tầng theo user còn hạn trong chu kỳ server.</i>",
+        "",
+        "<b>Lượt active/renew tính phí user</b>",
+    ]
+    seen: set[str] = set()
+    for item in user_fee_items:
+        key = _billable_fee_unit_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        detail = _billing_detail_from_backend_item(item, issuer_map)
+        if detail.get("issued_by_telegram_id"):
+            detail["issuer_label"] = _partner_actor_label(
+                member_labels,
+                detail.get("issued_by_telegram_id"),
+                detail.get("issued_by_username"),
+            )
+        detail_items.append(detail)
+        if len(seen) <= 30:
+            lines.append(
+                f"• <b>{_h(item.get('customer_label') or 'Không tên')}</b> · "
+                f"{_h(item.get('bot_code') or '?')} · "
+                f"kích hoạt {_backend_short_date(item.get('redeemed_at'))} · "
+                f"hết hạn {_backend_short_date(item.get('entitlement_expires_at'))}\n"
+                f"  Tạo bởi: <code>{_h(detail.get('issuer_label') or 'Không rõ')}</code>"
+            )
+    if not seen:
+        lines.append("Chưa có lượt active/renew nào trong chu kỳ này.")
+
+    lines.extend(["", "<b>User còn hạn tính block support/hạ tầng</b>"])
+    support_seen: set[str] = set()
+    support_detail_items: list[dict] = []
+    for item in support_items:
+        key = _billable_seat_key(item)
+        if key in support_seen:
+            continue
+        support_seen.add(key)
+        detail = _billing_detail_from_backend_item(item, issuer_map)
+        if detail.get("issued_by_telegram_id"):
+            detail["issuer_label"] = _partner_actor_label(
+                member_labels,
+                detail.get("issued_by_telegram_id"),
+                detail.get("issued_by_username"),
+            )
+        support_detail_items.append(detail)
+        if len(support_seen) <= 30:
+            lines.append(
+                f"• <b>{_h(item.get('customer_label') or 'Không tên')}</b> · "
+                f"{_h(item.get('bot_code') or '?')} · "
+                f"từ {_backend_short_date(item.get('entitlement_starts_at') or item.get('redeemed_at'))} · "
+                f"đến {_backend_short_date(item.get('entitlement_expires_at'))}"
+            )
+    if not support_seen:
+        lines.append("Chưa có user còn hạn trong chu kỳ này.")
+
+    detail_items.extend(support_detail_items)
+    if detail_items:
+        by_issuer, by_bot = _group_billing_details(detail_items)
+        lines.extend(["", "<b>Theo người tạo</b>"])
+        for label, count in by_issuer[:12]:
+            lines.append(f"• <code>{_h(label)}</code>: <b>{count}</b> dòng")
+        lines.extend(["", "<b>Theo bot</b>"])
+        for bot_code, count in by_bot[:12]:
+            lines.append(f"• <code>{_h(bot_code)}</code>: <b>{count}</b> dòng")
+    if len(user_fee_items) > 30:
+        lines.append(f"... còn {len(user_fee_items) - 30} lượt active/renew khác.")
+    if len(support_items) > 30:
+        lines.append(f"... còn {len(support_items) - 30} user support/hạ tầng khác.")
+    kb = [
+        [InlineKeyboardButton("💳 Quay lại công nợ", callback_data="pbill:summary")],
+        [InlineKeyboardButton("⬅️ Menu", callback_data="pmenu:home")],
+    ]
+    await _safe_edit_message_text(q, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def _show_partner_billing_history(q, ctx, partner: Partner):
+    sf = ctx.application.bot_data["session_factory"]
+
+    def db_q():
+        with sf() as s:
+            rows = (
+                s.query(PartnerBillingSnapshot)
+                .filter_by(partner_id=partner.id)
+                .order_by(PartnerBillingSnapshot.created_at.desc())
+                .limit(12)
+                .all()
+            )
+            return [
+                {
+                    "id": row.id,
+                    "period": row.billing_period_key,
+                    "week": row.week_key,
+                    "users": row.billable_users,
+                    "support_users": row.support_active_users,
+                    "blocks": row.blocks,
+                    "user_fee": row.user_fee_usd,
+                    "support_fee": row.support_fee_usd,
+                    "infra_fee": row.infra_fee_usd,
+                    "total": row.total_fee_usd,
+                    "confirmed": row.confirmed_amount_usd,
+                    "due_after": row.amount_due_after_usd,
+                    "created_at": row.created_at,
+                }
+                for row in rows
+            ]
+
+    rows = await asyncio.to_thread(db_q)
+    lines = ["<b>🧾 Lịch sử đã thanh toán</b>"]
+    kb: list[list[InlineKeyboardButton]] = []
+    if not rows:
+        lines.append("\nChưa có kỳ nào được admin xác nhận thanh toán.")
+    for row in rows:
+        lines.append(
+            f"• <code>#{row['id']}</code> · <code>{_h(row['period'])}</code>\n"
+            f"  Chu kỳ này: lượt user <b>{row['users']}</b> · "
+            f"user còn hạn <b>{row['support_users']}</b> · Block <b>{row['blocks']}</b> · "
+            f"User fee {_usd(row['user_fee'])} · Support {_usd(row['support_fee'])} · "
+            f"Hạ tầng {_usd(row['infra_fee'])}\n"
+            f"  Đã xác nhận: <b>{_usd(row['confirmed'])}</b> · Còn lại sau xác nhận: <b>{_usd(row['due_after'])}</b>"
+        )
+        kb.append([InlineKeyboardButton(f"📄 Chi tiết #{row['id']}", callback_data=f"pbill_snap:{row['id']}")])
+    kb.append([InlineKeyboardButton("💳 Công nợ hiện tại", callback_data="pbill:summary")])
+    kb.append([InlineKeyboardButton("⬅️ Menu", callback_data="pmenu:home")])
+    await _safe_edit_message_text(q, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def _show_partner_billing_snapshot_detail(q, ctx, partner: Partner, snapshot_id: int):
+    sf = ctx.application.bot_data["session_factory"]
+
+    def db_q():
+        with sf() as s:
+            row = s.get(PartnerBillingSnapshot, snapshot_id)
+            if not row or row.partner_id != partner.id:
+                return None
+            return {
+                "id": row.id,
+                "period": row.billing_period_key,
+                "week": row.week_key,
+                "period_start_at": row.period_start_at,
+                "period_end_at": row.period_end_at,
+                "cycle_days": row.cycle_days,
+                "users": row.billable_users,
+                "support_users": row.support_active_users,
+                "block_size": row.block_size,
+                "blocks": row.blocks,
+                "user_fee": row.user_fee_usd,
+                "support_fee": row.support_fee_usd,
+                "infra_fee": row.infra_fee_usd,
+                "total": row.total_fee_usd,
+                "paid_before": row.confirmed_paid_before_usd,
+                "confirmed": row.confirmed_amount_usd,
+                "due_after": row.amount_due_after_usd,
+                "items": _json_list(row.item_details_json),
+                "created_at": row.created_at,
+            }
+
+    row = await asyncio.to_thread(db_q)
+    if not row:
+        await _safe_edit_message_text(q, "Không tìm thấy bản đối soát này.", reply_markup=_back_to_partner())
+        return
+    lines = [
+        f"<b>📄 Chi tiết đối soát #{row['id']}</b>",
+        f"Chu kỳ: <code>{_h(row['period'])}</code>",
+        f"Từ <b>{row['period_start_at']:%Y-%m-%d}</b> đến <b>{row['period_end_at']:%Y-%m-%d}</b>",
+        "",
+        f"Lượt user active/renew: <b>{row['users']}</b>",
+        f"User còn hạn tính support/hạ tầng: <b>{row['support_users']}</b>",
+        f"Block: <b>{row['blocks']}</b> / {row['block_size']} user còn hạn",
+        f"Phí user active/renew: <b>{_usd(row['user_fee'])}</b>",
+        f"Support/kỹ thuật: <b>{_usd(row['support_fee'])}</b>",
+        f"Hạ tầng: <b>{_usd(row['infra_fee'])}</b>",
+        f"Tổng đã phát sinh tới lúc xác nhận: <b>{_usd(row['total'])}</b>",
+        f"Đã xác nhận trước đó: <b>{_usd(row['paid_before'])}</b>",
+        f"Bill này xác nhận: <b>{_usd(row['confirmed'])}</b>",
+        f"Còn lại sau xác nhận: <b>{_usd(row['due_after'])}</b>",
+    ]
+    by_issuer, by_bot = _group_billing_details(row["items"])
+    if by_issuer:
+        lines.extend(["", "<b>Theo người tạo</b>"])
+        for label, count in by_issuer[:12]:
+            lines.append(f"• <code>{_h(label)}</code>: <b>{count}</b> dòng")
+    if by_bot:
+        lines.extend(["", "<b>Theo bot</b>"])
+        for bot_code, count in by_bot[:12]:
+            lines.append(f"• <code>{_h(bot_code)}</code>: <b>{count}</b> dòng")
+    if by_issuer or by_bot:
+        lines.extend(["", "<b>Khách trong bản đối soát</b>"])
+    else:
+        lines.extend(["", "<b>Khách trong bản đối soát</b>"])
+    for item in row["items"][:30]:
+        if not isinstance(item, dict):
+            continue
+        charge_label = "user fee" if item.get("charge_kind") == "user_fee" else "support"
+        lines.append(
+            f"• <code>{_h(charge_label)}</code> · <b>{_h(item.get('customer_label') or 'Không tên')}</b> · "
+            f"{_h(item.get('bot_code') or '?')} · "
+            f"kỳ {_h(item.get('billing_period_key') or row['period'])} · "
+            f"kích hoạt {_h(item.get('activated_at') or '-')}\n"
+            f"  Tạo bởi: <code>{_h(item.get('issuer_label') or item.get('issued_by_telegram_id') or 'Không rõ')}</code>"
+        )
+    if not row["items"]:
+        lines.append("Không có chi tiết khách được lưu.")
+    if len(row["items"]) > 30:
+        lines.append(f"... còn {len(row['items']) - 30} khách khác.")
+    kb = [
+        [InlineKeyboardButton("🧾 Lịch sử đã thanh toán", callback_data="pbill:history")],
+        [InlineKeyboardButton("⬅️ Menu", callback_data="pmenu:home")],
+    ]
+    await _safe_edit_message_text(q, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def cb_partner_billing_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    role, partner = await _async_role(ctx, update.effective_user.id)
+    if role != "partner":
+        await _safe_edit_message_text(q, "Chỉ đối tác đã đăng ký mới dùng được chức năng này.")
+        return
+    action = q.data.split(":", 1)[1]
+    if action == "customers":
+        await _show_partner_billing_customers(q, ctx, partner)
+        return
+    if action == "history":
+        await _show_partner_billing_history(q, ctx, partner)
+        return
+    await _show_partner_billing(q, ctx, partner)
+
+
+async def cb_partner_billing_snapshot_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    role, partner = await _async_role(ctx, update.effective_user.id)
+    if role != "partner":
+        return
+    try:
+        snapshot_id = int(q.data.split(":", 1)[1])
+    except Exception:
+        return
+    await _show_partner_billing_snapshot_detail(q, ctx, partner, snapshot_id)
+
+
+async def cb_partner_billing_pay(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    role, partner = await _async_role(ctx, update.effective_user.id)
+    if role != "partner":
+        return
+    member_role = await _async_partner_member_role(ctx, partner, update.effective_user.id)
+    if not _partner_can(member_role, "billing_pay"):
+        await _safe_edit_message_text(
+            q,
+            _partner_permission_denied_text(member_role, "gửi bill thanh toán"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_back_to_partner(),
+        )
+        return
+    snapshot = await _partner_billing_snapshot(ctx, partner)
+    if snapshot is None:
+        await _safe_edit_message_text(q, "Chưa lấy được công nợ. Vui lòng thử lại sau vài phút.", reply_markup=_back_to_partner())
+        return
+    amount_due = int(snapshot.get("amount_due_usd") or 0)
+    if amount_due <= 0:
+        await _safe_edit_message_text(q, "Tháng này chưa còn khoản nào cần thanh toán.", reply_markup=_back_to_partner())
+        return
+    if int(snapshot.get("pending_payment_count") or 0) > 0:
+        await _safe_edit_message_text(
+            q,
+            "Đối tác đang có bill chuyển khoản chờ admin duyệt.\n"
+            "Vui lòng chờ admin xác nhận hoặc từ chối bill cũ trước khi gửi bill mới.",
+            reply_markup=_back_to_partner(),
+        )
+        return
+    ctx.user_data["awaiting"] = "partner_payment_photo"
+    ctx.user_data["payment_partner_id"] = partner.id
+    ctx.user_data["payment_billing_month"] = snapshot["billing_month"]
+    ctx.user_data["payment_week_key"] = snapshot["week_key"]
+    ctx.user_data["payment_amount_due_usd"] = amount_due
+    await _safe_edit_message_text(
+        q,
+        "<b>✅ Gửi bill chuyển khoản</b>\n\n"
+        f"Số tiền đang cần thanh toán: <b>{_usd(amount_due)}</b>\n"
+        "Bạn vui lòng gửi <b>ảnh bill chuyển khoản</b> vào chat này.\n\n"
+        "<i>Chỉ sau khi admin xác nhận ảnh bill, khoản này mới được tính là đã thanh toán.</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def payment_photo_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if ctx.user_data.get("awaiting") != "partner_payment_photo":
+        return
+    role, partner = await _async_role(ctx, update.effective_user.id)
+    expected_partner_id = str(ctx.user_data.get("payment_partner_id") or "")
+    if role != "partner" or partner.id != expected_partner_id:
+        ctx.user_data.clear()
+        return
+    member_role = await _async_partner_member_role(ctx, partner, update.effective_user.id)
+    if not _partner_can(member_role, "billing_pay"):
+        ctx.user_data.clear()
+        await update.message.reply_text(
+            _partner_permission_denied_text(member_role, "gửi bill thanh toán"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_back_to_partner(),
+        )
+        return
+    if not update.message or not update.message.photo:
+        return
+    photo = update.message.photo[-1]
+    billing_month = str(ctx.user_data.get("payment_billing_month") or "")
+    week_key = str(ctx.user_data.get("payment_week_key") or "")
+    amount_due = int(ctx.user_data.get("payment_amount_due_usd") or 0)
+    sf = ctx.application.bot_data["session_factory"]
+
+    def save() -> int:
+        with sf() as s:
+            row = PartnerPaymentProof(
+                partner_id=partner.id,
+                billing_month=billing_month,
+                week_key=week_key,
+                amount_due_snapshot_usd=amount_due,
+                telegram_file_id=photo.file_id,
+                telegram_file_unique_id=photo.file_unique_id,
+                submitted_by_telegram_id=update.effective_user.id if update.effective_user else None,
+                submitted_at=datetime.utcnow(),
+                status="submitted",
+            )
+            s.add(row)
+            s.commit()
+            return int(row.id)
+
+    proof_id = await asyncio.to_thread(save)
+    for key in (
+        "awaiting",
+        "payment_partner_id",
+        "payment_billing_month",
+        "payment_week_key",
+        "payment_amount_due_usd",
+    ):
+        ctx.user_data.pop(key, None)
+
+    admin_kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Xác nhận đã nhận tiền", callback_data=f"pbill_confirm:{proof_id}"),
+                InlineKeyboardButton("❌ Từ chối bill", callback_data=f"pbill_reject:{proof_id}"),
+            ]
+        ]
+    )
+    caption = (
+        f"<b>💳 Bill chuyển khoản mới</b>\n"
+        f"Proof: <code>#{proof_id}</code>\n"
+        f"Đối tác: <b>{_h(partner.name)}</b> (<code>{_h(partner.id)}</code>)\n"
+        f"Chu kỳ: <code>{_h(billing_month)}</code> · Tuần: <code>{_h(week_key)}</code>\n"
+        f"Số tiền snapshot: <b>{_usd(amount_due)}</b>"
+    )
+    sent_admin = 0
+    for admin_id in ctx.application.bot_data["settings"].admin_id_set():
+        try:
+            await ctx.bot.send_photo(
+                chat_id=admin_id,
+                photo=photo.file_id,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_kb,
+            )
+            sent_admin += 1
+        except Exception:
+            log.exception("payment_proof_admin_send_failed proof_id=%s admin_id=%s", proof_id, admin_id)
+    suffix = "Admin đã nhận bill và sẽ xác nhận." if sent_admin else "Bill đã lưu, nhưng chưa cấu hình admin nhận thông báo."
+    await update.message.reply_text(
+        f"✅ Đã nhận ảnh bill <code>#{proof_id}</code>.\n{suffix}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_back_to_partner(),
+    )
+
+
+async def _edit_billing_admin_message(q, text: str, reply_markup: InlineKeyboardMarkup | None = None):
+    try:
+        if getattr(q.message, "photo", None):
+            return await q.edit_message_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        return await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+    except BadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return None
+        raise
+
+
+async def cb_partner_billing_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not await _is_admin(ctx, update.effective_user.id):
+        return
+    try:
+        proof_id = int(q.data.split(":", 1)[1])
+    except Exception:
+        return
+    sf = ctx.application.bot_data["session_factory"]
+
+    def fetch_context():
+        with sf() as s:
+            proof = s.get(PartnerPaymentProof, proof_id)
+            if not proof:
+                return None
+            return {
+                "status": proof.status,
+                "partner_id": proof.partner_id,
+                "partner_name": proof.partner.name if proof.partner else proof.partner_id,
+                "partner_chat_id": proof.partner.telegram_user_id if proof.partner else None,
+            }
+
+    context = await asyncio.to_thread(fetch_context)
+    if not context:
+        await _edit_billing_admin_message(q, "Không tìm thấy bill này.")
+        return
+    if context.get("status") != "submitted":
+        await _edit_billing_admin_message(q, f"Bill này đã ở trạng thái <b>{_h(context.get('status'))}</b>.")
+        return
+
+    partner_ref = SimpleNamespace(id=context["partner_id"], name=context["partner_name"])
+    billing_snapshot = await _partner_billing_snapshot_from_bot_data(ctx.application.bot_data, partner_ref)
+    if billing_snapshot is None:
+        await _edit_billing_admin_message(
+            q,
+            "Chưa lấy được dữ liệu đối soát từ backend nên chưa xác nhận bill. Vui lòng thử lại sau vài phút.",
+        )
+        return
+
+    def mark():
+        with sf() as s:
+            proof = s.get(PartnerPaymentProof, proof_id)
+            if not proof:
+                return None
+            if proof.status != "submitted":
+                return {"already_done": True, "status": proof.status}
+            confirmed_amount = int(proof.amount_due_snapshot_usd or 0)
+            snapshot_id = None
+            period_items = list(
+                billing_snapshot.get("all_billable_items")
+                or _billable_month_items(
+                    billing_snapshot.get("report") or {},
+                    period_start=billing_snapshot.get("period_start"),
+                    period_end=billing_snapshot.get("period_end"),
+                )
+            )
+            token_ids = [
+                str(item.get("token_id") or "").strip()
+                for item in period_items
+                if str(item.get("token_id") or "").strip()
+            ]
+            labels = _partner_member_label_map(s, proof.partner_id)
+            issuer_map: dict[str, dict] = {}
+            if token_ids:
+                for tk in (
+                    s.query(Token)
+                    .filter(Token.partner_id == proof.partner_id)
+                    .filter(Token.jti.in_(token_ids[:500]))
+                    .all()
+                ):
+                    issuer_map[tk.jti] = {
+                        "issued_by_telegram_id": str(tk.issued_by_telegram_id or "").strip() or None,
+                        "issued_by_username": tk.issued_by_username,
+                        "issuer_label": _partner_actor_label(
+                            labels,
+                            tk.issued_by_telegram_id,
+                            tk.issued_by_username,
+                        ),
+                    }
+            seen: set[str] = set()
+            item_details: list[dict] = []
+            for item in period_items:
+                key = _billing_charge_detail_key(item)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                detail = _billing_detail_from_backend_item(item, issuer_map)
+                if detail.get("issued_by_telegram_id"):
+                    detail["issuer_label"] = _partner_actor_label(
+                        labels,
+                        detail.get("issued_by_telegram_id"),
+                        detail.get("issued_by_username"),
+                    )
+                item_details.append(detail)
+            paid_before = int(billing_snapshot.get("confirmed_paid_usd") or 0)
+            total_fee = int(
+                billing_snapshot.get("accrued_total_usd")
+                or billing_snapshot.get("monthly_total_usd")
+                or 0
+            )
+            snapshot_row = PartnerBillingSnapshot(
+                partner_id=proof.partner_id,
+                payment_proof_id=proof.id,
+                billing_period_key=str(billing_snapshot.get("billing_month") or proof.billing_month),
+                week_key=str(billing_snapshot.get("week_key") or proof.week_key),
+                period_start_at=billing_snapshot["period_start"].replace(tzinfo=None),
+                period_end_at=billing_snapshot["period_end"].replace(tzinfo=None),
+                cycle_days=int(billing_snapshot.get("cycle_days") or 30),
+                billable_users=int(billing_snapshot.get("billable_users") or 0),
+                support_active_users=int(billing_snapshot.get("support_active_users") or 0),
+                block_size=int(billing_snapshot.get("block_size") or 15),
+                blocks=int(billing_snapshot.get("blocks") or 0),
+                user_fee_usd=int(billing_snapshot.get("user_fee_usd") or 0),
+                support_fee_usd=int(billing_snapshot.get("support_fee_usd") or 0),
+                infra_fee_usd=int(billing_snapshot.get("infra_fee_usd") or 0),
+                total_fee_usd=total_fee,
+                confirmed_paid_before_usd=paid_before,
+                confirmed_amount_usd=confirmed_amount,
+                amount_due_after_usd=max(0, total_fee - paid_before - confirmed_amount),
+                item_details_json=json.dumps(item_details, ensure_ascii=False),
+                created_at=datetime.utcnow(),
+                created_by_admin_telegram_id=update.effective_user.id if update.effective_user else None,
+            )
+            s.add(snapshot_row)
+            s.flush()
+            snapshot_id = int(snapshot_row.id)
+            proof.status = "confirmed"
+            proof.amount_confirmed_usd = confirmed_amount
+            proof.confirmed_by_admin_telegram_id = update.effective_user.id if update.effective_user else None
+            proof.confirmed_at = datetime.utcnow()
+            notify_chat_ids: list[int] = []
+            if proof.partner and proof.partner.telegram_user_id:
+                notify_chat_ids.append(int(proof.partner.telegram_user_id))
+            if proof.submitted_by_telegram_id:
+                notify_chat_ids.append(int(proof.submitted_by_telegram_id))
+            members = (
+                s.query(PartnerMember)
+                .filter_by(partner_id=proof.partner_id, active=True)
+                .filter(PartnerMember.role.in_(["owner", "accountant"]))
+                .all()
+            )
+            for member in members:
+                notify_chat_ids.append(int(member.telegram_user_id))
+            unique_notify_ids: list[int] = []
+            for chat_id in notify_chat_ids:
+                if chat_id not in unique_notify_ids:
+                    unique_notify_ids.append(chat_id)
+            s.commit()
+            return {
+                "notify_chat_ids": unique_notify_ids,
+                "partner_name": proof.partner.name if proof.partner else proof.partner_id,
+                "amount": proof.amount_confirmed_usd,
+                "billing_month": proof.billing_month,
+                "snapshot_id": snapshot_id,
+            }
+
+    result = await asyncio.to_thread(mark)
+    if not result:
+        await _edit_billing_admin_message(q, "Không tìm thấy bill này.")
+        return
+    if result.get("already_done"):
+        await _edit_billing_admin_message(q, f"Bill này đã ở trạng thái <b>{_h(result.get('status'))}</b>.")
+        return
+    text = (
+        f"✅ Đã xác nhận bill <code>#{proof_id}</code>\n"
+        f"Đối tác: <b>{_h(result.get('partner_name'))}</b>\n"
+        f"Chu kỳ: <code>{_h(result.get('billing_month'))}</code>\n"
+        f"Số tiền: <b>{_usd(result.get('amount'))}</b>\n"
+        f"Snapshot đối soát: <code>#{result.get('snapshot_id') or '-'}</code>"
+    )
+    await _edit_billing_admin_message(q, text)
+    for chat_id in list(result.get("notify_chat_ids") or []):
+        try:
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"✅ Admin đã xác nhận bill <code>#{proof_id}</code>.\n"
+                    f"Số tiền đã ghi nhận: <b>{_usd(result.get('amount'))}</b>"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_back_to_partner(),
+            )
+        except Exception:
+            log.exception("payment_confirm_partner_notify_failed proof_id=%s chat_id=%s", proof_id, chat_id)
+
+
+async def cb_partner_billing_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if not await _is_admin(ctx, update.effective_user.id):
+        return
+    try:
+        proof_id = int(q.data.split(":", 1)[1])
+    except Exception:
+        return
+    sf = ctx.application.bot_data["session_factory"]
+
+    def mark():
+        with sf() as s:
+            proof = s.get(PartnerPaymentProof, proof_id)
+            if not proof:
+                return None
+            if proof.status != "submitted":
+                return {"already_done": True, "status": proof.status}
+            proof.status = "rejected"
+            proof.rejected_by_admin_telegram_id = update.effective_user.id if update.effective_user else None
+            proof.rejected_at = datetime.utcnow()
+            notify_chat_ids: list[int] = []
+            if proof.partner and proof.partner.telegram_user_id:
+                notify_chat_ids.append(int(proof.partner.telegram_user_id))
+            if proof.submitted_by_telegram_id:
+                notify_chat_ids.append(int(proof.submitted_by_telegram_id))
+            members = (
+                s.query(PartnerMember)
+                .filter_by(partner_id=proof.partner_id, active=True)
+                .filter(PartnerMember.role.in_(["owner", "accountant"]))
+                .all()
+            )
+            for member in members:
+                notify_chat_ids.append(int(member.telegram_user_id))
+            unique_notify_ids: list[int] = []
+            for chat_id in notify_chat_ids:
+                if chat_id not in unique_notify_ids:
+                    unique_notify_ids.append(chat_id)
+            s.commit()
+            return {
+                "notify_chat_ids": unique_notify_ids,
+                "partner_name": proof.partner.name if proof.partner else proof.partner_id,
+                "billing_month": proof.billing_month,
+            }
+
+    result = await asyncio.to_thread(mark)
+    if not result:
+        await _edit_billing_admin_message(q, "Không tìm thấy bill này.")
+        return
+    if result.get("already_done"):
+        await _edit_billing_admin_message(q, f"Bill này đã ở trạng thái <b>{_h(result.get('status'))}</b>.")
+        return
+    await _edit_billing_admin_message(
+        q,
+        f"❌ Đã từ chối bill <code>#{proof_id}</code>\nĐối tác: <b>{_h(result.get('partner_name'))}</b>",
+    )
+    for chat_id in list(result.get("notify_chat_ids") or []):
+        try:
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❌ Admin đã từ chối bill <code>#{proof_id}</code>.\n"
+                    "Vui lòng kiểm tra lại ảnh chuyển khoản và gửi bill mới."
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_back_to_partner(),
+            )
+        except Exception:
+            log.exception("payment_reject_partner_notify_failed proof_id=%s chat_id=%s", proof_id, chat_id)
+
+
+async def _weekly_billing_tick(app: Application):
+    settings: Settings = app.bot_data["settings"]
+    if not bool(settings.partner_weekly_billing_enabled):
+        return
+    bc: BackendClient | None = app.bot_data.get("backend_client")
+    if bc is None or not bc.enabled:
+        return
+    now = _billing_local_now(settings)
+    if now.weekday() != int(settings.partner_billing_notice_weekday or 6):
+        return
+    if now.hour < int(settings.partner_billing_notice_hour or 18):
+        return
+    sf = app.bot_data["session_factory"]
+
+    def fetch_partners():
+        with sf() as s:
+            return (
+                s.query(Partner)
+                .filter_by(active=True)
+                .order_by(Partner.created_at.asc())
+                .all()
+            )
+
+    partners = await asyncio.to_thread(fetch_partners)
+    for partner in partners:
+        snapshot = await _partner_billing_snapshot_from_bot_data(app.bot_data, partner)
+        if snapshot is None or int(snapshot.get("amount_due_usd") or 0) <= 0:
+            continue
+        billing_month = str(snapshot.get("billing_month") or _billing_month_key(now, settings=settings))
+        week_key = str(snapshot.get("week_key") or _billing_week_key(now))
+
+        def notice_exists() -> bool:
+            with sf() as s:
+                return (
+                    s.query(PartnerBillingNotice)
+                    .filter_by(partner_id=partner.id, billing_month=billing_month, week_key=week_key)
+                    .first()
+                    is not None
+                )
+
+        if await asyncio.to_thread(notice_exists):
+            continue
+        chat_ids = await _partner_billing_chat_ids_from_bot_data(app.bot_data, partner.id)
+        if not chat_ids:
+            continue
+        text = _partner_billing_text(snapshot, title="📌 Nhắc thanh toán công nợ tuần")
+        sent_message_id = None
+        sent_count = 0
+        for chat_id in chat_ids:
+            try:
+                msg = await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_partner_billing_keyboard(snapshot),
+                )
+                sent_count += 1
+                if sent_message_id is None:
+                    sent_message_id = msg.message_id
+            except Exception:
+                log.exception("weekly_billing_notice_send_failed partner_id=%s chat_id=%s", partner.id, chat_id)
+        if sent_count <= 0:
+            continue
+
+        def save_notice():
+            with sf() as s:
+                s.add(
+                    PartnerBillingNotice(
+                        partner_id=partner.id,
+                        billing_month=billing_month,
+                        week_key=week_key,
+                        billable_users=int(snapshot.get("billable_users") or 0),
+                        support_active_users=int(snapshot.get("support_active_users") or 0),
+                        amount_due_usd=int(snapshot.get("amount_due_usd") or 0),
+                        telegram_message_id=sent_message_id,
+                        sent_at=datetime.utcnow(),
+                    )
+                )
+                s.commit()
+
+        try:
+            await asyncio.to_thread(save_notice)
+        except Exception:
+            log.exception("weekly_billing_notice_save_failed partner_id=%s", partner.id)
+
+
+WEEKLY_BILLING_INTERVAL_SEC = 3600
+
+
+async def _weekly_billing_loop(app: Application):
+    log.info("weekly_billing loop started (interval=%ds)", WEEKLY_BILLING_INTERVAL_SEC)
+    while True:
+        try:
+            await _weekly_billing_tick(app)
+        except Exception:
+            log.exception("weekly_billing_tick_failed")
+        await asyncio.sleep(WEEKLY_BILLING_INTERVAL_SEC)
+
+
 # Issue flow: pick bot button
 async def cb_issue_pick_bot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     role, partner = await _async_role(ctx, update.effective_user.id)
     if role != "partner":
+        return
+    member_role = await _async_partner_member_role(ctx, partner, update.effective_user.id)
+    if not _partner_can(member_role, "token_write"):
+        await _safe_edit_message_text(
+            q,
+            _partner_permission_denied_text(member_role, "tạo mã cho khách"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_back_to_partner(),
+        )
         return
     bot_id = q.data.split(":", 1)[1]
     ctx.user_data["issue_bot_id"] = bot_id
@@ -1761,6 +3638,15 @@ async def cb_issue_days(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     role, partner = await _async_role(ctx, update.effective_user.id)
     if role != "partner":
+        return
+    member_role = await _async_partner_member_role(ctx, partner, update.effective_user.id)
+    if not _partner_can(member_role, "token_write"):
+        await _safe_edit_message_text(
+            q,
+            _partner_permission_denied_text(member_role, "tạo mã cho khách"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_back_to_partner(),
+        )
         return
     days = int(q.data.split(":", 1)[1])
     bot_id = ctx.user_data.pop("issue_bot_id", None)
@@ -1841,6 +3727,8 @@ async def cb_issue_days(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     revoked=False,
                     end_user_username=user_label,
                     created_by=f"backend-product:partner:{partner.id}",
+                    issued_by_telegram_id=update.effective_user.id if update.effective_user else None,
+                    issued_by_username=update.effective_user.username if update.effective_user else None,
                 )
             )
             s.commit()
@@ -1949,6 +3837,15 @@ async def cb_renew_pick_token(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     role, partner = await _async_role(ctx, update.effective_user.id)
     if role != "partner":
         return
+    member_role = await _async_partner_member_role(ctx, partner, update.effective_user.id)
+    if not _partner_can(member_role, "token_write"):
+        await _safe_edit_message_text(
+            q,
+            _partner_permission_denied_text(member_role, "gia hạn mã"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_back_to_partner(),
+        )
+        return
     jti = q.data.split(":", 1)[1]
     sf = ctx.application.bot_data["session_factory"]
 
@@ -2029,6 +3926,15 @@ async def cb_renew_days(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     role, partner = await _async_role(ctx, update.effective_user.id)
     if role != "partner":
         return
+    member_role = await _async_partner_member_role(ctx, partner, update.effective_user.id)
+    if not _partner_can(member_role, "token_write"):
+        await _safe_edit_message_text(
+            q,
+            _partner_permission_denied_text(member_role, "gia hạn mã"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_back_to_partner(),
+        )
+        return
     days = int(q.data.split(":", 1)[1])
     old_jti = ctx.user_data.pop("renew_jti", None)
     khach = ctx.user_data.pop("renew_khach", None)
@@ -2107,6 +4013,8 @@ async def cb_renew_days(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     revoked=False,
                     end_user_username=khach,
                     created_by=f"backend-product:partner:{partner.id}:renew",
+                    issued_by_telegram_id=update.effective_user.id if update.effective_user else None,
+                    issued_by_username=update.effective_user.username if update.effective_user else None,
                 )
             )
             old = s.get(Token, old_jti)
@@ -2143,6 +4051,13 @@ async def msg_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not state:
         return
     text = update.message.text.strip()
+
+    if state == "partner_payment_photo":
+        await update.message.reply_text(
+            "Bạn cần gửi ảnh bill chuyển khoản để admin xác nhận. Gõ /cancel nếu muốn hủy.",
+            reply_markup=_back_to_partner(),
+        )
+        return
 
     # ─── Add partner flow (admin) ───
     if state == "add_partner_tg_id":
@@ -2186,15 +4101,16 @@ async def msg_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pid = f"p_{tg_id}"
                 if s.get(Partner, pid):
                     pid = f"p_{tg_id}_{int(datetime.utcnow().timestamp())}"
-                s.add(
-                    Partner(
-                        id=pid,
-                        name=name,
-                        contact=f"tg:{tg_id}",
-                        active=True,
-                        telegram_user_id=tg_id,
-                    )
+                partner = Partner(
+                    id=pid,
+                    name=name,
+                    contact=f"tg:{tg_id}",
+                    active=True,
+                    telegram_user_id=tg_id,
                 )
+                s.add(partner)
+                s.flush()
+                _sync_owner_member(s, partner)
                 s.commit()
                 return (
                     f"✅ Đã thêm đối tác\n"
@@ -2208,6 +4124,100 @@ async def msg_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             text_out, parse_mode=ParseMode.HTML, reply_markup=_admin_menu()
         )
+        return
+
+    if state == "add_member_text":
+        if not await _is_admin(ctx, update.effective_user.id):
+            ctx.user_data.clear()
+            return
+        partner_id = str(ctx.user_data.pop("member_partner_id", "") or "")
+        ctx.user_data.pop("awaiting", None)
+        if not partner_id:
+            await update.message.reply_text("Phiên thao tác đã hết hạn. Thử lại nhé.", reply_markup=_admin_menu())
+            return
+        parts = text.split()
+        if not parts:
+            await update.message.reply_text("Gửi theo mẫu: TELEGRAM_ID role. Ví dụ: 123456789 operator")
+            return
+        try:
+            member_tg_id = int(parts[0])
+        except ValueError:
+            await update.message.reply_text("Telegram ID phải là số nguyên. Thử lại bằng menu thêm member nhé.", reply_markup=_admin_menu())
+            return
+        member_role = "operator"
+        member_username = None
+        for part in parts[1:]:
+            role_candidate = part.strip().lower()
+            if role_candidate in PARTNER_MEMBER_ROLES:
+                member_role = role_candidate
+            elif part.startswith("@"):
+                member_username = part.lstrip("@")[:64]
+        sf = ctx.application.bot_data["session_factory"]
+
+        def do_add_member():
+            with sf() as s:
+                partner = s.get(Partner, partner_id)
+                if not partner:
+                    return "❌ Không tìm thấy đối tác."
+                other_owner = (
+                    s.query(Partner)
+                    .filter(Partner.id != partner_id)
+                    .filter(Partner.active == True)  # noqa: E712
+                    .filter(Partner.telegram_user_id == member_tg_id)
+                    .first()
+                )
+                if other_owner:
+                    return (
+                        f"⚠️ Telegram ID này đang là owner của partner "
+                        f"<code>{other_owner.id}</code> ({_h(other_owner.name)})."
+                    )
+                other_member = (
+                    s.query(PartnerMember)
+                    .join(Partner, PartnerMember.partner_id == Partner.id)
+                    .filter(PartnerMember.partner_id != partner_id)
+                    .filter(PartnerMember.telegram_user_id == member_tg_id)
+                    .filter(PartnerMember.active == True)  # noqa: E712
+                    .filter(Partner.active == True)  # noqa: E712
+                    .first()
+                )
+                if other_member:
+                    return (
+                        f"⚠️ Telegram ID này đang là member của partner "
+                        f"<code>{other_member.partner_id}</code>."
+                    )
+                member = (
+                    s.query(PartnerMember)
+                    .filter_by(partner_id=partner_id, telegram_user_id=member_tg_id)
+                    .first()
+                )
+                if member is None:
+                    member = PartnerMember(
+                        partner_id=partner_id,
+                        telegram_user_id=member_tg_id,
+                        telegram_username=member_username,
+                        role=member_role,
+                        active=True,
+                        added_by_admin_telegram_id=update.effective_user.id if update.effective_user else None,
+                    )
+                    s.add(member)
+                    action = "Đã thêm"
+                else:
+                    member.role = member_role
+                    member.active = True
+                    member.revoked_at = None
+                    if member_username:
+                        member.telegram_username = member_username
+                    action = "Đã cập nhật"
+                s.commit()
+                return (
+                    f"✅ {action} member cho <code>{partner_id}</code>\n"
+                    f"Telegram: <code>{member_tg_id}</code>\n"
+                    f"Vai trò: <b>{_h(_partner_role_label(member_role))}</b>\n\n"
+                    "Billing vẫn gom theo partner, không tách theo từng người tạo."
+                )
+
+        text_out = await asyncio.to_thread(do_add_member)
+        await update.message.reply_text(text_out, parse_mode=ParseMode.HTML, reply_markup=_admin_menu())
         return
 
     # ─── Partner search flow ───
@@ -2229,6 +4239,15 @@ async def msg_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         role, partner = await _async_role(ctx, update.effective_user.id)
         if role != "partner":
             ctx.user_data.clear()
+            return
+        member_role = await _async_partner_member_role(ctx, partner, update.effective_user.id)
+        if not _partner_can(member_role, "token_write"):
+            ctx.user_data.clear()
+            await update.message.reply_text(
+                _partner_permission_denied_text(member_role, "tạo mã cho khách"),
+                parse_mode=ParseMode.HTML,
+                reply_markup=_back_to_partner(),
+            )
             return
         label = text[:64].strip()
         if not label:
@@ -2256,7 +4275,7 @@ async def msg_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not bot_ids:
             await update.message.reply_text(
                 "Bạn chưa có bot nào đang dùng được. Liên hệ đội vận hành CNTx Labs.",
-                reply_markup=_partner_menu(),
+                reply_markup=_partner_menu(member_role),
             )
             return
         kb = [
@@ -2483,6 +4502,7 @@ async def _post_init(app: Application):
         asyncio.create_task(_notifier_loop(app), name="expiry_notifier"),
         asyncio.create_task(_lock_check_loop(app), name="lock_checker"),
         asyncio.create_task(force_stop_retry.run_loop(app), name="force_stop_retry"),
+        asyncio.create_task(_weekly_billing_loop(app), name="weekly_billing"),
     ]
     app.bot_data["background_tasks"] = tasks
 
@@ -2554,6 +4574,7 @@ def build_application(settings: Settings) -> Application:
 
     app.add_handler(CallbackQueryHandler(cb_admin_menu, pattern=r"^menu:"))
     app.add_handler(CallbackQueryHandler(cb_partner_menu, pattern=r"^pmenu:"))
+    app.add_handler(CallbackQueryHandler(cb_member_pick_partner, pattern=r"^member_p:"))
     app.add_handler(CallbackQueryHandler(cb_grant_partner, pattern=r"^grant_p:"))
     app.add_handler(CallbackQueryHandler(cb_grant_bot, pattern=r"^grant_b:"))
     app.add_handler(CallbackQueryHandler(cb_revoke_pick_bot, pattern=r"^rg_p:"))
@@ -2568,7 +4589,13 @@ def build_application(settings: Settings) -> Application:
     app.add_handler(CallbackQueryHandler(cb_partner_token_detail, pattern=r"^ptok_d:"))
     app.add_handler(CallbackQueryHandler(cb_partner_token_revoke_confirm, pattern=r"^ptok_rvc:"))
     app.add_handler(CallbackQueryHandler(cb_partner_token_revoke, pattern=r"^ptok_rv:"))
+    app.add_handler(CallbackQueryHandler(cb_partner_billing_snapshot_detail, pattern=r"^pbill_snap:"))
+    app.add_handler(CallbackQueryHandler(cb_partner_billing_menu, pattern=r"^pbill:"))
+    app.add_handler(CallbackQueryHandler(cb_partner_billing_pay, pattern=r"^pbill_pay:"))
+    app.add_handler(CallbackQueryHandler(cb_partner_billing_confirm, pattern=r"^pbill_confirm:"))
+    app.add_handler(CallbackQueryHandler(cb_partner_billing_reject, pattern=r"^pbill_reject:"))
 
+    app.add_handler(MessageHandler(filters.PHOTO, payment_photo_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_router))
     app.add_error_handler(on_error)
 

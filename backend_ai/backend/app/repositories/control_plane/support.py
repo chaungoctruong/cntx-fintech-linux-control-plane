@@ -502,6 +502,30 @@ def _build_runner_heartbeat_metadata(
         if value is not None:
             metadata[key] = value
 
+    for key in (
+        "runner_pool",
+        "pool",
+        "broker_pool",
+        "broker",
+        "broker_key",
+        "broker_route",
+        "broker_route_key",
+        "supported_brokers",
+        "supported_broker_keys",
+        "broker_keys",
+        "brokers",
+        "supported_mt5_servers",
+        "supported_servers",
+        "mt5_servers",
+        "broker_servers",
+        "broker_routing_version",
+    ):
+        value = heartbeat.get(key)
+        if value is None:
+            value = scale_vps.get(key)
+        if value is not None:
+            metadata[key] = value
+
     if "accepting_new_accounts" in scale_vps:
         metadata["accepting_new_accounts"] = scale_vps.get("accepting_new_accounts")
     if "allow_start_on_this_runner" in scale_vps:

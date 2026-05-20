@@ -2,6 +2,7 @@
 
 import {
   entitlementMatchesBot,
+  botSupportsBroker,
   formatBotProfileClass,
   formatBotDisplayName,
   getLatestDeploymentForAccount,
@@ -45,6 +46,7 @@ export function useMt5BotDerivedState({
 }: UseMt5BotDerivedStateArgs) {
   const brokerKey = selectedBroker.trim().toLowerCase();
   const filteredAccounts = accounts.filter((account) => account.broker.trim().toLowerCase() === brokerKey);
+  const brokerBots = bots.filter((bot) => botSupportsBroker(bot, selectedBroker));
   const selectedAccount =
     filteredAccounts.find((account) => account.id === selectedAccountId) ?? filteredAccounts[0] ?? null;
   const activeDeployment =
@@ -65,9 +67,9 @@ export function useMt5BotDerivedState({
     ) || deployments.some((deployment) => isActiveDeploymentStatus(deployment.status));
   const telegramUserHasOtherActiveBot = !mt5FullAccess && telegramUserHasActiveBot && !selectedAccountHasActiveBot;
   const selectedBot =
-    bots.find((bot) => bot.bot_name === selectedBotName) ??
+    brokerBots.find((bot) => bot.bot_name === selectedBotName) ??
     bots.find((bot) => bot.bot_name === selectedDeployment?.bot_name) ??
-    bots[0] ??
+    brokerBots[0] ??
     null;
   const controlsLocked =
     loadingState || refreshingState || startingBot || stoppingBot || deletingAccount || unlockingBotToken;
@@ -106,6 +108,7 @@ export function useMt5BotDerivedState({
 
   return {
     brokerKey,
+    brokerBots,
     filteredAccounts,
     selectedAccount,
     latestDeployment,

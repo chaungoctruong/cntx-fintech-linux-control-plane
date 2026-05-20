@@ -89,7 +89,8 @@ color dn_color = i_chu_de == "Bộ màu cho nền đen" ? color.rgb(255, 255, 0)
 
 //pivotLenLiq = input.int(4, "Pivot Length", group = "General Configuration", display = display.none)
 mssOffset = 5//input.int(5, "MSS Swing Length", group = "General Configuration")
-higherTimeframe = '10'//input.timeframe("10", "Higher Timeframe", group = "General Configuration")
+chartTfSeconds = timeframe.in_seconds()
+higherTimeframe = chartTfSeconds < timeframe.in_seconds("10") ? "10" : chartTfSeconds < timeframe.in_seconds("60") ? "60" : chartTfSeconds < timeframe.in_seconds("240") ? "240" : chartTfSeconds < timeframe.in_seconds("D") ? "D" : chartTfSeconds < timeframe.in_seconds("W") ? "W" : chartTfSeconds < timeframe.in_seconds("M") ? "M" : "12M"
 breakoutMethod = "Wick"//input.string("Wick", "Breakout Method", options = ["Close", "Wick"], group = "General Configuration")
 entryMethod = "Classic"//input.string("Classic", "Entry Method", options = ["Classic", "Adaptive"], group = "General Configuration", tooltip = "The entry method for the indicator to use. Try changing this setting if you are getting poor results.")
 dbgTPSLVersion = "Default"//input.string("Default", "TP / SL Layout", options = ["Default", "Alternative"], group = "General Configuration")
@@ -237,7 +238,7 @@ tfInMin = timeframe.in_seconds() / 60
 
 //#region Liqs
 if timeframe.in_seconds(higherTimeframe) <= timeframe.in_seconds()
-    runtime.error("Higher timeframe must be higher than current timeframe.")
+    runtime.error("Khung lớn hơn nội bộ phải cao hơn khung chart hiện tại.")
 int htfMins = timeframe.in_seconds(higherTimeframe) / 60
 int barLength = htfMins / tfInMin
 float high12 = ta.highest(barLength)

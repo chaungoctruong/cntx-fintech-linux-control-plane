@@ -164,7 +164,7 @@ class BackendClient:
             return None
         params: dict[str, Any] = {
             "scope": str(scope or "all"),
-            "limit": max(1, min(int(limit or 500), 500)),
+            "limit": max(1, min(int(limit or 500), 5000)),
         }
         query_s = str(query or "").strip()
         if query_s:

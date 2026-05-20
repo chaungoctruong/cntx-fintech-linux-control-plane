@@ -101,6 +101,15 @@ class Settings(BaseSettings):
     MINIAPP_BOTS_CACHE_TTL_SEC: float = 1.5
     MT5_BOT_CATALOG_DISABLED_CODES: List[str] = []
     BOT_CONTROL_COOLDOWN_SEC: int = 60
+    # Broker-aware runner placement. Prefer runner self-declared capability
+    # from register/heartbeat; MT5_RUNNER_BROKER_MAP is only an optional
+    # override/allowlist for special cases.
+    # MT5_BROKER_ROUTE_ALIASES=dbg=dbg,dbgmarkets;icmarket=icmarket,icmarkets
+    MT5_BROKER_ROUTING_ENABLED: bool = True
+    MT5_BROKER_ROUTING_STRICT: bool = True
+    MT5_BROKER_ROUTING_REQUIRE_CAPABILITY: bool = True
+    MT5_BROKER_ROUTE_ALIASES: str = ""
+    MT5_RUNNER_BROKER_MAP: str = ""
     BOT_TOKEN_TRADING_ROOT: str = ""
     BOT_TOKEN_ACCEPT_LEGACY_SHA256: bool = True
     BOT_TOKEN_SCHEMA_INIT_ENABLED: bool = True

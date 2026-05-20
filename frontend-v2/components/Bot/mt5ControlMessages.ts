@@ -100,6 +100,10 @@ export function getFriendlyRuntimeReason(
       return "Hệ thống đang hoàn tất thao tác trước đó. Đợi ít phút rồi thử lại.";
     case "runtime_death_confirmation_required":
       return "Hệ thống đang xác minh trạng thái an toàn. Thử lại sau ít phút.";
+    case "no_compatible_runner_for_broker":
+    case "broker_not_supported_on_runner":
+    case "broker_route_not_supported":
+      return "Sàn này chưa có máy MT5 tương thích đang sẵn sàng. Liên hệ hỗ trợ để kích hoạt node đúng sàn.";
     case "runner_full":
     case "no_available_unreserved_slot":
     case "no_scheduler_candidate":
@@ -193,6 +197,10 @@ export function getFriendlyMt5ActionError(action: Mt5BotAction, error: unknown):
     case "slot_not_ipc_ready":
     case "slot_resident_worker_missing":
       return "Phiên bot đang khởi động lại. Thử lại sau ít phút.";
+    case "no_compatible_runner_for_broker":
+    case "broker_not_supported_on_runner":
+    case "broker_route_not_supported":
+      return "Sàn này chưa có máy MT5 tương thích đang sẵn sàng. Liên hệ hỗ trợ để kích hoạt node đúng sàn.";
     case "runner_full":
     case "no_available_unreserved_slot":
     case "no_scheduler_candidate":

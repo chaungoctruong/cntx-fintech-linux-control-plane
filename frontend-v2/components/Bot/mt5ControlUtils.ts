@@ -40,10 +40,84 @@ function normalizeBotIdentity(value?: string | null): string {
   return String(value || "").trim().toLowerCase();
 }
 
+function compactIdentity(value?: string | null): string {
+  return String(value || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function botIdentityKeys(bot: MT5BotCatalogItem): string[] {
+  return [bot.bot_id, bot.bot_name, bot.display_name]
+    .map(compactIdentity)
+    .filter(Boolean);
+}
+
+function legacyBrokerGuard(bot: MT5BotCatalogItem, broker?: string | null): boolean | null {
+  const selectedBroker = brokerRouteKey(broker);
+  if (!selectedBroker) {
+    return null;
+  }
+  const identities = botIdentityKeys(bot);
+  if (identities.some((item) => item === "gsalgovip" || item === "gsalgo" || item === "gsalgomt5bot")) {
+    return selectedBroker === "dbg" || selectedBroker === "exness";
+  }
+  if (identities.some((item) => item === "xaubotai" || item === "xaubot")) {
+    return selectedBroker === "exness";
+  }
+  return null;
+}
+
+function stringList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || "").trim()).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return value
+      .split(/[,|\n;]+/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+export function brokerRouteKey(value?: string | null): string {
+  const compact = compactIdentity(value);
+  if (!compact) return "";
+  if (compact.includes("dbg")) return "dbg";
+  if (compact.includes("exness")) return "exness";
+  if (compact.includes("xm")) return "xm";
+  if (compact.includes("vantage")) return "vantage";
+  if (compact.includes("icmarket")) return "icmarket";
+  return compact;
+}
+
+export function botSupportsBroker(bot: MT5BotCatalogItem | null, broker?: string | null): boolean {
+  if (!bot) {
+    return false;
+  }
+  const legacyGuard = legacyBrokerGuard(bot, broker);
+  if (legacyGuard !== null) {
+    return legacyGuard;
+  }
+  const hints = getRecord(bot.resource_hints);
+  const runtimeEnv = getRecord(bot.runtime_env);
+  const supported = [
+    ...stringList(hints.supported_brokers),
+    ...stringList(hints.supported_broker_keys),
+    ...stringList(hints.brokers),
+    ...stringList(hints.broker_keys),
+    ...stringList(runtimeEnv.supported_brokers),
+    ...stringList(runtimeEnv.supported_broker_keys),
+  ];
+  if (supported.length === 0 || supported.includes("*")) {
+    return true;
+  }
+  const selectedBroker = brokerRouteKey(broker);
+  return Boolean(selectedBroker && supported.map(brokerRouteKey).includes(selectedBroker));
+}
+
 export function formatBotDisplayName(value?: string | null): string {
   const raw = String(value || "").trim();
-  const normalized = normalizeBotIdentity(raw).replace(/[^a-z0-9]/g, "");
-  if (normalized === "gsalgo" || normalized === "gsalgomt5bot") {
+  const normalized = compactIdentity(raw);
+  if (normalized === "gsalgovip" || normalized === "gsalgo" || normalized === "gsalgomt5bot") {
     return GSALGO_DISPLAY_NAME;
   }
   return raw;

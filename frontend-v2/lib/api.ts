@@ -595,7 +595,7 @@ interface MiniBotCatalogItem {
 }
 
 const GSALGO_DISPLAY_NAME = "Gs Algo";
-const GSALGO_DISPLAY_IDENTITIES = new Set(["gsalgo", "gsalgomt5bot"]);
+const GSALGO_DISPLAY_IDENTITIES = new Set(["gsalgovip", "gsalgo", "gsalgomt5bot"]);
 
 function normalizeBotDisplayIdentity(value?: string | null): string {
   return String(value || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");

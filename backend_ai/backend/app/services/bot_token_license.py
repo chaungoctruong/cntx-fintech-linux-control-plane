@@ -4,6 +4,7 @@ import json
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import Any, Optional
 
 from app.services.bot_tokens.catalog import BotTradingLicenseCatalog, LicensedBotPackage, normalize_bot_identity
@@ -211,6 +212,7 @@ def _format_partner_token_report_row(
         "token_status": str(row.get("status") or ""),
         "status_code": status_code,
         "status_label": status_label,
+        "issued_by_telegram_id": row.get("issued_by_telegram_id"),
         "issued_at": issued_at.isoformat() if issued_at is not None else None,
         "redeem_expires_at": _iso_dt(row.get("redeem_expires_at")),
         "redeemed_at": _iso_dt(row.get("redeemed_at")),
@@ -294,11 +296,24 @@ def _partner_token_report_summary(items: list[dict[str, Any]]) -> dict[str, Any]
 class BotTokenLicenseService:
     """PostgreSQL-backed token entitlement bridge for Mini App MT5 bot access."""
 
+    _schema_ready = False
+    _schema_lock = Lock()
+
     def __init__(self, store: Store) -> None:
         self.store = store
         self._catalog = BotTradingLicenseCatalog()
 
     def ensure_schema(self) -> None:
+        if self.__class__._schema_ready:
+            return
+        with self.__class__._schema_lock:
+            if self.__class__._schema_ready:
+                return
+
+            self._ensure_schema_uncached()
+            self.__class__._schema_ready = True
+
+    def _ensure_schema_uncached(self) -> None:
         def _do(_con: Any, cur: Any) -> None:
             cur.execute(
                 """
@@ -604,7 +619,7 @@ class BotTokenLicenseService:
             )
             return _format_entitlement(dict(cur.fetchone() or {}))
 
-        return self.store._with_retry_locked(_do, tries=1)
+        return self.store._with_retry_locked(_do, tries=5)
 
     def list_active_entitlements(
         self,
@@ -1046,7 +1061,7 @@ class BotTokenLicenseService:
         if scope_s not in {"all", "month"}:
             scope_s = "all"
         query_s = str(query or "").strip()
-        limit_i = max(1, min(int(limit or 500), 500))
+        limit_i = max(1, min(int(limit or 500), 5000))
         now = _utc_now()
         period_start, period_end = _billing_period_bounds(scope_s, now=now)
 

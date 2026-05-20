@@ -39,6 +39,17 @@ def ensure_schema_patches(engine: Engine) -> None:
             ("force_stop_attempts", "INTEGER DEFAULT 0"),
             ("force_stop_last_attempt", "DATETIME"),
             ("force_stop_last_error", "VARCHAR(255)"),
+            ("issued_by_telegram_id", "BIGINT"),
+            ("issued_by_username", "VARCHAR(64)"),
+        ],
+        "partners": [
+            ("billing_anchor_at", "DATETIME"),
+        ],
+        "partner_billing_notices": [
+            ("support_active_users", "INTEGER DEFAULT 0"),
+        ],
+        "partner_billing_snapshots": [
+            ("support_active_users", "INTEGER DEFAULT 0"),
         ],
     }
     with engine.connect() as conn:

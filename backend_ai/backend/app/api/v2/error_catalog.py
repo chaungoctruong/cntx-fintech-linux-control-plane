@@ -201,6 +201,16 @@ _ENTRIES: tuple[ErrorEntry, ...] = (
         retryable=True,
         group="bot",
     ),
+    ErrorEntry(
+        public_code="bot_not_available_for_broker",
+        http_status=status.HTTP_403_FORBIDDEN,
+        message_vi="Bot này không hỗ trợ sàn đang chọn. Vui lòng chọn bot khác hoặc đổi đúng sàn được cấp.",
+        message_en="This bot does not support the selected broker. Choose another bot or switch to the supported broker.",
+        action="fix_input",
+        retryable=False,
+        group="bot",
+        aliases=("bot_broker_not_supported", "bot_not_supported_for_broker"),
+    ),
     # ---------------------------------------------------------------
     # DEPLOYMENT
     # ---------------------------------------------------------------
@@ -399,6 +409,16 @@ _ENTRIES: tuple[ErrorEntry, ...] = (
         action="retry",
         retryable=True,
         group="runner",
+    ),
+    ErrorEntry(
+        public_code="no_compatible_runner_for_broker",
+        http_status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        message_vi="Sàn này chưa có máy MT5 tương thích đang sẵn sàng. Vui lòng thử lại sau hoặc liên hệ hỗ trợ.",
+        message_en="There is no ready MT5 runner compatible with this broker. Please try again later or contact support.",
+        action="contact_support",
+        retryable=False,
+        group="runner",
+        aliases=("broker_not_supported_on_runner", "broker_route_not_supported"),
     ),
     ErrorEntry(
         public_code="login_busy",

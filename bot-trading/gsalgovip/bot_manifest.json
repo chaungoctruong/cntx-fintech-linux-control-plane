@@ -96,6 +96,15 @@
     "high_modify_frequency": false,
     "needs_inbound_webhook": true,
     "requires_postgres": true,
+    "supported_brokers": [
+      "dbg",
+      "exness"
+    ],
+    "supported_mt5_servers": [
+      "DBGMarkets-Live",
+      "Exness-MT5Real",
+      "Exness-MT5Trial17"
+    ],
     "default_webhook_port": 8017,
     "memory_hint_mb": 256,
     "cpu_hint_cores": 0.25

@@ -12,6 +12,12 @@ BOT_TOKEN: str = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 BACKEND_URL: str = (os.getenv("BACKEND_URL", "http://127.0.0.1:8001") or "").strip().rstrip("/")
 BACKEND_API_KEY: str = (os.getenv("BACKEND_API_KEY") or "").strip()
 PUBLIC_BASE_URL: str = (os.getenv("PUBLIC_BASE_URL") or BACKEND_URL).strip().rstrip("/")
+MINIAPP_RELEASE: str = (
+    os.getenv("MINIAPP_RELEASE")
+    or os.getenv("NEXT_PUBLIC_RELEASE")
+    or os.getenv("VERCEL_GIT_COMMIT_SHA")
+    or ""
+).strip()
 
 AI_ENABLED: bool = (os.getenv("AI_ENABLED", "1") or "1").strip().lower() in ("1", "true", "yes", "y", "on")
 AI_COOLDOWN_SEC: float = float((os.getenv("AI_COOLDOWN_SEC", "1.2") or "1.2").strip())

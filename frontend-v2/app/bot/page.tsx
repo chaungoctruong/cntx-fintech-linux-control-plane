@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   AlertTriangle,
@@ -17,6 +17,7 @@ import { INTERNAL_BOT_NAV_MARKER } from "@/components/BottomNav";
 import MiniappTermsModal from "@/components/Bot/MiniappTermsModal";
 import Mt5BotControlPanel from "@/components/Bot/Mt5BotControlPanel";
 import PageHeader from "@/components/PageHeader";
+import { botSupportsBroker } from "@/components/Bot/mt5ControlUtils";
 import { useMiniappTerms } from "@/hooks/useMiniappTerms";
 import {
   BackendAPIError,
@@ -744,6 +745,10 @@ export default function BotPage() {
   const ctraderControlRef = useRef<HTMLDivElement | null>(null);
 
   const resolvedBroker = form.broker.trim();
+  const brokerMt5Bots = useMemo(
+    () => mt5Bots.filter((bot) => botSupportsBroker(bot, resolvedBroker)),
+    [mt5Bots, resolvedBroker]
+  );
   const selectedBrokerPreset =
     brokerPresets.find((preset) => brokerNamesMatch(preset.name, resolvedBroker)) ?? null;
   const selectedLane = selectedBrokerPreset?.lane ?? null;
@@ -752,8 +757,8 @@ export default function BotPage() {
   const selectedBrokerServerPending = isServerPendingBroker(resolvedBroker);
   const selectedBrokerFixedServer = getFixedMt5Server(resolvedBroker);
   const selectedMt5Bot =
-    mt5Bots.find((bot) => bot.bot_name === selectedMt5BotName) ??
-    mt5Bots.find((bot) => bot.bot_id === selectedMt5BotName) ??
+    brokerMt5Bots.find((bot) => bot.bot_name === selectedMt5BotName) ??
+    brokerMt5Bots.find((bot) => bot.bot_id === selectedMt5BotName) ??
     null;
   const mt5BotToken = mt5BotTokenInput.trim();
   const mt5FullAccess = miniappAccess?.mt5_full_access === true;
@@ -1203,7 +1208,7 @@ export default function BotPage() {
   const loadMt5BotCatalog = useCallback(async () => {
     setLoadingMt5Bots(true);
     try {
-      const response = await fetchMt5BotCatalog();
+      const response = await fetchMt5BotCatalog(true);
       setMt5Bots(response.items);
       setMt5BotCatalogError(null);
     } catch (error) {
@@ -1226,22 +1231,22 @@ export default function BotPage() {
   }, [loadMt5BotCatalog, selectedLane]);
 
   useEffect(() => {
-    if (!mt5Bots.length) {
+    if (!brokerMt5Bots.length) {
       setSelectedMt5BotName("");
       return;
     }
 
     if (!selectedMt5BotName) {
-      const preferredBot = mt5Bots.find((bot) => bot.display_name === "Gs Algo") ?? mt5Bots[0];
+      const preferredBot = brokerMt5Bots.find((bot) => bot.display_name === "Gs Algo") ?? brokerMt5Bots[0];
       setSelectedMt5BotName(preferredBot.bot_name);
       return;
     }
 
-    if (selectedMt5BotName && !mt5Bots.some((bot) => bot.bot_name === selectedMt5BotName)) {
+    if (selectedMt5BotName && !brokerMt5Bots.some((bot) => bot.bot_name === selectedMt5BotName)) {
       setSelectedMt5BotName("");
       setMt5BotTokenInput("");
     }
-  }, [mt5Bots, selectedMt5BotName]);
+  }, [brokerMt5Bots, selectedMt5BotName]);
 
   useEffect(() => {
     if (selectedBrokerFixedServer) {
@@ -2009,26 +2014,27 @@ export default function BotPage() {
                                     </div>
                                   ) : null}
 
-                                  {mt5Bots.length > 0 ? (
+                                  {brokerMt5Bots.length > 0 ? (
                                     <label className="space-y-2">
                                       <span className="text-xs font-semibold uppercase tracking-[0.18em] text-cyber-muted">
                                         Bot bạn muốn dùng
                                       </span>
-                                      <button
-                                        type="button"
-                                        className={`${inputClassName} flex min-h-[54px] items-center gap-2 text-left font-semibold`}
-                                        onClick={() => {
-                                          const preferredBot = selectedMt5Bot ?? mt5Bots[0] ?? null;
-                                          if (!preferredBot) return;
-                                          setSelectedMt5BotName(preferredBot.bot_name);
-                                        }}
+                                      <select
+                                        className={`${inputClassName} min-h-[54px] font-semibold`}
+                                        value={selectedMt5Bot?.bot_name ?? ""}
+                                        onChange={(event) => setSelectedMt5BotName(event.target.value)}
+                                        disabled={submitting || loadingMt5Bots}
                                       >
-                                        <span>{selectedMt5Bot?.display_name || "Gs Algo"}</span>
-                                      </button>
+                                        {brokerMt5Bots.map((bot) => (
+                                          <option key={bot.bot_id || bot.bot_name} value={bot.bot_name}>
+                                            {bot.display_name}
+                                          </option>
+                                        ))}
+                                      </select>
                                     </label>
                                   ) : (
                                     <div className="rounded-2xl border border-dashed border-white/10 bg-transparent px-4 py-4 text-sm text-cyber-muted">
-                                      Chưa có bot nào khả dụng lúc này. Hãy thử làm mới lại sau ít phút.
+                                      Chưa có bot nào khả dụng cho sàn {brokerDisplayName}. Hãy thử làm mới lại sau ít phút.
                                     </div>
                                   )}
 
@@ -2089,7 +2095,7 @@ export default function BotPage() {
                                       ? selectedBrokerFixedServer
                                       : selectedBrokerServerPending
                                       ? DBG_MARKETS_SERVER_PENDING_LABEL
-                                      : "Ví dụ: Exness-MT5Real / XMGlobal-MT5 7"
+                                      : "Ví dụ: Exness-MT5Real"
                                   }
                                   disabled={
                                     Boolean(selectedBrokerFixedServer) ||
