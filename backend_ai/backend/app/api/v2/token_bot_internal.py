@@ -47,6 +47,21 @@ class ProductTokenRevokeRequest(BaseModel):
     reason: str = Field(default="partner_revoke", max_length=200)
 
 
+@router.get("/bots")
+async def token_bot_internal_list_bots(
+    _: None = Depends(require_internal_key),
+    licenses: BotTokenLicenseService = Depends(bot_token_license_dep),
+) -> dict[str, Any]:
+    """Bot catalog for token-bot grant/issue UI.
+
+    This endpoint is intentionally driven by the platform catalog, not by
+    hardcoded bot names, so runner-reported bots and bot-trading packages both
+    become grantable once they are active in ``bot_catalog``.
+    """
+    items = licenses.list_available_bots()
+    return {"items": items, "count": len(items)}
+
+
 @router.post("/partners/upsert")
 async def token_bot_internal_upsert_partner(
     payload: ProductPartnerUpsertRequest,

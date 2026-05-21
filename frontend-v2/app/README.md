@@ -10,7 +10,7 @@
 - `layout.tsx`: khung gốc, metadata, providers mức ứng dụng.
 - `page.tsx`: trang chủ Mini App.
 - `globals.css`: style nền tảng toàn app.
-- `wallet/page.tsx`, `rewards/page.tsx`, `rankbot/page.tsx`: các tab/route theo tính năng.
+- `wallet/page.tsx`, `rewards/page.tsx`: các tab/route theo tính năng.
 - `bot/page.tsx`: route bot chính.
 - `bot/control/page.tsx`: màn điều khiển MT5 trong Mini App.
 - `bot/ctrader/callback/page.tsx`: callback lane cTrader (legacy) nếu được dùng trong flow hiện tại.

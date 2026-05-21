@@ -72,8 +72,8 @@ _ADMIN_QUOTA_LIMITS = {
     "enterprise": {"max_active_deployments": _ADMIN_ACCOUNT_QUOTA_LIMIT, "max_accounts": _ADMIN_ACCOUNT_QUOTA_LIMIT},
 }
 _DBG_MARKETS_FIXED_SERVER = "DBGMarkets-Live"
-_GSALGO_DISPLAY_NAME = "Gs Algo"
-_GSALGO_DISPLAY_IDENTITIES = {"gsalgovip", "gsalgo", "gsalgomt5bot"}
+MT5_LOGIN_PUBLIC_ERROR_CODE = "mt5_login_failed"
+MT5_LOGIN_PUBLIC_ERROR_MESSAGE = "Thông tin tài khoản MT5 chưa đúng. Vui lòng kiểm tra login, mật khẩu hoặc server."
 
 
 def _bot_control_cooldown_sec() -> int:
@@ -94,6 +94,28 @@ _BOT_EXECUTION_CONTRACT_TEXT_KEYS = (
     "tradingview_webhook_owner",
 )
 _BOT_EXECUTION_CONTRACT_BOOL_KEYS = ("requires_executor_slot",)
+_DCA_LIMIT_CAPABILITY_KEYS = (
+    "supports_pending_orders",
+    "supports_limit_orders",
+    "supports_pending_limit_orders",
+    "pending_orders",
+    "pending_limit_orders",
+    "mt5_pending_orders",
+    "mt5_limit_orders",
+    "tradingview_pending_orders",
+    "tradingview_limit_orders",
+    "tradingview_dca_limit",
+)
+_DCA_LIMIT_CAPABILITY_TOKENS = {
+    "pending_orders",
+    "pending_limit_orders",
+    "limit_orders",
+    "mt5_pending_orders",
+    "mt5_limit_orders",
+    "tradingview_pending_orders",
+    "tradingview_limit_orders",
+    "tradingview_dca_limit",
+}
 
 
 def _contract_bool(value: Any) -> bool:
@@ -328,17 +350,7 @@ def _norm_broker_identity(value: Any) -> str:
     return "".join(ch for ch in _norm_text(value).lower() if ch.isalnum())
 
 
-def _norm_bot_display_identity(value: Any) -> str:
-    return "".join(ch for ch in _norm_text(value).lower() if ch.isalnum())
-
-
-def _is_gsalgo_display_identity(*values: Any) -> bool:
-    return any(_norm_bot_display_identity(value) in _GSALGO_DISPLAY_IDENTITIES for value in values)
-
-
 def _bot_display_name(*, bot_code: Any, bot_name: Any, display_name: Any) -> str:
-    if _is_gsalgo_display_identity(bot_code, bot_name, display_name):
-        return _GSALGO_DISPLAY_NAME
     return _norm_text(display_name or bot_name or bot_code)
 
 
@@ -913,6 +925,364 @@ class MT5ControlPlaneService:
             return value
         return None
 
+    @classmethod
+    def _tradingview_entry_price(cls, body: dict[str, Any]) -> float | None:
+        return cls._optional_positive_body_float(body, "entry_price", "entry", "entry_level")
+
+    @staticmethod
+    def _tradingview_int_setting(name: str, default: int) -> int:
+        raw = getattr(settings, name, default)
+        if raw is None or str(raw).strip() == "":
+            return int(default)
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return int(default)
+
+    @staticmethod
+    def _tradingview_float_setting(name: str, default: float) -> float:
+        raw = getattr(settings, name, default)
+        if raw is None or str(raw).strip() == "":
+            return float(default)
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return float(default)
+
+    @staticmethod
+    def _optional_body_int(body: dict[str, Any], *keys: str) -> int | None:
+        for key in keys:
+            raw = body.get(key)
+            if raw is None or str(raw).strip() == "":
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                raise ValueError(f"tradingview_{key}_invalid")
+            if not value.is_integer():
+                raise ValueError(f"tradingview_{key}_invalid")
+            return int(value)
+        return None
+
+    @staticmethod
+    def _optional_timestamp_ms(body: dict[str, Any], *keys: str) -> int | None:
+        for key in keys:
+            raw = body.get(key)
+            if raw is None or str(raw).strip() == "":
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                raise ValueError(f"tradingview_{key}_invalid")
+            if value <= 0:
+                raise ValueError(f"tradingview_{key}_invalid")
+            if value < 10_000_000_000:
+                value *= 1000.0
+            return int(value)
+        return None
+
+    @classmethod
+    def _tradingview_contract_context(cls, body: dict[str, Any]) -> dict[str, Any]:
+        expected = max(1, cls._tradingview_int_setting("TRADINGVIEW_ORDER_CONTRACT_VERSION", 2))
+        required = bool(getattr(settings, "TRADINGVIEW_REQUIRE_CONTRACT_VERSION", True))
+        version = cls._optional_body_int(
+            body,
+            "contract_version",
+            "schema_version",
+            "order_contract_version",
+            "payload_version",
+        )
+        if required and version is None:
+            raise ValueError("tradingview_contract_version_required")
+        if version is not None and version != expected:
+            raise ValueError("tradingview_contract_version_unsupported")
+
+        alert_time_ms = cls._optional_timestamp_ms(body, "alert_time_ms", "sent_at_ms", "timenow_ms")
+        if required and alert_time_ms is None:
+            raise ValueError("tradingview_alert_time_required")
+
+        received_at_ms = int(time.time() * 1000)
+        max_age_sec = max(0, cls._tradingview_int_setting("TRADINGVIEW_ALERT_MAX_AGE_SEC", 300))
+        future_skew_sec = max(0, cls._tradingview_int_setting("TRADINGVIEW_ALERT_FUTURE_SKEW_SEC", 60))
+        alert_age_sec: float | None = None
+        if alert_time_ms is not None:
+            alert_age_sec = (received_at_ms - alert_time_ms) / 1000.0
+            if max_age_sec > 0 and alert_age_sec > max_age_sec:
+                raise ValueError("tradingview_alert_stale")
+            if future_skew_sec > 0 and alert_age_sec < -future_skew_sec:
+                raise ValueError("tradingview_alert_clock_skew")
+
+        return {
+            "contract_version": version or expected,
+            "expected_contract_version": expected,
+            "alert_time_ms": alert_time_ms,
+            "bar_time_ms": cls._optional_timestamp_ms(body, "bar_time_ms", "bar_time", "time_ms"),
+            "received_at_ms": received_at_ms,
+            "alert_age_sec": alert_age_sec,
+            "alert_max_age_sec": max_age_sec,
+            "alert_future_skew_sec": future_skew_sec,
+        }
+
+    @classmethod
+    def _validate_tradingview_volume_limit(cls, volume: float) -> None:
+        max_volume = cls._tradingview_float_setting("TRADINGVIEW_MAX_VOLUME", 10.0)
+        if max_volume > 0 and float(volume) > max_volume:
+            raise ValueError("tradingview_volume_exceeds_limit")
+
+    @classmethod
+    def _validate_tradingview_price_distances(cls, *, sl_distance: float, tp_distance: float) -> None:
+        min_distance = cls._tradingview_float_setting("TRADINGVIEW_MIN_PRICE_DISTANCE", 0.0)
+        max_distance = cls._tradingview_float_setting("TRADINGVIEW_MAX_PRICE_DISTANCE", 250.0)
+        if min_distance > 0 and (sl_distance < min_distance or tp_distance < min_distance):
+            raise ValueError("tradingview_price_distance_below_minimum")
+        if max_distance > 0 and (sl_distance > max_distance or tp_distance > max_distance):
+            raise ValueError("tradingview_price_distance_exceeds_limit")
+
+    @classmethod
+    def _tradingview_payload_metadata(cls, body: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+        guard = dict(request.get("risk_guard") or {}) if isinstance(request.get("risk_guard"), dict) else {}
+        alert_time_ms = request.get("alert_time_ms")
+        bar_time_ms = request.get("bar_time_ms")
+        received_at_ms = request.get("alert_received_at_ms")
+        payload: dict[str, Any] = {
+            "tradingview_contract_version": request.get("order_contract_version") or guard.get("contract_version"),
+            "tradingview_alert_received_at_ms": received_at_ms,
+            "tradingview_guard": guard or {
+                "source": "backend_tradingview_ingress",
+                "enforcement": "reject_order_only",
+                "account_locking": False,
+                "entry_price_required": True,
+                "max_volume": cls._tradingview_float_setting("TRADINGVIEW_MAX_VOLUME", 10.0),
+                "min_price_distance": cls._tradingview_float_setting("TRADINGVIEW_MIN_PRICE_DISTANCE", 0.0),
+                "max_price_distance": cls._tradingview_float_setting("TRADINGVIEW_MAX_PRICE_DISTANCE", 250.0),
+            },
+        }
+        if alert_time_ms is not None:
+            payload["tradingview_alert_time_ms"] = alert_time_ms
+        if bar_time_ms is not None:
+            payload["tradingview_bar_time_ms"] = bar_time_ms
+        if alert_time_ms is not None and received_at_ms is not None:
+            try:
+                payload["tradingview_alert_age_sec"] = round((float(received_at_ms) - float(alert_time_ms)) / 1000.0, 3)
+            except (TypeError, ValueError):
+                pass
+        for key in ("signal_role", "dca_price", "tv_symbol", "timeframe"):
+            if body.get(key) not in (None, ""):
+                payload[key] = body.get(key)
+        return payload
+
+    @classmethod
+    def _tradingview_dca_limit_requested(cls, body: dict[str, Any]) -> bool:
+        role = str(body.get("signal_role") or body.get("role") or "").strip().upper()
+        if role == "DCA":
+            return False
+        raw_type = str(body.get("dca_order_type") or body.get("dca_entry_type") or "").strip().lower()
+        if raw_type not in {"limit", "pending_limit", "buy_limit", "sell_limit"}:
+            return False
+        return cls._optional_positive_body_float(body, "dca_limit_price", "dca_price") is not None
+
+    @classmethod
+    def _tradingview_dca_limit_body(cls, body: dict[str, Any]) -> dict[str, Any]:
+        dca_price = cls._optional_positive_body_float(body, "dca_limit_price", "dca_price")
+        if dca_price is None:
+            raise ValueError("tradingview_dca_price_required")
+        dca_body = dict(body)
+        dca_body["entry_price"] = dca_price
+        dca_body["dca_price"] = dca_price
+        dca_body["signal_role"] = "DCA"
+        return dca_body
+
+    @staticmethod
+    def _tradingview_dict_payload(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+            except Exception:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    @classmethod
+    def _iter_tradingview_capability_sources(cls, *sources: Any) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        stack: list[tuple[dict[str, Any], int]] = []
+        for source in sources:
+            payload = cls._tradingview_dict_payload(source)
+            if payload:
+                stack.append((payload, 0))
+
+        while stack:
+            current, depth = stack.pop()
+            out.append(current)
+            if depth >= 3:
+                continue
+            for key in (
+                "capabilities",
+                "capabilities_json",
+                "metadata",
+                "metadata_json",
+                "runner_capabilities_json",
+                "runner_metadata_json",
+                "runtime_features",
+                "execution_contract",
+                "order_capabilities",
+                "mt5",
+                "tradingview",
+                "features",
+            ):
+                nested = cls._tradingview_dict_payload(current.get(key))
+                if nested:
+                    stack.append((nested, depth + 1))
+        return out
+
+    @classmethod
+    def _tradingview_payload_has_dca_limit_capability(cls, *sources: Any) -> bool:
+        for source in cls._iter_tradingview_capability_sources(*sources):
+            for key in _DCA_LIMIT_CAPABILITY_KEYS:
+                if key in source and _contract_bool(source.get(key)):
+                    return True
+            for key in ("capability_tags", "tags", "features", "supported_order_types", "order_types"):
+                raw = source.get(key)
+                values: list[Any]
+                if isinstance(raw, str):
+                    values = re.split(r"[,|\s;]+", raw)
+                elif isinstance(raw, (list, tuple, set)):
+                    values = list(raw)
+                else:
+                    values = []
+                normalized = {str(item or "").strip().lower() for item in values if str(item or "").strip()}
+                if normalized.intersection(_DCA_LIMIT_CAPABILITY_TOKENS):
+                    return True
+        return False
+
+    def _tradingview_dca_limit_runner_supported(self, source: dict[str, Any]) -> bool:
+        if not bool(getattr(settings, "TRADINGVIEW_REQUIRE_DCA_LIMIT_RUNNER_CAPABILITY", True)):
+            return True
+        if self._tradingview_payload_has_dca_limit_capability(source):
+            return True
+        runner_id = str((source or {}).get("runner_id") or "").strip()
+        if runner_id and hasattr(self._repo, "get_runner"):
+            try:
+                runner = self._repo.get_runner(runner_id=runner_id) or {}
+            except Exception:
+                runner = {}
+            if self._tradingview_payload_has_dca_limit_capability(runner):
+                return True
+        return False
+
+    @staticmethod
+    def _validate_tradingview_order_levels(
+        *,
+        side: str,
+        stop_loss: float,
+        take_profit: float,
+        entry_price: float | None = None,
+    ) -> None:
+        side_s = str(side or "").strip().lower()
+        if side_s == "buy":
+            if not stop_loss < take_profit:
+                raise ValueError("tradingview_price_levels_invalid")
+            if entry_price is not None and not stop_loss < entry_price < take_profit:
+                raise ValueError("tradingview_price_levels_invalid")
+            return
+        if side_s == "sell":
+            if not take_profit < stop_loss:
+                raise ValueError("tradingview_price_levels_invalid")
+            if entry_price is not None and not take_profit < entry_price < stop_loss:
+                raise ValueError("tradingview_price_levels_invalid")
+            return
+        raise ValueError("tradingview_side_invalid")
+
+    @classmethod
+    def _tradingview_place_order_request(
+        cls,
+        *,
+        symbol: str,
+        side: str,
+        volume: float,
+        stop_loss: float,
+        take_profit: float,
+        magic: int,
+        body: dict[str, Any],
+        entry_type: str = "market",
+    ) -> dict[str, Any]:
+        contract = cls._tradingview_contract_context(body)
+        entry_price = cls._tradingview_entry_price(body)
+        if entry_price is None:
+            raise ValueError("tradingview_entry_price_required")
+        cls._validate_tradingview_volume_limit(volume)
+        cls._validate_tradingview_order_levels(
+            side=side,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            entry_price=entry_price,
+        )
+        if str(side or "").strip().lower() == "buy":
+            sl_distance = entry_price - stop_loss
+            tp_distance = take_profit - entry_price
+        else:
+            sl_distance = stop_loss - entry_price
+            tp_distance = entry_price - take_profit
+        cls._validate_tradingview_price_distances(
+            sl_distance=sl_distance,
+            tp_distance=tp_distance,
+        )
+        entry_type_s = str(entry_type or body.get("entry_type") or body.get("order_entry_type") or "market").strip().lower()
+        if entry_type_s in {"pending_limit", "buy_limit", "sell_limit"}:
+            entry_type_s = "limit"
+        if entry_type_s not in {"market", "limit"}:
+            raise ValueError("tradingview_entry_type_invalid")
+        side_l = str(side or "").strip().lower()
+        order_type = "MARKET"
+        if entry_type_s == "limit":
+            order_type = "BUY_LIMIT" if side_l == "buy" else "SELL_LIMIT"
+        request: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "volume": volume,
+            "order_contract_version": contract["contract_version"],
+            "source": "tradingview",
+            "entry_type": entry_type_s,
+            "order_type": order_type,
+            "pending_order": entry_type_s == "limit",
+            # TradingView sends absolute chart price levels. Current Windows
+            # runners consume legacy sl/tp as price distances, so we bridge both
+            # contracts explicitly instead of forwarding ambiguous raw values.
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "sl_price": stop_loss,
+            "tp_price": take_profit,
+            "sl": sl_distance,
+            "tp": tp_distance,
+            "sl_distance": sl_distance,
+            "tp_distance": tp_distance,
+            "risk_unit": "absolute_price",
+            "distance_unit": "price_distance",
+            "magic": magic,
+            "entry_price": entry_price,
+            "alert_time_ms": contract.get("alert_time_ms"),
+            "bar_time_ms": contract.get("bar_time_ms"),
+            "alert_received_at_ms": contract.get("received_at_ms"),
+            "risk_guard": {
+                "source": "backend_tradingview_ingress",
+                "enforcement": "reject_order_only",
+                "account_locking": False,
+                "entry_price_required": True,
+                "contract_version": contract["contract_version"],
+                "max_volume": cls._tradingview_float_setting("TRADINGVIEW_MAX_VOLUME", 10.0),
+                "min_price_distance": cls._tradingview_float_setting("TRADINGVIEW_MIN_PRICE_DISTANCE", 0.0),
+                "max_price_distance": cls._tradingview_float_setting("TRADINGVIEW_MAX_PRICE_DISTANCE", 250.0),
+                "alert_max_age_sec": contract.get("alert_max_age_sec"),
+                "alert_future_skew_sec": contract.get("alert_future_skew_sec"),
+            },
+        }
+        if entry_type_s == "limit":
+            request["limit_price"] = entry_price
+            request["price"] = entry_price
+        return request
+
     @staticmethod
     def _tradingview_signal_id_for_bot(bot: dict[str, Any]) -> str:
         hints = dict((bot or {}).get("resource_hints") or {})
@@ -1076,7 +1446,7 @@ class MT5ControlPlaneService:
         self._repo.mark_account_runtime_login_result(
             account_id=int(account_id),
             ok=False,
-            error=reason_s,
+            error_text=reason_s,
         )
         self._store.add_audit(
             telegram_id=telegram_id,
@@ -1208,6 +1578,15 @@ class MT5ControlPlaneService:
         else:
             state = "UNKNOWN"
             next_action = "RETRY_LOGIN"
+        failed = state == "FAILED"
+        public_last_error = MT5_LOGIN_PUBLIC_ERROR_CODE if failed else reservation.get("last_error")
+        public_reservation = dict(reservation or {})
+        public_account = dict(account or {}) if account else account
+        if failed:
+            public_reservation.pop("payload_json", None)
+            public_reservation["last_error"] = MT5_LOGIN_PUBLIC_ERROR_CODE
+            if isinstance(public_account, dict):
+                public_account["last_error"] = MT5_LOGIN_PUBLIC_ERROR_CODE
         return {
             "id": reservation.get("id"),
             "login_reservation_id": reservation.get("id"),
@@ -1223,12 +1602,15 @@ class MT5ControlPlaneService:
             "command_id": reservation.get("command_id"),
             "redis_stream_id": reservation.get("redis_stream_id"),
             "expires_at": reservation.get("expires_at"),
-            "last_error": reservation.get("last_error"),
+            "last_error": public_last_error,
+            "user_message_key": MT5_LOGIN_PUBLIC_ERROR_CODE if failed else None,
+            "detail": MT5_LOGIN_PUBLIC_ERROR_MESSAGE if failed else None,
+            "message": MT5_LOGIN_PUBLIC_ERROR_MESSAGE if failed else None,
             "runtime_login_required": True,
             "credential_check_policy": "reserve_or_login_slot",
             "mt5_recovery_policy": "recover_or_launch",
-            "reservation": reservation,
-            "account": account,
+            "reservation": public_reservation,
+            "account": public_account,
         }
 
     async def request_account_login_slot(self, *, telegram_id: str, username: Optional[str], account_id: int) -> dict[str, Any]:
@@ -1664,8 +2046,10 @@ class MT5ControlPlaneService:
         if login_reservation_status == "verified":
             claimed_login_reservation = self._repo.claim_verified_login_reservation(account_id=int(account_id))
         account_status = str(account.get("raw_status") or account.get("status") or "").strip().lower()
-        if account_status in {"pending_login", "login_failed"} and not claimed_login_reservation:
+        if account_status == "pending_login" and not claimed_login_reservation:
             raise OrchestrationPolicyError("account_login_required")
+        if account_status == "login_failed" and not claimed_login_reservation:
+            raise OrchestrationPolicyError("mt5_login_failed")
         if claimed_login_reservation:
             account = dict(account)
             account["raw_status"] = account_status or account.get("status")
@@ -2063,8 +2447,8 @@ class MT5ControlPlaneService:
         dep = self._repo.get_active_deployment_for_account(account_id=int(account_id))
         if not dep:
             raise ValueError("deployment_not_found")
-        bot_needle = str(bot_code or "gsalgovip").strip()
-        if str(dep.get("bot_code") or "").strip() != bot_needle:
+        bot_needle = str(bot_code or "").strip()
+        if bot_needle and str(dep.get("bot_code") or "").strip() != bot_needle:
             raise ValueError("deployment_bot_mismatch")
         return dep
 
@@ -2080,7 +2464,7 @@ class MT5ControlPlaneService:
         Expected JSON fields (minimal):
         - alert_id | order_intent_id | id: stable id for idempotency
         - action: BUY|SELL|OPEN|CLOSE|CLOSE_BUY|CLOSE_SELL|...
-        - deployment_id (preferred) OR account_id (+ optional bot_code, default gsalgovip)
+        - deployment_id (preferred) OR account_id (+ optional bot_code guard)
         - symbol: required for PLACE_ORDER
         - volume: optional (defaults to deployment trading.lot_size)
         - CLOSE_ORDER: Windows requires ticket and/or position (body fields ticket, position, or position_id).
@@ -2088,6 +2472,9 @@ class MT5ControlPlaneService:
         - secret: optional if TRADINGVIEW_WEBHOOK_SECRET is set (prefer header X-TradingView-Secret)
 
         Inner MT5 fields are nested under payload.request for Windows executor compatibility.
+        TradingView SL/TP are absolute price levels and entry_price is required
+        so backend can validate direction and bridge legacy runner sl/tp
+        distance fields safely.
         """
         if not isinstance(body, dict):
             raise ValueError("invalid_request")
@@ -2119,7 +2506,7 @@ class MT5ControlPlaneService:
         except (TypeError, ValueError):
             acc_id_i = None
 
-        bot_code = str(body.get("bot_code") or "gsalgovip").strip()
+        bot_code = str(body.get("bot_code") or "").strip()
         dep = self._resolve_deployment_for_tradingview(
             deployment_id=dep_id_i,
             account_id=acc_id_i,
@@ -2165,8 +2552,8 @@ class MT5ControlPlaneService:
             if volume <= 0:
                 raise ValueError("tradingview_volume_required")
 
-            sl = self._optional_positive_body_float(body, "sl", "stop_loss")
-            tp = self._optional_positive_body_float(body, "tp", "take_profit")
+            sl = self._optional_positive_body_float(body, "stop_loss", "sl")
+            tp = self._optional_positive_body_float(body, "take_profit", "tp")
             if sl is None:
                 raise ValueError("tradingview_sl_required")
             if tp is None:
@@ -2177,18 +2564,39 @@ class MT5ControlPlaneService:
                 bot_code=str(dep.get("bot_code") or bot_code),
             )
 
-            req: dict[str, Any] = {
-                "symbol": symbol,
-                "side": side,
-                "volume": volume,
-                "sl": sl,
-                "tp": tp,
-                "magic": magic,
-            }
+            req = self._tradingview_place_order_request(
+                symbol=symbol,
+                side=side,
+                volume=volume,
+                stop_loss=sl,
+                take_profit=tp,
+                magic=magic,
+                body=body,
+            )
+            dca_body: dict[str, Any] | None = None
+            dca_req: dict[str, Any] | None = None
+            dca_skip_error = ""
+            if self._tradingview_dca_limit_requested(body):
+                if not self._tradingview_dca_limit_runner_supported(dep):
+                    dca_skip_error = "tradingview_dca_limit_runner_unsupported"
+                else:
+                    dca_body = self._tradingview_dca_limit_body(body)
+                    dca_req = self._tradingview_place_order_request(
+                        symbol=symbol,
+                        side=side,
+                        volume=volume,
+                        stop_loss=sl,
+                        take_profit=tp,
+                        magic=magic,
+                        body=dca_body,
+                        entry_type="limit",
+                    )
             dev_raw = body.get("deviation")
             if dev_raw is not None and str(dev_raw).strip():
                 try:
                     req["deviation"] = int(dev_raw)
+                    if dca_req is not None:
+                        dca_req["deviation"] = int(dev_raw)
                 except (TypeError, ValueError):
                     raise ValueError("tradingview_deviation_invalid")
 
@@ -2199,37 +2607,71 @@ class MT5ControlPlaneService:
                 command_type=cmd_type,
                 trace_id=trace_id,
             )
-            if existing:
-                return {
-                    "ok": True,
-                    "status": "duplicate",
-                    "command_id": existing.get("command_id"),
-                    "trace_id": trace_id,
-                    "deployment_id": deployment_id_i,
-                }
-
             validate_runtime_command_request(deployment=dep, allowed_statuses={"running"})
-            payload: dict[str, Any] = {"request": req}
-            if symbol != source_symbol:
-                payload["source_symbol"] = source_symbol
-                payload["mapped_symbol"] = symbol
-            for key in ("signal_role", "dca_price", "tv_symbol", "timeframe"):
-                if body.get(key) not in (None, ""):
-                    payload[key] = body.get(key)
-            result = await self._deployment_manager.dispatch_runtime_command(
-                deployment=dep,
-                command_type=CommandType.PLACE_ORDER,
-                payload=payload,
-                trace_id=trace_id,
-            )
-            cmd = result.get("command") or {}
-            return {
+            if existing:
+                main_status = "duplicate"
+                main_command_id = existing.get("command_id")
+            else:
+                payload: dict[str, Any] = {
+                    "request": req,
+                    **self._tradingview_payload_metadata(body, req),
+                }
+                if symbol != source_symbol:
+                    payload["source_symbol"] = source_symbol
+                    payload["mapped_symbol"] = symbol
+                result = await self._deployment_manager.dispatch_runtime_command(
+                    deployment=dep,
+                    command_type=CommandType.PLACE_ORDER,
+                    payload=payload,
+                    trace_id=trace_id,
+                )
+                cmd = result.get("command") or {}
+                main_status = "queued"
+                main_command_id = cmd.get("command_id")
+
+            response: dict[str, Any] = {
                 "ok": True,
-                "status": "queued",
-                "command_id": cmd.get("command_id"),
+                "status": main_status,
+                "command_id": main_command_id,
                 "trace_id": trace_id,
                 "deployment_id": deployment_id_i,
             }
+            if dca_req is not None and dca_body is not None:
+                dca_trace_id = f"{trace_id}:dca_limit"
+                existing_dca = self._repo.get_execution_command_by_trace_identity(
+                    account_id=account_id_i,
+                    deployment_id=deployment_id_i,
+                    command_type=cmd_type,
+                    trace_id=dca_trace_id,
+                )
+                if existing_dca:
+                    dca_status = "duplicate"
+                    dca_command_id = existing_dca.get("command_id")
+                else:
+                    dca_payload: dict[str, Any] = {
+                        "request": dca_req,
+                        **self._tradingview_payload_metadata(dca_body, dca_req),
+                    }
+                    if symbol != source_symbol:
+                        dca_payload["source_symbol"] = source_symbol
+                        dca_payload["mapped_symbol"] = symbol
+                    dca_result = await self._deployment_manager.dispatch_runtime_command(
+                        deployment=dep,
+                        command_type=CommandType.PLACE_ORDER,
+                        payload=dca_payload,
+                        trace_id=dca_trace_id,
+                    )
+                    dca_cmd = dca_result.get("command") or {}
+                    dca_status = "queued"
+                    dca_command_id = dca_cmd.get("command_id")
+                response["status"] = "queued" if "queued" in {main_status, dca_status} else "duplicate"
+                response["dca_status"] = dca_status
+                response["dca_command_id"] = dca_command_id
+                response["dca_trace_id"] = dca_trace_id
+            elif dca_skip_error:
+                response["dca_status"] = "skipped"
+                response["dca_error"] = dca_skip_error
+            return response
 
         # CLOSE_ORDER — Windows: ticket or position required; symbol/magic are supplementary only.
         symbol_close = str(body.get("symbol") or body.get("ticker") or "").strip()
@@ -2328,7 +2770,9 @@ class MT5ControlPlaneService:
         Optional:
           - bot_code (str): optional bot guard for multi-bot signal routing.
           - default_volume (float): legacy fallback only if deployment lot is missing.
-          - sl/tp or stop_loss/take_profit: required for PLACE_ORDER.
+          - sl/tp or stop_loss/take_profit: accepted inbound aliases for PLACE_ORDER.
+            They are absolute price levels; entry_price is required so backend
+            can validate direction and bridge legacy runner sl/tp distance fields.
           - CLOSE_ORDER resolves current position snapshots per subscriber and sends
             one ticket-based close command per open MT5 position. If no ticket is
             known for a subscriber, that subscriber gets a clear failed result.
@@ -2380,6 +2824,7 @@ class MT5ControlPlaneService:
                 raise ValueError("tradingview_side_required")
             if side not in {"buy", "sell"}:
                 raise ValueError("tradingview_side_invalid")
+            self._tradingview_contract_context(body)
 
         default_volume_raw = body.get("default_volume") or body.get("volume") or body.get("lot")
         default_volume: float | None = None
@@ -2388,8 +2833,8 @@ class MT5ControlPlaneService:
                 default_volume = float(default_volume_raw)
             except (TypeError, ValueError):
                 raise ValueError("tradingview_volume_invalid")
-        body_sl = self._optional_positive_body_float(body, "sl", "stop_loss")
-        body_tp = self._optional_positive_body_float(body, "tp", "take_profit")
+        body_sl = self._optional_positive_body_float(body, "stop_loss", "sl")
+        body_tp = self._optional_positive_body_float(body, "take_profit", "tp")
         if kind == "PLACE_ORDER":
             if body_sl is None:
                 raise ValueError("tradingview_sl_required")
@@ -2401,6 +2846,7 @@ class MT5ControlPlaneService:
             max_subs_i = int(max_subs) if max_subs is not None else 5000
         except (TypeError, ValueError):
             max_subs_i = 5000
+        dry_run = _contract_bool(body.get("dry_run") or body.get("validate_only"))
 
         subscribers = self._repo.list_subscribers_for_signal(
             signal_id=signal_id,
@@ -2444,7 +2890,12 @@ class MT5ControlPlaneService:
 
             if kind == "PLACE_ORDER" and vol <= 0:
                 # Per-subscriber skip; record failure rather than abort whole broadcast.
-                items.append({"_invalid_volume": True, "account_id": account_id, "subscription_id": sub.get("subscription_id")})
+                items.append({
+                    "_invalid_volume": True,
+                    "account_id": account_id,
+                    "subscription_id": sub.get("subscription_id"),
+                    "_subscription_id": sub.get("subscription_id"),
+                })
                 continue
 
             magic = self._stable_order_magic(
@@ -2456,14 +2907,44 @@ class MT5ControlPlaneService:
 
             if kind == "PLACE_ORDER":
                 trace_id = f"tv_bcast:{alert_id}:{account_id}:place_order"
-                request = {
-                    "symbol": order_symbol,
-                    "side": side,
-                    "volume": vol,
-                    "sl": body_sl,
-                    "tp": body_tp,
-                    "magic": magic,
-                }
+                dca_body: dict[str, Any] | None = None
+                dca_request: dict[str, Any] | None = None
+                dca_skip_error = ""
+                if self._tradingview_dca_limit_requested(body):
+                    if self._tradingview_dca_limit_runner_supported(sub):
+                        dca_body = self._tradingview_dca_limit_body(body)
+                    else:
+                        dca_skip_error = "tradingview_dca_limit_runner_unsupported"
+                try:
+                    request = self._tradingview_place_order_request(
+                        symbol=order_symbol,
+                        side=side,
+                        volume=vol,
+                        stop_loss=float(body_sl),
+                        take_profit=float(body_tp),
+                        magic=magic,
+                        body=body,
+                    )
+                    if dca_body is not None:
+                        dca_request = self._tradingview_place_order_request(
+                            symbol=order_symbol,
+                            side=side,
+                            volume=vol,
+                            stop_loss=float(body_sl),
+                            take_profit=float(body_tp),
+                            magic=magic,
+                            body=dca_body,
+                            entry_type="limit",
+                        )
+                except ValueError as exc:
+                    items.append({
+                        "_skip_dispatch": True,
+                        "_error": str(exc) or "tradingview_order_rejected",
+                        "account_id": account_id,
+                        "subscription_id": sub.get("subscription_id"),
+                        "_subscription_id": sub.get("subscription_id"),
+                    })
+                    continue
                 cmd_type = CommandType.PLACE_ORDER
             else:
                 close_kind = str(meta.get("close_kind") or "CLOSE").strip().upper() or "CLOSE"
@@ -2549,10 +3030,8 @@ class MT5ControlPlaneService:
                 "broadcast_bot_code": requested_bot_code,
                 "broadcast_source_symbol": symbol,
                 "broadcast_mapped_symbol": order_symbol,
+                **self._tradingview_payload_metadata(body, request),
             }
-            for key in ("signal_role", "dca_price", "tv_symbol", "timeframe"):
-                if body.get(key) not in (None, ""):
-                    payload[key] = body.get(key)
 
             items.append({
                 "command_type": cmd_type,
@@ -2565,7 +3044,42 @@ class MT5ControlPlaneService:
                 "trace_id": trace_id,
                 "payload": payload,
                 "_subscription_id": sub.get("subscription_id"),
+                "_signal_role": "ENTRY",
             })
+
+            if kind == "PLACE_ORDER" and dca_skip_error:
+                items.append({
+                    "_skip_dispatch": True,
+                    "_error": dca_skip_error,
+                    "account_id": account_id,
+                    "subscription_id": sub.get("subscription_id"),
+                    "_subscription_id": sub.get("subscription_id"),
+                    "_signal_role": "DCA",
+                })
+
+            if dca_request is not None and dca_body is not None:
+                dca_payload = {
+                    "request": dca_request,
+                    "broadcast_signal_id": signal_id,
+                    "broadcast_alert_id": alert_id,
+                    "broadcast_bot_code": requested_bot_code,
+                    "broadcast_source_symbol": symbol,
+                    "broadcast_mapped_symbol": order_symbol,
+                    **self._tradingview_payload_metadata(dca_body, dca_request),
+                }
+                items.append({
+                    "command_type": cmd_type,
+                    "account_id": account_id,
+                    "deployment_id": deployment_id,
+                    "bot_id": bot_code,
+                    "runner_id": runner_id,
+                    "slot_id": slot_id,
+                    "priority": int(sub.get("subscription_priority") or 60),
+                    "trace_id": f"{trace_id}:dca_limit",
+                    "payload": dca_payload,
+                    "_subscription_id": sub.get("subscription_id"),
+                    "_signal_role": "DCA",
+                })
 
         # Fan-out batch dispatch
         dispatchable = [
@@ -2573,6 +3087,42 @@ class MT5ControlPlaneService:
             for i in items
             if not i.get("_invalid_volume") and not i.get("_skip_dispatch")
         ]
+        if dry_run:
+            dry_results: list[dict[str, Any]] = []
+            dry_failed = 0
+            for item in items:
+                entry = {
+                    "account_id": item.get("account_id"),
+                    "subscription_id": item.get("_subscription_id") or item.get("subscription_id"),
+                    "ok": not bool(item.get("_invalid_volume") or item.get("_skip_dispatch")),
+                    "dry_run": True,
+                }
+                if item.get("_signal_role"):
+                    entry["signal_role"] = item.get("_signal_role")
+                if item.get("_invalid_volume"):
+                    entry["error"] = "no_volume_resolved"
+                    dry_failed += 1
+                elif item.get("_skip_dispatch"):
+                    entry["error"] = item.get("_error") or "dispatch_skipped"
+                    dry_failed += 1
+                else:
+                    entry["trace_id"] = item.get("trace_id")
+                dry_results.append(entry)
+            return {
+                "alert_id": alert_id,
+                "signal_id": signal_id,
+                "bot_code": requested_bot_code,
+                "action": str(action),
+                "kind": kind,
+                "dry_run": True,
+                "subscribers_total": len(subscribers),
+                "commands_total": len(dispatchable),
+                "dispatched": 0,
+                "deduped": 0,
+                "failed": dry_failed,
+                "broadcast_id": broadcast_id,
+                "results": dry_results,
+            }
         results = await self._command_router.dispatch_batch(items=dispatchable, broadcast_id=broadcast_id)
 
         # Merge results back with input order
@@ -2593,6 +3143,8 @@ class MT5ControlPlaneService:
                     "ok": False,
                     "error": item.get("_error") or "dispatch_skipped",
                 }
+                if item.get("_signal_role"):
+                    entry["signal_role"] = item.get("_signal_role")
                 if item.get("close_kind"):
                     entry["close_kind"] = item.get("close_kind")
                 if item.get("symbol"):
@@ -2603,6 +3155,8 @@ class MT5ControlPlaneService:
             r = results[result_idx] if result_idx < len(results) else {"ok": False, "error": "no_result"}
             result_idx += 1
             entry = {"account_id": account_id, "subscription_id": sub_id, "ok": bool(r.get("ok"))}
+            if item.get("_signal_role"):
+                entry["signal_role"] = item.get("_signal_role")
             if item.get("_position_ticket"):
                 entry["position_ticket"] = item.get("_position_ticket")
             if item.get("_position_key"):

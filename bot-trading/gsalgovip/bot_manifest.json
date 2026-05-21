@@ -7,7 +7,7 @@
   "package_path": "bot-trading/gsalgovip",
   "version": "0.3.0",
   "version_file": "VERSION",
-  "description": "Multi-tenant TradingView->MT5 bot package for the Spider AI catalog. Linux backend distributes this package to multiple Windows runners; one OS process per tenant. Cloned from gsalgo with all account/path-specific data removed and the local SQLite store replaced by an isolated PostgreSQL database injected by the platform.",
+  "description": "Multi-tenant TradingView->MT5 bot package for the Spider AI catalog. Linux backend distributes this package to multiple Windows runners; one OS process per tenant. Cloned from gsalgo with all account/path-specific data removed and an isolated PostgreSQL database injected by the platform.",
   "bot_type": "backend_webhook_signal",
   "execution_owner": "linux_backend",
   "windows_role": "mt5_executor_only",

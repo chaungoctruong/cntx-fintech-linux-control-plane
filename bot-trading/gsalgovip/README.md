@@ -42,7 +42,7 @@ runner / nhiều tenant.**
 
 ## Có gì mới ở 0.2.0
 
-- **State store: PostgreSQL** (trước là SQLite ở 0.1.0).
+- **State store: PostgreSQL**.
 - Bot giờ yêu cầu `DATABASE_URL` được inject bởi runtime context của
   platform. DB thuộc về bot, KHÔNG thuộc Linux backend core.
 - Nâng cấp concurrency: `claim_pending_signal()` dùng `FOR UPDATE SKIP
@@ -140,7 +140,7 @@ runtime (FastAPI webhook + worker + MT5 executor) chỉ chạy trên Windows.
 - Không có webhook secret, không có MT5 password, không có Telegram
   token, **không có DATABASE_URL** — mọi secret nằm trong secret store
   của platform
-- Không SQLite — đã thay bằng PostgreSQL
+- Không dùng local file-backed DB — PostgreSQL riêng per tenant
 - Không ghi vào core PostgreSQL của Linux backend — bot có DB RIÊNG
 
 ## Contract cô lập database

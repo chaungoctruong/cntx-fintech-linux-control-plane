@@ -6,7 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import Settings
-from app.db import make_engine, make_session_factory
+from app.db import initialize_schema, make_engine, make_session_factory
 from app.models import Base, Partner
 
 
@@ -19,7 +19,7 @@ def main():
 
     settings = Settings()
     engine = make_engine(settings.database_url)
-    Base.metadata.create_all(engine)
+    initialize_schema(engine, Base.metadata)
     sf = make_session_factory(engine)
 
     pid = args.id or uuid.uuid4().hex[:12]

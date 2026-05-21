@@ -61,48 +61,6 @@ def _get_token_state(jti: str) -> dict[str, Any] | None:
         return None
 
 
-def transfer_link(old_jti: str, new_jti: str) -> dict[str, Any]:
-    """Copy link mapping old_jti → new_jti khi token gia hạn.
-
-    Idempotent: nếu new_jti đã có link → skip. Nếu old_jti không có link → noop.
-    """
-    rc = _redis_client()
-    if rc is None:
-        raise HTTPException(
-            status_code=503,
-            detail={"public_code": "redis_unavailable", "message": "State store offline"},
-        )
-    try:
-        new_existing = rc.get(_link_key(new_jti))
-        if new_existing:
-            return {"transferred": False, "note": "new_jti_already_linked"}
-        old_raw = rc.get(_link_key(old_jti))
-        if not old_raw:
-            return {"transferred": False, "note": "old_jti_has_no_link"}
-        old_ttl = rc.ttl(_link_key(old_jti))
-        ttl = old_ttl if (old_ttl and old_ttl > 0) else LINK_TTL_SEC
-        rc.set(_link_key(new_jti), old_raw, ex=ttl)
-    except Exception:
-        log.exception("transfer_link_failed old=%s new=%s", old_jti, new_jti)
-        raise HTTPException(
-            status_code=503,
-            detail={"public_code": "redis_unavailable", "message": "Transfer link thất bại"},
-        )
-    try:
-        info = json.loads(old_raw)
-    except Exception:
-        info = {}
-    audit.transfer_link(
-        old_jti=old_jti, new_jti=new_jti, transferred=True,
-        account_id=info.get("account_id"),
-    )
-    return {
-        "transferred": True,
-        "account_id": info.get("account_id"),
-        "ttl_sec": ttl,
-    }
-
-
 def set_linked_account_id(jti: str, account_id: int) -> dict[str, Any]:
     rc = _redis_client()
     if rc is None:

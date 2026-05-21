@@ -84,8 +84,10 @@ class RedisStreamPublisher:
             raise ValueError("command_id_required")
         account_id = str(payload.get("account_id") or "").strip()
         runner_id = str(payload.get("runner_id") or "").strip()
+        if not runner_id:
+            raise ValueError("runner_id_required")
         queue_key = f"mt5:account:{account_id}:commands"
-        runner_queue_key = f"mt5:runner:{runner_id}:commands" if runner_id else "__mt5_runner_queue_missing__"
+        runner_queue_key = f"mt5:runner:{runner_id}:commands"
         marker_key = f"{COMMAND_PUBLISH_DEDUPE_KEY_PREFIX}{command_id}"
         payload_json = json.dumps(payload.get("payload") or {}, ensure_ascii=False, separators=(",", ":"))
         runner_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -161,10 +163,10 @@ class RedisStreamPublisher:
                     raise ValueError("command_id_required")
                 account_id = str(payload.get("account_id") or "").strip()
                 runner_id = str(payload.get("runner_id") or "").strip()
+                if not runner_id:
+                    raise ValueError("runner_id_required")
                 queue_key = f"mt5:account:{account_id}:commands"
-                runner_queue_key = (
-                    f"mt5:runner:{runner_id}:commands" if runner_id else "__mt5_runner_queue_missing__"
-                )
+                runner_queue_key = f"mt5:runner:{runner_id}:commands"
                 marker_key = f"{COMMAND_PUBLISH_DEDUPE_KEY_PREFIX}{command_id}"
                 payload_json = json.dumps(payload.get("payload") or {}, ensure_ascii=False, separators=(",", ":"))
                 runner_payload = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

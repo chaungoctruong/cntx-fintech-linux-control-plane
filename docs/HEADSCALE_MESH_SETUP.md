@@ -70,10 +70,10 @@ derp:
   urls:
     - https://controlplane.tailscale.com/derpmap/default
 
-database:
-  type: sqlite
-  sqlite:
-    path: /var/lib/headscale/db.sqlite
+# Database/state store:
+# - Lay config database theo dung version Headscale dang chay.
+# - Moi truong production phai co backup/snapshot rieng cho Headscale state.
+# - Khong dung chung DB voi CNTx backend.
 
 # TLS — tự lấy cert qua Let's Encrypt nếu có domain. Hoặc dùng cert tự ký.
 tls_letsencrypt_hostname: headscale.<your-domain>
@@ -348,7 +348,7 @@ docker exec headscale headscale nodes delete --identifier <node_id>
 ### Backup Headscale state
 
 ```bash
-# DB sqlite + keys:
+# Headscale state + keys:
 tar czf /backup/headscale-$(date +%F).tgz /etc/headscale /var/lib/headscale
 # Restore: extract về same paths, restart container
 ```

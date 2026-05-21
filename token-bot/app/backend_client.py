@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from typing import Any
 
@@ -106,6 +108,10 @@ class BackendClient:
             },
         )
 
+    async def list_available_bots(self) -> dict[str, Any] | None:
+        """Fetch token-grantable bots from the backend platform catalog."""
+        return await self._get_internal("/api/v2/token-bot/internal/bots")
+
     async def issue_activation_token(
         self,
         *,
@@ -212,38 +218,5 @@ class BackendClient:
             jti[:16],
             data.get("action"),
             data.get("note"),
-        )
-        return data
-
-    async def transfer_link(self, *, old_jti: str, new_jti: str) -> dict[str, Any] | None:
-        """Khi partner gia hạn: copy account link old_jti → new_jti để khách không phải re-link."""
-        if not self.enabled:
-            log.warning("backend_client disabled — skip transfer_link old=%s", old_jti[:16])
-            return None
-        url = f"{self.base_url}/api/v2/partner-user/internal/transfer-link"
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as c:
-                r = await c.post(
-                    url,
-                    json={"old_jti": old_jti, "new_jti": new_jti},
-                    headers={"X-Token-Bot-Key": self.internal_key},
-                )
-        except Exception:
-            log.exception("transfer_link_http_failed old=%s", old_jti[:16])
-            return None
-        if r.status_code >= 400:
-            log.error(
-                "transfer_link status=%s old=%s body=%s",
-                r.status_code, old_jti[:16], r.text[:300],
-            )
-            return None
-        try:
-            data = r.json()
-        except Exception:
-            return None
-        log.info(
-            "transfer_link result old=%s new=%s transferred=%s account_id=%s",
-            old_jti[:16], new_jti[:16],
-            data.get("transferred"), data.get("account_id"),
         )
         return data

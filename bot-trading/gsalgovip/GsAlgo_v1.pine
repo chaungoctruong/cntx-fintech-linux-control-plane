@@ -228,11 +228,13 @@ getPosition (positionText) =>
     else if positionText == "Middle Center"
         position.middle_center
 
-backendJson(string _action, float _sl, float _tp, string _role, float _dcaPrice) =>
+backendJson(string _action, float _entry, float _sl, float _tp, string _role, float _dcaPrice, bool _sendDcaLimit) =>
     rolePart = str.length(_role) > 0 ? ",\"signal_role\":\"" + _role + "\"" : ""
     dcaPart = not na(_dcaPrice) ? ",\"dca_price\":" + str.tostring(_dcaPrice, format.mintick) : ""
+    dcaLimitPart = _sendDcaLimit and not na(_dcaPrice) ? ",\"dca_entry_type\":\"limit\",\"dca_order_type\":\"limit\",\"dca_limit_price\":" + str.tostring(_dcaPrice, format.mintick) : ""
     alertId = i_backend_signal_id + "-" + syminfo.ticker + "-" + timeframe.period + "-" + str.tostring(time) + "-" + _action + (str.length(_role) > 0 ? "-" + _role : "")
-    "{\"secret\":\"" + i_backend_secret + "\",\"alert_id\":\"" + alertId + "\",\"signal_id\":\"" + i_backend_signal_id + "\",\"bot_code\":\"" + i_backend_bot_code + "\",\"action\":\"" + _action + "\",\"symbol\":\"" + i_backend_symbol + "\",\"tv_symbol\":\"" + syminfo.tickerid + "\",\"timeframe\":\"" + timeframe.period + "\",\"sl\":" + str.tostring(_sl, format.mintick) + ",\"tp\":" + str.tostring(_tp, format.mintick) + rolePart + dcaPart + "}"
+    alertNow = na(timenow) ? time : timenow
+    "{\"secret\":\"" + i_backend_secret + "\",\"schema_version\":2,\"contract_version\":2,\"alert_time_ms\":" + str.tostring(alertNow) + ",\"bar_time_ms\":" + str.tostring(time) + ",\"alert_id\":\"" + alertId + "\",\"signal_id\":\"" + i_backend_signal_id + "\",\"bot_code\":\"" + i_backend_bot_code + "\",\"action\":\"" + _action + "\",\"symbol\":\"" + i_backend_symbol + "\",\"tv_symbol\":\"" + syminfo.tickerid + "\",\"timeframe\":\"" + timeframe.period + "\",\"entry_price\":" + str.tostring(_entry, format.mintick) + ",\"stop_loss\":" + str.tostring(_sl, format.mintick) + ",\"take_profit\":" + str.tostring(_tp, format.mintick) + rolePart + dcaPart + dcaLimitPart + "}"
 
 tfInMin = timeframe.in_seconds() / 60
 
@@ -1141,9 +1143,11 @@ if array.size(trades) > 0
 // alert
 
 if sigLong and isMonToFri
-    alert(i_backend_alerts ? backendJson("BUY", lastTS.entryPrice - use_SL, lastTS.entryPrice + use_TP, "", float(na)) : "🟢 Buy - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ EN: " + str.tostring(lastTS.entryPrice, format.mintick) + "\n" + "❌ SL:" + str.tostring(lastTS.entryPrice - use_SL, format.mintick) + "\n" + "✅ TP:" + str.tostring(lastTS.entryPrice + use_TP, format.mintick), alert.freq_once_per_bar_close)
+    dcaLimitLong = i_alert_5 ? (enLong + slLong) / 2 : float(na)
+    alert(i_backend_alerts ? backendJson("BUY", enLong, slLong, tpLong, "", dcaLimitLong, i_alert_5) : "🟢 Buy - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ EN: " + str.tostring(enLong, format.mintick) + "\n" + "❌ SL:" + str.tostring(slLong, format.mintick) + "\n" + "✅ TP:" + str.tostring(tpLong, format.mintick), alert.freq_once_per_bar_close)
 else if sigShort and isMonToFri
-    alert(i_backend_alerts ? backendJson("SELL", lastTS.entryPrice + use_SL, lastTS.entryPrice - use_TP, "", float(na)) : "🔴 Sell - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ EN: " + str.tostring(lastTS.entryPrice, format.mintick) + "\n" + "❌ SL:" + str.tostring(lastTS.entryPrice + use_SL, format.mintick) + "\n" + "✅ TP:" + str.tostring(lastTS.entryPrice - use_TP, format.mintick), alert.freq_once_per_bar_close)
+    dcaLimitShort = i_alert_5 ? (enShort + slShort) / 2 : float(na)
+    alert(i_backend_alerts ? backendJson("SELL", enShort, slShort, tpShort, "", dcaLimitShort, i_alert_5) : "🔴 Sell - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ EN: " + str.tostring(enShort, format.mintick) + "\n" + "❌ SL:" + str.tostring(slShort, format.mintick) + "\n" + "✅ TP:" + str.tostring(tpShort, format.mintick), alert.freq_once_per_bar_close)
 
 if not i_backend_alerts and n_tp[1] < n_tp[0] and tpbuyAlertTick and isMonToFri
     alert("🔔 Chạm TP Buy" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
@@ -1154,10 +1158,10 @@ else if not i_backend_alerts and n_sl[1] < n_sl[0] and slbuyAlertTick and isMonT
 else if not i_backend_alerts and n_sl[1] < n_sl[0] and slsellAlertTick and isMonToFri
     alert("🔔 Chạm SL Sell" + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7"), alert.freq_once_per_bar)
 
-if i_alert_5 and not dca_alert[1] and dca_alert and dang_buy and isMonToFri
-    alert(i_backend_alerts ? backendJson("BUY", lastTS.entryPrice - use_SL, lastTS.entryPrice + use_TP, "DCA", dca_price) : "🟢 Buy - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ DCA: " + str.tostring(dca_price, format.mintick) + "\n" + "❌ SL:" + str.tostring(lastTS.entryPrice - use_SL, format.mintick) + "\n" + "✅ TP:" + str.tostring(lastTS.entryPrice + use_TP, format.mintick), alert.freq_once_per_bar_close)
-else if i_alert_5 and not dca_alert[1] and dca_alert and dang_sell and isMonToFri
-    alert(i_backend_alerts ? backendJson("SELL", lastTS.entryPrice + use_SL, lastTS.entryPrice - use_TP, "DCA", dca_price) : "🔴 Sell - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ DCA: " + str.tostring(dca_price, format.mintick) + "\n" + "❌ SL:" + str.tostring(lastTS.entryPrice + use_SL, format.mintick) + "\n" + "✅ TP:" + str.tostring(lastTS.entryPrice - use_TP, format.mintick), alert.freq_once_per_bar_close)
+if i_alert_5 and not i_backend_alerts and not dca_alert[1] and dca_alert and dang_buy and isMonToFri
+    alert("🟢 Buy - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ DCA: " + str.tostring(dca_price, format.mintick) + "\n" + "❌ SL:" + str.tostring(lastTS.entryPrice - use_SL, format.mintick) + "\n" + "✅ TP:" + str.tostring(lastTS.entryPrice + use_TP, format.mintick), alert.freq_once_per_bar_close)
+else if i_alert_5 and not i_backend_alerts and not dca_alert[1] and dca_alert and dang_sell and isMonToFri
+    alert("🔴 Sell - " + syminfo.ticker + " - " + timeframe.period + "\n" + "▶️ DCA: " + str.tostring(dca_price, format.mintick) + "\n" + "❌ SL:" + str.tostring(lastTS.entryPrice + use_SL, format.mintick) + "\n" + "✅ TP:" + str.tostring(lastTS.entryPrice - use_TP, format.mintick), alert.freq_once_per_bar_close)
 
 
 

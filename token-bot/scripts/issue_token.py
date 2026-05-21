@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.bot_registry import BotRegistry
 from app.config import Settings
 from app.crypto import BotCipher
-from app.db import make_engine, make_session_factory
+from app.db import initialize_schema, make_engine, make_session_factory
 from app.models import Base, Partner, Token
 from app.token_service import TokenService
 
@@ -24,7 +24,7 @@ def main():
 
     settings = Settings()
     engine = make_engine(settings.database_url)
-    Base.metadata.create_all(engine)
+    initialize_schema(engine, Base.metadata)
     sf = make_session_factory(engine)
 
     cipher = BotCipher(base64.b64decode(settings.master_key_b64))

@@ -474,6 +474,52 @@ class ControlPlaneLoginReservationsMixin:
 
         return int(self._store._with_retry_locked(_do) or 0)
 
+    def release_login_reservation_by_id(
+        self,
+        *,
+        reservation_id: int,
+        account_id: int,
+        reason: str,
+    ) -> int:
+        clean_reason = (_norm(reason) or "login_reservation_released")[:200]
+
+        def _do(con: Any, cur: Any) -> int:
+            cur.execute(
+                """
+                SELECT id, runner_id, slot_id
+                FROM account_login_reservations
+                WHERE id = %s
+                  AND account_id = %s
+                  AND status IN ('pending', 'dispatched', 'verified')
+                FOR UPDATE
+                """,
+                (int(reservation_id), int(account_id)),
+            )
+            row = dict(cur.fetchone() or {})
+            if not row:
+                return 0
+            cur.execute(
+                """
+                UPDATE account_login_reservations
+                SET status = 'released',
+                    last_error = %s,
+                    completed_at = COALESCE(completed_at, NOW()),
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                (clean_reason, int(row["id"])),
+            )
+            self._release_login_reservation_slot_locked(
+                cur,
+                account_id=int(account_id),
+                runner_id=str(row.get("runner_id") or ""),
+                slot_id=str(row.get("slot_id") or ""),
+                reason=clean_reason,
+            )
+            return 1
+
+        return int(self._store._with_retry_locked(_do) or 0)
+
     def release_claimed_login_reservation(
         self,
         *,

@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import json
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
@@ -13,16 +15,16 @@ router = APIRouter(prefix="/api/v1")
 
 
 class PartnerCreate(BaseModel):
-    id: str | None = None
+    id: Optional[str] = None
     name: str
-    contact: str | None = None
+    contact: Optional[str] = None
 
 
 class PartnerOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: str
     name: str
-    contact: str | None
+    contact: Optional[str]
     active: bool
     created_at: datetime
 
@@ -30,7 +32,7 @@ class PartnerOut(BaseModel):
 class TokenIssueRequest(BaseModel):
     partner_id: str
     bot_ids: list[str] = Field(min_length=1)
-    ttl_seconds: int | None = None
+    ttl_seconds: Optional[int] = None
 
 
 class TokenIssueResponse(BaseModel):
@@ -51,13 +53,13 @@ class TokenOut(BaseModel):
     revoked: bool
 
 
-def _admin_guard(request: Request, x_admin_key: str | None = Header(default=None)):
+def _admin_guard(request: Request, x_admin_key: Optional[str] = Header(default=None)):
     if not x_admin_key or x_admin_key != request.app.state.settings.admin_api_key:
         raise HTTPException(status_code=401, detail="invalid admin key")
 
 
 def _token_guard(
-    request: Request, authorization: str | None = Header(default=None)
+    request: Request, authorization: Optional[str] = Header(default=None)
 ) -> dict[str, Any]:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="missing bearer token")
@@ -197,7 +199,7 @@ def issue_token(payload: TokenIssueRequest, request: Request):
 
 
 @router.get("/admin/tokens", response_model=list[TokenOut], dependencies=[Depends(_admin_guard)])
-def list_tokens(request: Request, partner_id: str | None = None):
+def list_tokens(request: Request, partner_id: Optional[str] = None):
     sf = request.app.state.session_factory
     with sf() as s:
         q = s.query(Token)
@@ -256,8 +258,8 @@ def partner_get_bot(bot_id: str, request: Request, claims: dict = Depends(_token
 
 
 class StartDeploymentRequest(BaseModel):
-    account_id: int | None = None
-    config: dict[str, Any] | None = None
+    account_id: Optional[int] = None
+    config: Optional[dict[str, Any]] = None
 
 
 @router.post("/bots/{bot_id}/deployments")

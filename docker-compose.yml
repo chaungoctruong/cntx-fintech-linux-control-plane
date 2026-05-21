@@ -132,7 +132,7 @@ services:
       PORT: 8090
       SOURCE_BOT_DIR: /bot-trading
       ENCRYPTED_BOT_DIR: /app/var/encrypted
-      DATABASE_URL: sqlite:////app/var/token_bot.db
+      DATABASE_URL: postgresql+psycopg2://${LOCAL_POSTGRES_USER:-spider_dev}:${LOCAL_POSTGRES_PASSWORD:-spider_dev_only_change_me}@db:5432/${LOCAL_POSTGRES_DB:-spider_dev}
       REDIS_URL: redis://:${LOCAL_REDIS_PASSWORD:?set LOCAL_REDIS_PASSWORD}@redis:6379/0
       BACKEND_URL: http://cntx-lab:8001
     command: ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8090"]
@@ -142,6 +142,8 @@ services:
       - ./token-bot/var:/app/var
       - ./bot-trading:/bot-trading:ro
     depends_on:
+      db:
+        condition: service_healthy
       redis:
         condition: service_healthy
       cntx-lab:
@@ -165,7 +167,7 @@ services:
     environment:
       SOURCE_BOT_DIR: /bot-trading
       ENCRYPTED_BOT_DIR: /app/var/encrypted
-      DATABASE_URL: sqlite:////app/var/token_bot.db
+      DATABASE_URL: postgresql+psycopg2://${LOCAL_POSTGRES_USER:-spider_dev}:${LOCAL_POSTGRES_PASSWORD:-spider_dev_only_change_me}@db:5432/${LOCAL_POSTGRES_DB:-spider_dev}
       REDIS_URL: redis://:${LOCAL_REDIS_PASSWORD:?set LOCAL_REDIS_PASSWORD}@redis:6379/0
       BACKEND_URL: http://cntx-lab:8001
     command: ["python", "scripts/run_tg_bot.py"]
@@ -173,6 +175,8 @@ services:
       - ./token-bot/var:/app/var
       - ./bot-trading:/bot-trading:ro
     depends_on:
+      db:
+        condition: service_healthy
       redis:
         condition: service_healthy
       cntx-lab:

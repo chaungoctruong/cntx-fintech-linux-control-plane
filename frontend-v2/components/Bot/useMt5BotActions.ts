@@ -15,6 +15,7 @@ import {
 import {
   getDeploymentByIdForAccount,
   getLatestDeploymentForAccount,
+  getMt5AccountLoginIssueMessage,
   getStartResponseDeploymentId,
   isMt5AccountReady,
   normalizeDeploymentId,
@@ -238,7 +239,11 @@ export function useMt5BotActions({
       return;
     }
     if (!isMt5AccountReady(params.selectedAccount)) {
-      onNotice("error", "Tài khoản này chưa sẵn sàng, chưa thể kích hoạt bot.");
+      onNotice(
+        "error",
+        getMt5AccountLoginIssueMessage(params.selectedAccount) ??
+          "Tài khoản này chưa sẵn sàng, chưa thể kích hoạt bot."
+      );
       return;
     }
     if (!params.selectedBot) {
@@ -286,7 +291,11 @@ export function useMt5BotActions({
       return;
     }
     if (!isMt5AccountReady(params.selectedAccount)) {
-      onNotice("error", "Tài khoản này chưa sẵn sàng, chưa thể bật bot.");
+      onNotice(
+        "error",
+        getMt5AccountLoginIssueMessage(params.selectedAccount) ??
+          "Tài khoản này chưa sẵn sàng, chưa thể bật bot."
+      );
       return;
     }
     if (params.selectedAccountHasActiveBot) {

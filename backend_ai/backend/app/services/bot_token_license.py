@@ -301,7 +301,7 @@ class BotTokenLicenseService:
 
     def __init__(self, store: Store) -> None:
         self.store = store
-        self._catalog = BotTradingLicenseCatalog()
+        self._catalog = BotTradingLicenseCatalog(store=store)
 
     def ensure_schema(self) -> None:
         if self.__class__._schema_ready:
@@ -312,6 +312,11 @@ class BotTokenLicenseService:
 
             self._ensure_schema_uncached()
             self.__class__._schema_ready = True
+
+    def list_available_bots(self) -> list[dict[str, Any]]:
+        """Return bot codes that can be used for product activation tokens."""
+        self.ensure_schema()
+        return self._catalog.list_packages()
 
     def _ensure_schema_uncached(self) -> None:
         def _do(_con: Any, cur: Any) -> None:
@@ -912,13 +917,22 @@ class BotTokenLicenseService:
         def _do(_con: Any, cur: Any) -> list[dict[str, Any]]:
             cur.execute(
                 """
-                SELECT *
-                FROM bot_token_entitlements
-                WHERE status = 'expired'
-                  AND deployment_id IS NOT NULL
-                  AND stop_command_id IS NULL
-                  AND expires_at <= NOW()
-                ORDER BY expires_at ASC, id ASC
+                SELECT e.*
+                FROM bot_token_entitlements e
+                JOIN bot_deployments d ON d.id = e.deployment_id
+                WHERE e.status = 'expired'
+                  AND e.deployment_id IS NOT NULL
+                  AND e.stop_command_id IS NULL
+                  AND e.expires_at <= NOW()
+                  AND LOWER(COALESCE(d.desired_state, '')) <> 'stopped'
+                  AND LOWER(COALESCE(d.status, '')) NOT IN (
+                      'stopped',
+                      'failed',
+                      'blocked',
+                      'cancelled',
+                      'deleted'
+                  )
+                ORDER BY e.expires_at ASC, e.id ASC
                 LIMIT %s
                 """,
                 (batch_size,),

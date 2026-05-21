@@ -120,23 +120,6 @@ def link_account(
     )
 
 
-class TransferLinkRequest(BaseModel):
-    old_jti: str = Field(..., min_length=1, max_length=128)
-    new_jti: str = Field(..., min_length=1, max_length=128)
-
-
-@router.post("/internal/transfer-link", dependencies=[Depends(require_internal_key)])
-def internal_transfer_link(payload: TransferLinkRequest) -> dict[str, Any]:
-    """Token-bot gọi khi partner gia hạn → copy link account từ JWT cũ sang mới.
-
-    Khách không phải nhập lại MT5 account_id sau renew.
-    """
-    from .service import transfer_link
-
-    result = transfer_link(payload.old_jti, payload.new_jti)
-    return {"ok": True, **result}
-
-
 class ForceStopRequest(BaseModel):
     jti: str = Field(..., min_length=1, max_length=128)
     reason: str = Field(..., min_length=1, max_length=255)

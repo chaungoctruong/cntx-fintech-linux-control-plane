@@ -131,22 +131,10 @@ def _split_code_tokens(code: str) -> list[str]:
     return [part for part in re.split(r"[-_]+", str(code or "").strip()) if part]
 
 
-def _market_label_vi(code: str) -> str:
-    known_markets = {
-        "xauusd_trading_bot": "Vàng (XAUUSD)",
-        "gold_default_v1": "Vàng (XAUUSD)",
-        "legacy_live_trading_bot": "Chiến lược legacy",
-        "drl_xauusd_bot": "Vàng (XAUUSD)",
-        "xau_ai_trading_bot": "Vàng (XAUUSD)",
-        "xaubot_ai": "Vàng (XAUUSD)",
-        "ai_gold_scalper": "Vàng (XAUUSD)",
-        "reinforcement_learning_for_gold_trading": "Vàng (XAUUSD)",
-        "rl_algo_trading": "Vàng (XAUUSD)",
-        "tradingbot": "Vàng (XAUUSD)",
-    }
-    special = known_markets.get(str(code or "").strip().lower())
-    if special:
-        return special
+def _market_label_vi(code: str, raw_tags: list[str] | None = None) -> str:
+    searchable = " ".join([str(code or ""), *(str(tag or "") for tag in raw_tags or [])]).lower()
+    if any(token in searchable for token in ("xau", "gold", "vang")):
+        return "Vàng (XAUUSD)"
     tokens = _split_code_tokens(code)
     if not tokens:
         return "Thị trường tự động"
@@ -177,9 +165,9 @@ def _strategy_label_vi(code: str, strategy: str) -> str:
     return " ".join(part for part in rest if part) or "Bot giao dịch tự động"
 
 
-def _bot_label_vi(name: str, code: str) -> str:
+def _bot_label_vi(name: str, code: str, raw_tags: list[str] | None = None) -> str:
     name_s = str(name or "").strip()
-    market = _market_label_vi(code)
+    market = _market_label_vi(code, raw_tags)
     strategy = _strategy_label_vi(code, "")
     if name_s and name_s != code:
         return name_s
@@ -199,7 +187,7 @@ def _public_tags(raw_tags: list[str], code: str) -> list[str]:
             tags.append("Giao dịch tự động")
         else:
             tags.append(tag_s)
-    market = _market_label_vi(code)
+    market = _market_label_vi(code, raw_tags)
     if market and market not in tags:
         tags.append(market)
     # Preserve order while removing duplicates for the public payload.
@@ -214,8 +202,8 @@ def _public_tags(raw_tags: list[str], code: str) -> list[str]:
     return out
 
 
-def _bot_summary_vi(code: str, strategy: str) -> str:
-    market = _market_label_vi(code)
+def _bot_summary_vi(code: str, strategy: str, raw_tags: list[str] | None = None) -> str:
+    market = _market_label_vi(code, raw_tags)
     strategy_label = _strategy_label_vi(code, strategy)
     if strategy_label and strategy_label != "Bot giao dịch tự động":
         return f"Bot {strategy_label} dành cho {market}. Xem overview tại đây và mở dashboard CNTx labs để sử dụng thật."
@@ -223,9 +211,9 @@ def _bot_summary_vi(code: str, strategy: str) -> str:
 
 
 def _bot_payload(*, code: str, name: str, strategy: str, status: str, raw_tags: list[str], dashboard_url: str) -> dict[str, Any]:
-    label_vi = _bot_label_vi(name, code)
+    label_vi = _bot_label_vi(name, code, raw_tags)
     strategy_label_vi = _strategy_label_vi(code, strategy)
-    market_label_vi = _market_label_vi(code)
+    market_label_vi = _market_label_vi(code, raw_tags)
     tags = _public_tags(raw_tags, code)
     icon_url = _asset_url("/static/img/cntx-labs-logo.svg")
     cover_image_url = _asset_url("/static/img/cntx-labs-logo.svg")
@@ -243,7 +231,7 @@ def _bot_payload(*, code: str, name: str, strategy: str, status: str, raw_tags: 
         "status_label_vi": "Sẵn sàng" if str(status or "").strip().upper() == "ACTIVE" else "Tạm ẩn",
         "market_label_vi": market_label_vi,
         "category_vi": "Bot giao dịch tự động",
-        "summary_vi": _bot_summary_vi(code, strategy),
+        "summary_vi": _bot_summary_vi(code, strategy, raw_tags),
         "tags": tags,
         "raw_tags": [str(tag).strip() for tag in raw_tags if str(tag).strip()],
         "icon_url": icon_url,

@@ -73,10 +73,10 @@ CREATE INDEX IF NOT EXISTS ix_executions_signal_id ON executions(signal_id);
 class StateStore:
     """Thin sync wrapper around psycopg 3.
 
-    Public API kept identical to the legacy SQLite store so worker.py and
-    webhook.py do not need to change. Constructor takes a DATABASE_URL string
-    instead of a Path; the rest of the surface (insert_signal, claim_pending_
-    signal, mark_signal_status, has_execution, insert_execution) is the same.
+    Public API is kept stable so worker.py and webhook.py do not need to
+    change. Constructor takes a DATABASE_URL string; the rest of the surface
+    (insert_signal, claim_pending_signal, mark_signal_status, has_execution,
+    insert_execution) is the same.
     """
 
     def __init__(self, database_url: str, *, auto_init: bool = True):

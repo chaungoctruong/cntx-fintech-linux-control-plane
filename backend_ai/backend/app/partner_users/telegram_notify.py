@@ -1,7 +1,7 @@
 """Gửi DM Telegram cho end-user qua bot hubot (TELEGRAM_BOT_TOKEN).
 
 End-user đã /start hubot từ trước (khi đăng ký MT5 vào Spider AI) nên có chat
-với bot. Khi token hết hạn/bị thu hồi/được gia hạn → DM họ để họ biết.
+với bot. Khi token hết hạn/bị thu hồi → DM họ để họ biết.
 """
 from __future__ import annotations
 
@@ -52,8 +52,6 @@ def _classify_reason(reason: str) -> str:
     r = (reason or "").lower()
     if "token_expired" in r:
         return "expired"
-    if "renewed" in r:
-        return "renewed"
     if "partner_revoke" in r:
         return "partner_revoke"
     if "admin_revoke_grant" in r:
@@ -71,14 +69,7 @@ def build_force_stop_message(*, end_user_label: str | None, bot_id: str, reason:
         body = (
             f"Token bot {bot_html} cấp cho {you} đã hết hạn.\n"
             f"Bot trên MT5 đã được <b>tự tắt</b> để bảo vệ tài khoản.\n\n"
-            f"Vui lòng liên hệ <b>đối tác</b> để gia hạn."
-        )
-    elif kind == "renewed":
-        title = "♻️ <b>Token đã được gia hạn</b>"
-        body = (
-            f"Đối tác đã gia hạn token bot {bot_html} cho {you}.\n"
-            f"Token cũ đã <b>không còn hiệu lực</b> — bot tạm dừng.\n\n"
-            f"Vui lòng lấy <b>token mới</b> từ đối tác, dán vào ứng dụng để bot chạy lại."
+            f"Vui lòng liên hệ <b>đối tác</b> để cấp mã mới."
         )
     elif kind == "partner_revoke":
         title = "🚫 <b>Token đã bị thu hồi</b>"

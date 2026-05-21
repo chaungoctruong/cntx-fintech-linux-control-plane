@@ -20,7 +20,7 @@ _TRADING_UNIT_KEYS = ("unit", "distance_unit", "sl_tp_unit", "trade_unit", "trad
 _TRADING_BOOLEAN_KEYS = ("dca_enabled",)
 _UNSUPPORTED_DCA_CONFIG_KEYS = ("max_entries", "volume_multiplier")
 _ALLOWED_UNITS = {"price_distance", "points"}
-_TRADING_CONFIG_BOT_IDENTITIES = {"gsalgo", "gsalgo_mt5_bot"}
+_TRADING_CONFIG_BOT_IDENTITIES: set[str] = set()
 _RESTART_ON_CONFIG_UPDATE_KEYS = {
     "restart_on_config_update",
     "requires_restart_on_config_update",

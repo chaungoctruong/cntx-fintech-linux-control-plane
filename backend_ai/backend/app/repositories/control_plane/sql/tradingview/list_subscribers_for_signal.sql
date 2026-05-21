@@ -18,10 +18,14 @@ SELECT
   d.bot_code        AS bot_code,
   d.runner_id       AS runner_id,
   d.slot_id         AS slot_id,
-  d.config_json     AS deployment_config_json
+  d.config_json     AS deployment_config_json,
+  n.capabilities_json AS runner_capabilities_json,
+  n.metadata_json     AS runner_metadata_json,
+  n.capability_tags   AS runner_capability_tags
 FROM tradingview_signal_subscriptions s
 JOIN broker_accounts ba ON ba.id = s.account_id
 JOIN bot_deployments d ON d.account_id = s.account_id
+LEFT JOIN runner_nodes n ON n.runner_id = d.runner_id
 WHERE s.signal_id = %s
   AND s.enabled = TRUE
   AND ba.is_active = TRUE

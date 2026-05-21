@@ -8,6 +8,8 @@ Phai duoc giu o muc dich `badge / banner` UX, KHONG expose internal runner detai
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import time
 from typing import Any, Optional
 
@@ -17,8 +19,13 @@ from app.api.v2.control_plane_deps import service_dep, user_dep
 from app.core.internal_auth import require_backend_api_key
 from app.events.command_delivery_observability import CommandDeliveryObservabilityService
 from app.infra.redis_streams import EVENT_STREAM_KEY
+from app.orchestration.broker_routing import (
+    canonical_broker_key,
+    parse_broker_aliases,
+    parse_runner_broker_map,
+)
 from app.repositories.control_plane_repository import ControlPlaneRepository
-from app.services.control_plane_service import MT5ControlPlaneService
+from app.services.control_plane_service import MT5ControlPlaneService, get_control_plane_service
 from app.services.store_service import get_process_store, get_store
 from app.settings import settings
 
@@ -34,6 +41,35 @@ _HEALTHZ_SCHEDULER_STALE_DOWN_SEC = 1800  # 30 min
 # Threshold mac dinh; co the override bang settings sau khi thu nghiem voi user thuc.
 _DEFAULT_COMMAND_QUEUE_PER_RUNNER_DEGRADED = 20
 _DEFAULT_LOGIN_SLOT_BACKLOG_PER_RUNNER_DEGRADED = 20
+
+_BROKER_CAPABILITY_KEYS = (
+    "runner_pool",
+    "pool",
+    "broker_pool",
+    "broker",
+    "broker_key",
+    "broker_route",
+    "broker_route_key",
+    "supported_brokers",
+    "supported_broker_keys",
+    "broker_keys",
+    "brokers",
+)
+_BROKER_SERVER_KEYS = (
+    "supported_mt5_servers",
+    "supported_servers",
+    "mt5_servers",
+    "broker_servers",
+    "server",
+    "mt5_server",
+)
+_BROKER_TAG_PREFIXES = (
+    "broker:",
+    "pool:",
+    "broker=",
+    "broker_pool:",
+    "runner_pool:",
+)
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -59,6 +95,353 @@ def _ops_thresholds() -> dict[str, int]:
         "login_slot_backlog": max(1, int(getattr(settings, "OPS_LOGIN_SLOT_BACKLOG_THRESHOLD", 20) or 20)),
         "command_backlog": max(1, int(getattr(settings, "OPS_COMMAND_BACKLOG_THRESHOLD", 40) or 40)),
         "event_backlog": max(1, int(getattr(settings, "OPS_EVENT_BACKLOG_THRESHOLD", 100) or 100)),
+        "broker_pool_min_online_runners": max(1, int(getattr(settings, "OPS_BROKER_POOL_MIN_ONLINE_RUNNERS", 2) or 2)),
+    }
+
+
+def _safe_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _flatten_string_items(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        items: list[str] = []
+        for item in value.values():
+            items.extend(_flatten_string_items(item))
+        return items
+    if isinstance(value, (list, tuple, set)):
+        items = []
+        for item in value:
+            items.extend(_flatten_string_items(item))
+        return items
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    return [item.strip() for item in re.split(r"[,|\n;]+", raw) if item.strip()]
+
+
+def _runner_broker_sources(runner: dict[str, Any]) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = [dict(runner or {})]
+    for key in ("metadata_json", "metadata", "capabilities_json", "capabilities"):
+        payload = _safe_dict((runner or {}).get(key))
+        if payload:
+            sources.append(payload)
+    return sources
+
+
+def _runner_broker_inventory(
+    runner: dict[str, Any],
+    *,
+    aliases: dict[str, set[str]],
+    runner_broker_map: dict[str, frozenset[str]],
+) -> tuple[set[str], set[str]]:
+    runner_id = str((runner or {}).get("runner_id") or "").strip()
+    broker_keys: set[str] = set()
+    servers: set[str] = set()
+
+    for mapped in runner_broker_map.get(runner_id, frozenset()):
+        mapped_s = str(mapped or "").strip()
+        if mapped_s and mapped_s != "*":
+            broker_keys.add(mapped_s)
+
+    for source in _runner_broker_sources(runner):
+        for key in _BROKER_CAPABILITY_KEYS:
+            for item in _flatten_string_items(source.get(key)):
+                if item == "*":
+                    continue
+                broker_key = canonical_broker_key(item, aliases)
+                if broker_key:
+                    broker_keys.add(broker_key)
+        for key in _BROKER_SERVER_KEYS:
+            for item in _flatten_string_items(source.get(key)):
+                servers.add(str(item).strip())
+                broker_key = canonical_broker_key(item, aliases)
+                if broker_key:
+                    broker_keys.add(broker_key)
+        for tag in _flatten_string_items(source.get("capability_tags") or source.get("tags") or source.get("runner_tags")):
+            tag_s = str(tag or "").strip().lower()
+            for prefix in _BROKER_TAG_PREFIXES:
+                if tag_s.startswith(prefix):
+                    broker_key = canonical_broker_key(tag_s[len(prefix):], aliases)
+                    if broker_key:
+                        broker_keys.add(broker_key)
+                    break
+    return broker_keys, {item for item in servers if item}
+
+
+def _empty_broker_pool_health(*, error: str | None = None) -> dict[str, Any]:
+    return {
+        "status": "unknown" if error else "ok",
+        "ok": error is None,
+        "items": [],
+        "counts": {
+            "total_broker_pools": 0,
+            "ok": 0,
+            "degraded": 0,
+            "down": 0,
+            "unrouted_runners": 0,
+            "unrouted_online_runners": 0,
+        },
+        "alerts": [],
+        "warnings": ["broker_pool_health_unavailable"] if error else [],
+        "error": error,
+        "thresholds": {
+            "min_online_runners_per_broker_pool": _safe_int(
+                _ops_thresholds().get("broker_pool_min_online_runners"),
+                2,
+            ),
+        },
+    }
+
+
+def _build_broker_pool_health(runners: list[dict[str, Any]] | None) -> dict[str, Any]:
+    """Aggregate broker-aware runner capacity for ops.
+
+    This is intentionally read-only and derived from runner metadata/heartbeat.
+    It lets ops see cases like "DBG has a configured runner, but it is offline"
+    before users hit the login flow.
+    """
+    runner_items = [dict(item) for item in (runners or []) if isinstance(item, dict)]
+    thresholds = _ops_thresholds()
+    min_online = max(1, _safe_int(thresholds.get("broker_pool_min_online_runners"), 2))
+    aliases = parse_broker_aliases(getattr(settings, "MT5_BROKER_ROUTE_ALIASES", ""))
+    runner_broker_map = parse_runner_broker_map(
+        getattr(settings, "MT5_RUNNER_BROKER_MAP", ""),
+        aliases,
+    )
+    pools: dict[str, dict[str, Any]] = {}
+    unrouted_runner_count = 0
+    unrouted_online_count = 0
+
+    for runner in runner_items:
+        runner_id = str(runner.get("runner_id") or "").strip()
+        status = str(runner.get("status") or "").strip().lower()
+        operational_status = str(runner.get("operational_status") or "").strip().upper()
+        is_stale = bool(runner.get("is_stale"))
+        is_online_fresh = bool(status == "online" and not is_stale)
+        accepts_new_work = bool(runner.get("accepts_new_work"))
+        available_slots = _safe_int(runner.get("available_slots"))
+        ready_slots = _safe_int(runner.get("ready_slots"))
+        service_ready = bool(
+            accepts_new_work
+            or (
+                is_online_fresh
+                and available_slots > 0
+                and operational_status not in {"OFFLINE", "MAINTENANCE", "FULL"}
+            )
+        )
+        broker_keys, servers = _runner_broker_inventory(
+            runner,
+            aliases=aliases,
+            runner_broker_map=runner_broker_map,
+        )
+        if not broker_keys:
+            unrouted_runner_count += 1
+            if is_online_fresh:
+                unrouted_online_count += 1
+            continue
+        for broker_key in sorted(broker_keys):
+            pool = pools.setdefault(
+                broker_key,
+                {
+                    "broker_key": broker_key,
+                    "runner_ids": [],
+                    "runner_count": 0,
+                    "online_runners": 0,
+                    "ready_runners": 0,
+                    "stale_runners": 0,
+                    "offline_runners": 0,
+                    "degraded_runners": 0,
+                    "ready_slots": 0,
+                    "available_slots": 0,
+                    "service_available_slots": 0,
+                    "supported_mt5_servers": set(),
+                },
+            )
+            if runner_id:
+                pool["runner_ids"].append(runner_id)
+            pool["runner_count"] += 1
+            pool["ready_slots"] += ready_slots
+            pool["available_slots"] += available_slots
+            if is_online_fresh:
+                pool["online_runners"] += 1
+            elif is_stale:
+                pool["stale_runners"] += 1
+            else:
+                pool["offline_runners"] += 1
+            if operational_status == "DEGRADED":
+                pool["degraded_runners"] += 1
+            if service_ready:
+                pool["ready_runners"] += 1
+                pool["service_available_slots"] += available_slots
+            pool["supported_mt5_servers"].update(servers)
+
+    items: list[dict[str, Any]] = []
+    global_alerts: list[str] = []
+    global_warnings: list[str] = []
+    for broker_key, raw in sorted(pools.items()):
+        alerts: list[str] = []
+        warnings: list[str] = []
+        runner_count = _safe_int(raw.get("runner_count"))
+        online_runners = _safe_int(raw.get("online_runners"))
+        ready_runners = _safe_int(raw.get("ready_runners"))
+        service_available_slots = _safe_int(raw.get("service_available_slots"))
+
+        if runner_count <= 0:
+            status = "unconfigured"
+            alerts.append("broker_pool_unconfigured")
+        elif online_runners <= 0:
+            status = "down"
+            alerts.append("broker_pool_no_online_runner")
+        elif ready_runners <= 0 or service_available_slots <= 0:
+            status = "degraded"
+            alerts.append("broker_pool_no_accepting_runner")
+        else:
+            status = "ok"
+
+        if runner_count == 1:
+            warnings.append("broker_pool_single_runner")
+        if online_runners < min_online:
+            warnings.append("broker_pool_below_redundancy")
+        if _safe_int(raw.get("stale_runners")) > 0:
+            warnings.append("broker_pool_has_stale_runner")
+        if _safe_int(raw.get("degraded_runners")) > 0:
+            warnings.append("broker_pool_has_degraded_runner")
+
+        item = {
+            "broker_key": broker_key,
+            "status": status,
+            "runner_count": runner_count,
+            "online_runners": online_runners,
+            "ready_runners": ready_runners,
+            "stale_runners": _safe_int(raw.get("stale_runners")),
+            "offline_runners": _safe_int(raw.get("offline_runners")),
+            "degraded_runners": _safe_int(raw.get("degraded_runners")),
+            "ready_slots": _safe_int(raw.get("ready_slots")),
+            "available_slots": _safe_int(raw.get("available_slots")),
+            "service_available_slots": service_available_slots,
+            "supported_mt5_servers": sorted(str(item) for item in raw.get("supported_mt5_servers") or [] if str(item).strip()),
+            "runner_ids": sorted({str(item) for item in raw.get("runner_ids") or [] if str(item).strip()}),
+            "alerts": alerts,
+            "warnings": warnings,
+        }
+        items.append(item)
+        if status == "down":
+            global_alerts.append(f"broker_pool_down:{broker_key}")
+        elif status in {"degraded", "unconfigured"}:
+            global_alerts.append(f"broker_pool_degraded:{broker_key}")
+        for warning in warnings:
+            global_warnings.append(f"{warning}:{broker_key}")
+
+    if unrouted_runner_count > 0 and bool(getattr(settings, "MT5_BROKER_ROUTING_REQUIRE_CAPABILITY", True)):
+        global_warnings.append("broker_pool_unrouted_runners")
+
+    counts = {
+        "total_broker_pools": len(items),
+        "ok": sum(1 for item in items if item.get("status") == "ok"),
+        "degraded": sum(1 for item in items if item.get("status") in {"degraded", "unconfigured"}),
+        "down": sum(1 for item in items if item.get("status") == "down"),
+        "unrouted_runners": unrouted_runner_count,
+        "unrouted_online_runners": unrouted_online_count,
+    }
+    status = "ok"
+    if counts["down"] > 0:
+        status = "down"
+    elif counts["degraded"] > 0:
+        status = "degraded"
+
+    return {
+        "status": status,
+        "ok": bool(status == "ok"),
+        "items": items,
+        "counts": counts,
+        "alerts": list(dict.fromkeys(global_alerts)),
+        "warnings": list(dict.fromkeys(global_warnings)),
+        "error": None,
+        "thresholds": {
+            "min_online_runners_per_broker_pool": min_online,
+        },
+    }
+
+
+def _build_mt5_capacity_check(dashboard: dict[str, Any]) -> dict[str, Any]:
+    """Public-safe MT5 runtime capacity check for /healthz.
+
+    This intentionally exposes only aggregate counts. It tells infrastructure
+    monitors when API/Postgres/Redis are alive but the MT5 control plane cannot
+    safely accept work for at least one broker pool.
+    """
+    summary = dict(dashboard.get("summary") or {})
+    broker_pools = _build_broker_pool_health(list(dashboard.get("runners") or []))
+    broker_status = str(broker_pools.get("status") or "unknown").lower()
+    broker_counts = dict(broker_pools.get("counts") or {})
+    total_runners = _safe_int(summary.get("total_runners"))
+    ready_runners = _safe_int(summary.get("ready_runners"))
+    online_runners = _safe_int(summary.get("online_runners"))
+    available_slots = _safe_int(summary.get("available_slots"))
+    capacity_available = bool(summary.get("capacity_available")) or bool(online_runners > 0 and available_slots > 0)
+    routing_requires_capability = bool(
+        getattr(settings, "MT5_BROKER_ROUTING_ENABLED", True)
+        and getattr(settings, "MT5_BROKER_ROUTING_REQUIRE_CAPABILITY", True)
+    )
+
+    status = "ok"
+    error: str | None = None
+    if total_runners <= 0:
+        status = "degraded"
+        error = "no_runners_registered"
+    elif not capacity_available:
+        status = "degraded"
+        error = "no_mt5_capacity"
+    elif broker_status == "down":
+        status = "degraded"
+        error = "broker_pool_down"
+    elif broker_status in {"degraded", "unconfigured"}:
+        status = "degraded"
+        error = "broker_pool_degraded"
+    elif broker_status == "unknown":
+        status = "degraded"
+        error = "broker_pool_health_unavailable"
+    elif routing_requires_capability and _safe_int(broker_counts.get("total_broker_pools")) <= 0:
+        status = "degraded"
+        error = "broker_pool_unconfigured"
+
+    warnings: list[str] = []
+    if ready_runners < total_runners:
+        warnings.append("runner_capacity_reduced")
+    for warning in list(broker_pools.get("warnings") or []):
+        warning_s = str(warning or "").strip()
+        if warning_s:
+            warnings.append(warning_s.split(":", 1)[0])
+
+    return {
+        "status": status,
+        "error": error,
+        "total_runners": total_runners,
+        "online_runners": online_runners,
+        "ready_runners": ready_runners,
+        "available_slots": available_slots,
+        "capacity_available": capacity_available,
+        "broker_pools": {
+            "status": broker_status,
+            "total": _safe_int(broker_counts.get("total_broker_pools")),
+            "ok": _safe_int(broker_counts.get("ok")),
+            "degraded": _safe_int(broker_counts.get("degraded")),
+            "down": _safe_int(broker_counts.get("down")),
+            "unrouted_runners": _safe_int(broker_counts.get("unrouted_runners")),
+            "unrouted_online_runners": _safe_int(broker_counts.get("unrouted_online_runners")),
+        },
+        "warnings": list(dict.fromkeys(warnings)),
     }
 
 
@@ -324,6 +707,7 @@ def _build_ops_summary(
     queues: dict[str, Any],
     *,
     thresholds: dict[str, int] | None = None,
+    broker_pools: dict[str, Any] | None = None,
     now: int | None = None,
 ) -> dict[str, Any]:
     thresholds = dict(thresholds or _ops_thresholds())
@@ -383,6 +767,7 @@ def _build_ops_summary(
     bindings = {
         "sticky_mismatch": _safe_int(bindings_raw.get("sticky_mismatch")),
     }
+    broker_pool_summary = dict(broker_pools or _empty_broker_pool_health())
 
     alerts: list[str] = []
     warnings: list[str] = []
@@ -421,6 +806,17 @@ def _build_ops_summary(
             alerts.append("runner_full")
     if bindings["sticky_mismatch"] > 0:
         alerts.append("sticky_mismatch")
+    broker_pool_status = str(broker_pool_summary.get("status") or "unknown").lower()
+    if broker_pool_status == "down":
+        alerts.append("broker_pool_down")
+    elif broker_pool_status in {"degraded", "unconfigured"}:
+        alerts.append("broker_pool_degraded")
+    if broker_pool_status == "unknown":
+        warnings.append("broker_pool_health_unavailable")
+    for warning in list(broker_pool_summary.get("warnings") or []):
+        warning_s = str(warning or "").strip()
+        if warning_s:
+            warnings.append(warning_s.split(":", 1)[0])
 
     return {
         "ok": len(alerts) == 0,
@@ -432,8 +828,9 @@ def _build_ops_summary(
         "queues": queue_summary,
         "deployments": deployments,
         "bindings": bindings,
-        "alerts": alerts,
-        "warnings": warnings,
+        "broker_pools": broker_pool_summary,
+        "alerts": list(dict.fromkeys(alerts)),
+        "warnings": list(dict.fromkeys(warnings)),
         "thresholds": {
             **dict(snapshot.get("thresholds") or {}),
             **thresholds,
@@ -450,6 +847,9 @@ def _avg_per_runner(total: int, n_runners: int) -> float:
 def _build_health_badge(dashboard: dict[str, Any]) -> dict[str, Any]:
     """Compute level + message tu runner_health_dashboard payload."""
     summary = dict(dashboard.get("summary") or {})
+    broker_pools = _build_broker_pool_health(list(dashboard.get("runners") or []))
+    broker_pool_status = str(broker_pools.get("status") or "unknown").lower()
+    broker_pool_counts = dict(broker_pools.get("counts") or {})
     total_runners = int(summary.get("total_runners") or 0)
     online_runners = int(summary.get("online_runners") or 0)
     ready_runners = int(summary.get("ready_runners") or 0)
@@ -478,6 +878,16 @@ def _build_health_badge(dashboard: dict[str, Any]) -> dict[str, Any]:
             message_vi = "Không có runner sẵn sàng nhận lệnh. Đội ngũ vận hành đang xử lý."
             message_en = "No runner is ready to accept commands. Operations team is on it."
             reason = "no_ready_runners"
+    elif broker_pool_status in {"down", "degraded"}:
+        level = "degraded"
+        if broker_pool_status == "down":
+            message_vi = "Một số sàn MT5 đang tạm thời không có máy nhận đăng nhập."
+            message_en = "Some MT5 broker pools temporarily have no login runner online."
+            reason = "broker_pool_down"
+        else:
+            message_vi = "Một số sàn MT5 đang thiếu năng lực dự phòng. Bot vẫn chạy nhưng có thể chậm hơn."
+            message_en = "Some MT5 broker pools have reduced redundancy. Bots still run but may be slower."
+            reason = "broker_pool_degraded"
     elif (
         ready_runners < total_runners
         or stale_runners > 0
@@ -531,10 +941,21 @@ def _build_health_badge(dashboard: dict[str, Any]) -> dict[str, Any]:
             "avg_login_slot_queue_per_runner": round(avg_login_slot, 2),
             "avg_command_queue_per_runner": round(avg_cmd, 2),
             "capacity_available": bool(summary.get("capacity_available")),
+            "broker_pools": {
+                "status": broker_pool_status,
+                "total": _safe_int(broker_pool_counts.get("total_broker_pools")),
+                "down": _safe_int(broker_pool_counts.get("down")),
+                "degraded": _safe_int(broker_pool_counts.get("degraded")),
+                "unrouted_runners": _safe_int(broker_pool_counts.get("unrouted_runners")),
+            },
         },
         "thresholds": {
             "login_slot_queue_per_runner_degraded": _DEFAULT_LOGIN_SLOT_BACKLOG_PER_RUNNER_DEGRADED,
             "command_queue_per_runner_degraded": _DEFAULT_COMMAND_QUEUE_PER_RUNNER_DEGRADED,
+            "min_online_runners_per_broker_pool": _safe_int(
+                broker_pools.get("thresholds", {}).get("min_online_runners_per_broker_pool"),
+                2,
+            ),
         },
         "generated_at": int(time.time()),
     }
@@ -687,6 +1108,19 @@ async def _count_command_delivery_backlog(request: Request | None = None, store:
         return {"count": -1, "error": f"{exc.__class__.__name__}:{str(exc)[:120]}"}
 
 
+async def _check_mt5_capacity() -> dict[str, Any]:
+    try:
+        service = get_control_plane_service()
+        dashboard = await asyncio.to_thread(service.runner_health_dashboard)
+        return _build_mt5_capacity_check(dashboard)
+    except Exception as exc:
+        return {
+            **_build_mt5_capacity_check({}),
+            "status": "degraded",
+            "error": f"mt5_capacity_unavailable:{exc.__class__.__name__}:{str(exc)[:120]}",
+        }
+
+
 def _check_command_delivery_reconciler(
     snapshot: Any,
     *,
@@ -785,10 +1219,11 @@ async def system_healthz(
     Khong leak runner_id/queue_depth/host (chi expose status + latency_ms cho subcheck).
     """
     started_check = time.monotonic()
-    pg_check, redis_check, command_backlog = await asyncio.gather(
+    pg_check, redis_check, command_backlog, mt5_capacity_check = await asyncio.gather(
         _check_postgres(request),
         _check_redis(),
         _count_command_delivery_backlog(request),
+        _check_mt5_capacity(),
     )
     reconciler_snap = None
     cb_snap = None
@@ -836,6 +1271,7 @@ async def system_healthz(
             singleton_state=singleton_state,
             singleton_updated_at=singleton_updated_at,
         ),
+        "mt5_capacity": mt5_capacity_check,
     }
     status = _aggregate_healthz_status(checks)
     if status == "down":
@@ -926,7 +1362,12 @@ async def system_ops_summary(
     """
     snapshot = service.ops_summary_snapshot()
     queues = await _collect_ops_redis_queues(list(snapshot.get("runner_ids") or []))
-    return _build_ops_summary(snapshot, queues)
+    try:
+        dashboard = service.runner_health_dashboard()
+        broker_pools = _build_broker_pool_health(list(dashboard.get("runners") or []))
+    except Exception as exc:
+        broker_pools = _empty_broker_pool_health(error=f"{exc.__class__.__name__}:{str(exc)[:120]}")
+    return _build_ops_summary(snapshot, queues, broker_pools=broker_pools)
 
 
 @router.get("/command-delivery-observability")

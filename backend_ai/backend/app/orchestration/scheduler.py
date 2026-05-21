@@ -861,12 +861,33 @@ def choose_slot_for_account(
     heartbeat_ttl_sec: int = 120,
     broker_route: BrokerRoutePolicy | None = None,
 ) -> SchedulerDecision:
+    requested_profile = str(bot.get("profile_class") or "normal").strip().lower() or "normal"
+    dedicated_required = requires_dedicated_runner(bot)
+    now_dt = now or datetime.now(timezone.utc)
+
+    def _reason_for(slot: dict[str, Any]) -> Optional[str]:
+        return _slot_block_reason(
+            slot,
+            account_id=account_id,
+            bot=bot,
+            requested_profile=requested_profile,
+            dedicated_required=dedicated_required,
+            now_dt=now_dt,
+            heartbeat_ttl_sec=heartbeat_ttl_sec,
+            broker_route=broker_route,
+            same_account_sticky_slot=_slot_matches_sticky_binding(
+                slot,
+                sticky_binding,
+                account_id=account_id,
+            ),
+        )
+
     ranked = rank_slots_for_account(
         account_id=account_id,
         bot=bot,
         slots=slots,
         sticky_binding=sticky_binding,
-        now=now,
+        now=now_dt,
         heartbeat_ttl_sec=heartbeat_ttl_sec,
         broker_route=broker_route,
     )
@@ -875,26 +896,9 @@ def choose_slot_for_account(
     if _has_sticky_binding(sticky_binding):
         sticky_runner = str((sticky_binding or {}).get("runner_id") or "").strip()
         sticky_slot = str((sticky_binding or {}).get("slot_id") or "").strip()
-        requested_profile = str(bot.get("profile_class") or "normal").strip().lower() or "normal"
-        dedicated_required = requires_dedicated_runner(bot)
-        now_dt = now or datetime.now(timezone.utc)
         for slot in slots:
             if str(slot.get("runner_id") or "").strip() == sticky_runner and str(slot.get("slot_id") or "").strip() == sticky_slot:
-                reason = _slot_block_reason(
-                    slot,
-                    account_id=account_id,
-                    bot=bot,
-                    requested_profile=requested_profile,
-                    dedicated_required=dedicated_required,
-                    now_dt=now_dt,
-                    heartbeat_ttl_sec=heartbeat_ttl_sec,
-                    broker_route=broker_route,
-                    same_account_sticky_slot=_slot_matches_sticky_binding(
-                        slot,
-                        sticky_binding,
-                        account_id=account_id,
-                    ),
-                )
+                reason = _reason_for(slot)
                 if reason in {
                     "mt5_runtime_maintenance",
                     "windows_runtime_unhealthy",
@@ -908,21 +912,32 @@ def choose_slot_for_account(
                     return SchedulerDecision(ok=False, reason=reason)
                 break
         return SchedulerDecision(ok=False, reason="sticky_slot_unavailable")
+    route_compatible_reasons = {
+        reason
+        for slot in slots
+        if runner_slot_supports_broker_route(slot, broker_route)
+        for reason in [_reason_for(slot)]
+        if reason and reason != "no_compatible_runner_for_broker"
+    }
+    if broker_route and broker_route.active and route_compatible_reasons:
+        for reason in (
+            "mt5_runtime_maintenance",
+            "windows_runtime_unhealthy",
+            "slot_not_ipc_ready",
+            "slot_resident_worker_missing",
+            "runner_full",
+            "runner_queue_backlog",
+            "runner_offline",
+            "bot_not_available_on_runner",
+            "slot_not_ready",
+            "slot_unavailable",
+        ):
+            if reason in route_compatible_reasons:
+                return SchedulerDecision(ok=False, reason=reason)
     block_reasons = {
         reason
         for slot in slots
-        for reason in [
-            _slot_block_reason(
-                slot,
-                account_id=account_id,
-                bot=bot,
-                requested_profile=str(bot.get("profile_class") or "normal").strip().lower() or "normal",
-                dedicated_required=requires_dedicated_runner(bot),
-                now_dt=now or datetime.now(timezone.utc),
-                heartbeat_ttl_sec=heartbeat_ttl_sec,
-                broker_route=broker_route,
-            )
-        ]
+        for reason in [_reason_for(slot)]
         if reason
     }
     for reason in (

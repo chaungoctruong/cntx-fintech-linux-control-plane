@@ -18,6 +18,7 @@ class Mt5OrderRequest:
     tp: float
     volume: float
     config_key: str
+    entry_type: str = "market"
 
 
 class Mt5Executor:
@@ -211,8 +212,14 @@ class Mt5Executor:
                     error="tick_unavailable",
                 )
 
-            order_type = mt5.ORDER_TYPE_BUY if req.side == "BUY" else mt5.ORDER_TYPE_SELL
-            price = tick.ask if req.side == "BUY" else tick.bid
+            entry_type = str(req.entry_type or "market").strip().lower()
+            is_limit = entry_type in {"limit", "pending_limit", "buy_limit", "sell_limit"}
+            if is_limit:
+                order_type = mt5.ORDER_TYPE_BUY_LIMIT if req.side == "BUY" else mt5.ORDER_TYPE_SELL_LIMIT
+                price = float(req.entry)
+            else:
+                order_type = mt5.ORDER_TYPE_BUY if req.side == "BUY" else mt5.ORDER_TYPE_SELL
+                price = tick.ask if req.side == "BUY" else tick.bid
             point = float(getattr(symbol, "point", 0.0) or 0.0)
             if point <= 0:
                 return ExecutionResult(
@@ -242,7 +249,7 @@ class Mt5Executor:
                     error=f"spread_points={spread_points:.2f}",
                 )
             drift_points = abs(float(price) - float(req.entry)) / point
-            if self.settings.max_entry_drift_points > 0 and drift_points > self.settings.max_entry_drift_points:
+            if not is_limit and self.settings.max_entry_drift_points > 0 and drift_points > self.settings.max_entry_drift_points:
                 return ExecutionResult(
                     signal_id=req.signal_id,
                     status="failed",
@@ -258,7 +265,7 @@ class Mt5Executor:
             digits = int(symbol.digits)
             comment = f"gsalgo_{req.signal_id}"
             request_data: dict[str, Any] = {
-                "action": mt5.TRADE_ACTION_DEAL,
+                "action": mt5.TRADE_ACTION_PENDING if is_limit else mt5.TRADE_ACTION_DEAL,
                 "symbol": req.symbol,
                 "volume": float(req.volume),
                 "type": order_type,
@@ -269,8 +276,9 @@ class Mt5Executor:
                 "magic": int(self.settings.mt5_magic),
                 "comment": comment,
                 "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
             }
+            if not is_limit:
+                request_data["type_filling"] = mt5.ORDER_FILLING_IOC
             check = mt5.order_check(request_data)
             if check is None:
                 return ExecutionResult(
@@ -323,7 +331,11 @@ class Mt5Executor:
             )
 
         retcode = str(getattr(result, "retcode", ""))
-        is_ok = int(getattr(result, "retcode", -1)) == int(getattr(mt5, "TRADE_RETCODE_DONE", 10009))
+        ok_retcodes = {
+            int(getattr(mt5, "TRADE_RETCODE_DONE", 10009)),
+            int(getattr(mt5, "TRADE_RETCODE_PLACED", 10008)),
+        }
+        is_ok = int(getattr(result, "retcode", -1)) in ok_retcodes
         return ExecutionResult(
             signal_id=req.signal_id,
             status="executed" if is_ok else "failed",
@@ -338,4 +350,3 @@ class Mt5Executor:
             mt5_retcode=retcode,
             error="" if is_ok else str(getattr(result, "comment", "")),
         )
-

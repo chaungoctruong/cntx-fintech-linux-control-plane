@@ -125,7 +125,7 @@ def verify_jwt_and_state(token: str) -> PartnerUserContext:
     if st == "locked":
         raise HTTPException(
             status_code=403,
-            detail={"public_code": "token_locked", "message": "Token đã hết hạn — bot bị khóa. Liên hệ đối tác để gia hạn."},
+            detail={"public_code": "token_locked", "message": "Token đã hết hạn — bot bị khóa. Liên hệ đối tác để cấp mã mới."},
         )
     if st != "valid":
         raise HTTPException(

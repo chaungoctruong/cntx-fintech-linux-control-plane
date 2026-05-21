@@ -80,7 +80,7 @@ class Store:
 
         if self.mode != "postgres":
             raise RuntimeError(
-                "\033[91m[CRITICAL ERROR] SQLite fallback has been disabled for SaaS safety. "
+                "\033[91m[CRITICAL ERROR] Non-PostgreSQL storage mode is disabled for SaaS safety. "
                 "Please run PostgreSQL via Docker and set DB_MODE=postgres.\033[0m"
             )
 

@@ -5,11 +5,14 @@ import { AnimatePresence, motion } from "framer-motion";
 import {
   AlertTriangle,
   Bot,
+  ChevronDown,
   ChevronRight,
   CheckCircle2,
   KeyRound,
   Loader2,
   RefreshCcw,
+  Search,
+  X,
 } from "lucide-react";
 
 import BottomNav from "@/components/BottomNav";
@@ -17,7 +20,7 @@ import { INTERNAL_BOT_NAV_MARKER } from "@/components/BottomNav";
 import MiniappTermsModal from "@/components/Bot/MiniappTermsModal";
 import Mt5BotControlPanel from "@/components/Bot/Mt5BotControlPanel";
 import PageHeader from "@/components/PageHeader";
-import { botSupportsBroker } from "@/components/Bot/mt5ControlUtils";
+import { botSupportsBroker, formatBotProfileClass, getMt5LoginFailureMessage } from "@/components/Bot/mt5ControlUtils";
 import { useMiniappTerms } from "@/hooks/useMiniappTerms";
 import {
   BackendAPIError,
@@ -75,6 +78,14 @@ function parsePublicEnvList(raw: string | undefined, fallback: readonly string[]
     .split(/[,\n;]/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function normalizeSheetQuery(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
 }
 
 function parsePublicEnvFixedServers(raw: string | undefined): Map<string, string> {
@@ -155,7 +166,7 @@ const MT5_LOGIN_SLOT_PHASE_LABEL: Record<Mt5LoginSlotPhase, string> = {
   ASSIGNED: "Đang chuẩn bị tài khoản...",
   LOGIN_IN_PROGRESS: "Đang đăng nhập MT5...",
   READY: "Đã lưu tài khoản thành công.",
-  FAILED: "Không đăng nhập được MT5.",
+  FAILED: "Thông tin tài khoản MT5 chưa đúng. Vui lòng kiểm tra login, mật khẩu hoặc server.",
 };
 
 type FormState = {
@@ -175,7 +186,7 @@ function getErrorMessage(error: unknown): string {
     return "Hệ thống chưa tạo được phiên đăng nhập MT5. Đợi ít phút rồi thử lại.";
   }
   if (backendCode === "mt5_login_failed") {
-    return "Không đăng nhập được MT5. Kiểm tra server, số tài khoản và mật khẩu rồi thử lại.";
+    return getMt5LoginFailureMessage(backendCode);
   }
   if (backendCode === "account_quota_exceeded") {
     return "Gói hiện tại đã đạt giới hạn tài khoản MT5. Xóa tài khoản cũ hoặc liên hệ hỗ trợ để mở thêm.";
@@ -188,7 +199,7 @@ function getErrorMessage(error: unknown): string {
       normalizedDetail.includes("terminal_log_ready_timeout") ||
       normalizedDetail.includes("log_ready_timeout")
     ) {
-      return "Đăng nhập MT5 mất nhiều thời gian hơn bình thường. Đợi ít phút rồi thử lại.";
+      return getMt5LoginFailureMessage(detail);
     }
     if (
       normalizedDetail.includes("login_returned_false") ||
@@ -198,7 +209,7 @@ function getErrorMessage(error: unknown): string {
       normalizedDetail.includes("authorization_failed") ||
       normalizedDetail.includes("mt5_login_failed")
     ) {
-      return "Không đăng nhập được MT5. Kiểm tra server, số tài khoản và mật khẩu rồi thử lại.";
+      return getMt5LoginFailureMessage(detail);
     }
     if (
       normalizedDetail.includes("runner_full") ||
@@ -708,6 +719,8 @@ export default function BotPage() {
   const [mt5Bots, setMt5Bots] = useState<MT5BotCatalogItem[]>([]);
   const [mt5BotCatalogError, setMt5BotCatalogError] = useState<string | null>(null);
   const [selectedMt5BotName, setSelectedMt5BotName] = useState("");
+  const [mt5BotSheetOpen, setMt5BotSheetOpen] = useState(false);
+  const [mt5BotSheetQuery, setMt5BotSheetQuery] = useState("");
   const [mt5BotTokenInput, setMt5BotTokenInput] = useState("");
   const [mt5WorkspaceTab, setMt5WorkspaceTab] = useState<Mt5WorkspaceTab>("connect");
   const [ctraderEnvironmentFilter, setCTraderEnvironmentFilter] = useState<CTraderEnvironmentFilter>("all");
@@ -760,6 +773,14 @@ export default function BotPage() {
     brokerMt5Bots.find((bot) => bot.bot_name === selectedMt5BotName) ??
     brokerMt5Bots.find((bot) => bot.bot_id === selectedMt5BotName) ??
     null;
+  const mt5BotSheetQueryNormalized = normalizeSheetQuery(mt5BotSheetQuery);
+  const visibleMt5BotSheetBots = mt5BotSheetQueryNormalized
+    ? brokerMt5Bots.filter((bot) =>
+        normalizeSheetQuery(
+          [bot.display_name, bot.bot_name, bot.bot_id, formatBotProfileClass(bot.profile_class)].join(" ")
+        ).includes(mt5BotSheetQueryNormalized)
+      )
+    : brokerMt5Bots;
   const mt5BotToken = mt5BotTokenInput.trim();
   const mt5FullAccess = miniappAccess?.mt5_full_access === true;
   const mt5BotTokenRequired = miniappAccess?.bot_token_required !== false;
@@ -1223,12 +1244,20 @@ export default function BotPage() {
       setMt5Bots([]);
       setMt5BotCatalogError(null);
       setSelectedMt5BotName("");
+      setMt5BotSheetOpen(false);
+      setMt5BotSheetQuery("");
       setMt5BotTokenInput("");
       return;
     }
 
     void loadMt5BotCatalog();
   }, [loadMt5BotCatalog, selectedLane]);
+
+  useEffect(() => {
+    if (!mt5BotSheetOpen) {
+      setMt5BotSheetQuery("");
+    }
+  }, [mt5BotSheetOpen]);
 
   useEffect(() => {
     if (!brokerMt5Bots.length) {
@@ -2015,23 +2044,51 @@ export default function BotPage() {
                                   ) : null}
 
                                   {brokerMt5Bots.length > 0 ? (
-                                    <label className="space-y-2">
+                                    <div className="space-y-2">
                                       <span className="text-xs font-semibold uppercase tracking-[0.18em] text-cyber-muted">
                                         Bot bạn muốn dùng
                                       </span>
-                                      <select
-                                        className={`${inputClassName} min-h-[54px] font-semibold`}
-                                        value={selectedMt5Bot?.bot_name ?? ""}
-                                        onChange={(event) => setSelectedMt5BotName(event.target.value)}
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setMt5BotSheetQuery("");
+                                          setMt5BotSheetOpen(true);
+                                        }}
                                         disabled={submitting || loadingMt5Bots}
+                                        className="w-full rounded-3xl border border-white/10 bg-black/[0.08] px-4 py-4 text-left transition hover:border-cyan-300/25 disabled:cursor-not-allowed disabled:opacity-60"
                                       >
-                                        {brokerMt5Bots.map((bot) => (
-                                          <option key={bot.bot_id || bot.bot_name} value={bot.bot_name}>
-                                            {bot.display_name}
-                                          </option>
-                                        ))}
-                                      </select>
-                                    </label>
+                                        <div className="flex items-start gap-3">
+                                          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-cyan-300/20 bg-cyan-300/10 text-cyan-100">
+                                            <Bot className="h-5 w-5" strokeWidth={1.9} />
+                                          </div>
+                                          <div className="min-w-0 flex-1">
+                                            <p className="truncate text-base font-semibold text-white">
+                                              {selectedMt5Bot?.display_name || "Chọn bot"}
+                                            </p>
+                                            <p className="mt-1 truncate text-xs leading-5 text-cyber-muted">
+                                              {selectedMt5Bot
+                                                ? `${formatBotProfileClass(selectedMt5Bot.profile_class)} · ${resolvedBroker}`
+                                                : "Chọn bot phù hợp với broker này"}
+                                            </p>
+                                            <div className="mt-3 flex flex-wrap gap-2">
+                                              <span className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-cyan-100">
+                                                MT5
+                                              </span>
+                                              <span
+                                                className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] ${
+                                                  mt5FullAccess
+                                                    ? "border-emerald-300/25 bg-emerald-300/10 text-emerald-100"
+                                                    : "border-amber-300/25 bg-amber-300/10 text-amber-100"
+                                                }`}
+                                              >
+                                                {mt5FullAccess ? "Đã mở" : "Cần mã"}
+                                              </span>
+                                            </div>
+                                          </div>
+                                          <ChevronDown className="mt-1 h-5 w-5 shrink-0 text-cyber-muted" strokeWidth={1.9} />
+                                        </div>
+                                      </button>
+                                    </div>
                                   ) : (
                                     <div className="rounded-2xl border border-dashed border-white/10 bg-transparent px-4 py-4 text-sm text-cyber-muted">
                                       Chưa có bot nào khả dụng cho sàn {brokerDisplayName}. Hãy thử làm mới lại sau ít phút.
@@ -2201,6 +2258,17 @@ export default function BotPage() {
                         selectedBroker={resolvedBroker}
                         preferredBotName={selectedMt5BotName}
                         onSelectedBotChange={setSelectedMt5BotName}
+                        onReconnectAccount={(account) => {
+                          setMt5WorkspaceTab("connect");
+                          setMt5BotTokenInput("");
+                          setForm((current) => ({
+                            ...current,
+                            broker: account.broker || resolvedBroker,
+                            server: account.server || current.server,
+                            login: account.login || current.login,
+                            password: "",
+                          }));
+                        }}
                         mt5FullAccess={mt5FullAccess}
                         onRequireTerms={requireTerms}
                         termsEnabled={termsEnabled}
@@ -2636,6 +2704,117 @@ export default function BotPage() {
           </section>
         </div>
       </motion.main>
+
+      <AnimatePresence>
+        {mt5BotSheetOpen && selectedLane === "mt5" && brokerMt5Bots.length > 0 ? (
+          <motion.div
+            className="fixed inset-0 z-[80] flex min-h-[100dvh] items-center justify-center overscroll-contain bg-black/55 px-3 py-6 backdrop-blur-sm"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={() => setMt5BotSheetOpen(false)}
+          >
+            <motion.div
+              className="flex max-h-[calc(100dvh-72px)] w-full max-w-md flex-col overflow-hidden rounded-[28px] border border-cyan-300/15 bg-[#05090f] shadow-[0_24px_70px_rgba(0,0,0,0.62)]"
+              initial={{ opacity: 0, y: 12, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 12, scale: 0.98 }}
+              transition={{ duration: 0.16, ease: "easeOut" }}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex shrink-0 items-center justify-between gap-3 border-b border-white/10 px-4 py-4">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-cyber-muted">
+                    {resolvedBroker || "MT5"}
+                  </p>
+                  <h4 className="mt-1 text-base font-semibold text-white">Chọn bot</h4>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setMt5BotSheetOpen(false)}
+                  className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border border-white/10 bg-black/[0.12] text-cyber-muted transition hover:border-white/20 hover:text-white"
+                  aria-label="Đóng bảng chọn bot"
+                >
+                  <X className="h-5 w-5" strokeWidth={1.9} />
+                </button>
+              </div>
+
+              <div className="shrink-0 border-b border-white/10 px-4 py-3">
+                <label className="relative block">
+                  <Search
+                    className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-cyber-muted"
+                    strokeWidth={1.9}
+                  />
+                  <input
+                    type="search"
+                    value={mt5BotSheetQuery}
+                    onChange={(event) => setMt5BotSheetQuery(event.target.value)}
+                    placeholder="Tìm tên bot..."
+                    className="h-11 w-full rounded-2xl border border-white/10 bg-black/[0.12] pl-10 pr-3 text-sm font-medium text-white outline-none transition placeholder:text-cyber-muted focus:border-cyan-300/35"
+                  />
+                </label>
+              </div>
+
+              <div className="min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain px-4 py-4 [-webkit-overflow-scrolling:touch]">
+                {visibleMt5BotSheetBots.length > 0 ? (
+                  visibleMt5BotSheetBots.map((bot) => {
+                  const botSelected = bot.bot_name === selectedMt5Bot?.bot_name;
+                  return (
+                    <button
+                      key={bot.bot_id || bot.bot_name}
+                      type="button"
+                      onClick={() => {
+                        setSelectedMt5BotName(bot.bot_name);
+                        setMt5BotSheetOpen(false);
+                      }}
+                      className={`w-full rounded-3xl border p-3 text-left transition ${
+                        botSelected
+                          ? "border-cyan-300/35 bg-cyan-300/10"
+                          : "border-white/10 bg-black/[0.08] hover:border-cyan-300/25"
+                      }`}
+                    >
+                      <div className="flex items-start gap-3">
+                        <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-cyan-300/20 bg-cyan-300/10 text-cyan-100">
+                          {botSelected ? (
+                            <CheckCircle2 className="h-5 w-5" strokeWidth={1.9} />
+                          ) : (
+                            <Bot className="h-5 w-5" strokeWidth={1.9} />
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm font-semibold text-white">{bot.display_name}</p>
+                          <p className="mt-1 truncate text-xs leading-5 text-cyber-muted">
+                            {formatBotProfileClass(bot.profile_class)}
+                          </p>
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            <span className="rounded-full border border-cyan-300/20 bg-cyan-300/10 px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-cyan-100">
+                              MT5
+                            </span>
+                            <span
+                              className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] ${
+                                mt5FullAccess
+                                  ? "border-emerald-300/25 bg-emerald-300/10 text-emerald-100"
+                                  : "border-amber-300/25 bg-amber-300/10 text-amber-100"
+                              }`}
+                            >
+                              {mt5FullAccess ? "Đã mở" : "Cần mã"}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    </button>
+                  );
+                  })
+                ) : (
+                  <div className="rounded-3xl border border-dashed border-white/10 bg-black/[0.08] px-4 py-6 text-sm leading-6 text-cyber-muted">
+                    Không tìm thấy bot phù hợp.
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
 
       <MiniappTermsModal
         open={termsModalOpen}

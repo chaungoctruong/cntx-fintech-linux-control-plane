@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -21,24 +24,24 @@ class Settings(BaseSettings):
 
     source_bot_dir: Path = Path("../bot-trading")
     encrypted_bot_dir: Path = Path("./var/encrypted")
-    database_url: str = "sqlite:///./var/token_bot.db"
+    database_url: str
     auto_encrypt_on_startup: bool = True
 
     token_default_ttl_sec: int = 86400
     enable_debug_decrypt: bool = False
     enable_legacy_jwt_tokens: bool = False
 
-    telegram_bot_token: str | None = None
+    telegram_bot_token: Optional[str] = None
     tg_admin_user_ids: str = ""
 
-    redis_url: str | None = None
+    redis_url: Optional[str] = None
     redis_state_grace_sec: int = 7 * 86400
 
     # Để lock/revoke tự dừng bot trên Windows runner, token-bot gọi internal
     # endpoint của backend chính qua HTTP. Để trống = chỉ mark state, không
     # chủ động stop bot (Mini App khách / TradingView signal vẫn chạy).
-    backend_url: str | None = None
-    backend_internal_key: str | None = None
+    backend_url: Optional[str] = None
+    backend_internal_key: Optional[str] = None
 
     partner_weekly_billing_enabled: bool = True
     partner_billing_timezone: str = "Asia/Ho_Chi_Minh"

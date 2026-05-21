@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import html
@@ -25,7 +27,7 @@ from .backend_client import BackendClient
 from .bot_registry import BotRegistry
 from .config import Settings
 from .crypto import BotCipher
-from .db import ensure_schema_patches, make_engine, make_session_factory
+from .db import initialize_schema, make_engine, make_session_factory
 from . import force_stop_retry
 from .models import (
     Base,
@@ -241,12 +243,7 @@ def _partner_menu(member_role: str | None = None) -> InlineKeyboardMarkup:
     ]
     if member_role is None or _partner_can(member_role, "token_write"):
         rows.insert(1, [InlineKeyboardButton("🎫 Tạo mã", callback_data="pmenu:issue")])
-        rows.append(
-            [
-                InlineKeyboardButton("♻️ Gia hạn", callback_data="pmenu:renew"),
-                InlineKeyboardButton("🚫 Khóa khách", callback_data="pmenu:lock"),
-            ]
-        )
+        rows.append([InlineKeyboardButton("🚫 Khóa khách", callback_data="pmenu:lock")])
     rows.append(
         [
             InlineKeyboardButton("📜 Mã đã cấp", callback_data="pmenu:mytokens"),
@@ -370,6 +367,72 @@ def _activation_code_message(
 
 def _is_backend_product_token(tk: Token | object) -> bool:
     return str(getattr(tk, "created_by", "") or "").startswith("backend-product:")
+
+
+def _norm_bot_code(value) -> str:
+    return str(value or "").strip()
+
+
+def _bot_item_code(item: dict) -> str:
+    return _norm_bot_code(
+        item.get("bot_code")
+        or item.get("bot_id")
+        or item.get("code")
+        or item.get("id")
+    )
+
+
+def _bot_item_name(item: dict) -> str:
+    return str(
+        item.get("bot_name")
+        or item.get("display_name")
+        or item.get("name")
+        or _bot_item_code(item)
+        or ""
+    ).strip()
+
+
+def _bot_item_label(item: dict) -> str:
+    code = _bot_item_code(item)
+    name = _bot_item_name(item)
+    version = str(item.get("version") or "").strip()
+    left = name if name and name != code else code
+    if name and code and name != code:
+        left = f"{name} · {code}"
+    if version:
+        return f"{left} v{version}"
+    return left or code
+
+
+async def _available_bot_items_from_bot_data(bot_data: dict) -> list[dict]:
+    bc: BackendClient | None = bot_data.get("backend_client")
+    if bc is not None and bc.enabled:
+        payload = await bc.list_available_bots()
+        raw_items = payload.get("items") if isinstance(payload, dict) else None
+        if isinstance(raw_items, list) and raw_items:
+            items = [item for item in raw_items if isinstance(item, dict) and _bot_item_code(item)]
+            if items:
+                return sorted(items, key=lambda item: (_bot_item_name(item).lower(), _bot_item_code(item).lower()))
+
+    reg: BotRegistry | None = bot_data.get("registry")
+    if reg is None:
+        return []
+    local_items = await asyncio.to_thread(reg.list_encrypted)
+    out: list[dict] = []
+    for item in local_items:
+        summary = item.get("summary") if isinstance(item.get("summary"), dict) else {}
+        code = _norm_bot_code(item.get("bot_id") or summary.get("bot_id"))
+        if not code:
+            continue
+        out.append(
+            {
+                "bot_code": code,
+                "bot_name": summary.get("bot_name") or code,
+                "version": item.get("version") or summary.get("version") or "",
+                "catalog_source": "local_registry",
+            }
+        )
+    return sorted(out, key=lambda item: (_bot_item_name(item).lower(), _bot_item_code(item).lower()))
 
 
 async def _partner_allowed_bot_ids(ctx, partner: Partner) -> list[str]:
@@ -1136,10 +1199,10 @@ def _partner_billing_text(snapshot: dict, *, title: str = "💳 Công nợ tuầ
         f"Chu kỳ tính phí: <b>{cycle_days} ngày</b>\n"
         f"Từ: <b>{period_start:%Y-%m-%d}</b> đến <b>{period_end:%Y-%m-%d}</b>\n"
         f"Mã chu kỳ: <code>{_h(billing_month)}</code>\n"
-        f"Lượt user active/renew trong chu kỳ: <b>{billable_users}</b>\n"
+        f"Lượt user kích hoạt trong chu kỳ: <b>{billable_users}</b>\n"
         f"User còn hạn tính support/hạ tầng: <b>{support_active_users}</b>\n"
         f"Block support/hạ tầng: <b>{blocks}</b> block / {block_size} user còn hạn\n\n"
-        f"Phí user active/renew: <b>{_usd(snapshot.get('user_fee_usd'))}</b>\n"
+        f"Phí user kích hoạt: <b>{_usd(snapshot.get('user_fee_usd'))}</b>\n"
         f"Support/kỹ thuật: <b>{_usd(snapshot.get('support_fee_usd'))}</b>\n"
         f"Hạ tầng: <b>{_usd(snapshot.get('infra_fee_usd'))}</b>\n\n"
         f"Tổng chu kỳ hiện tại: <b>{_usd(snapshot.get('current_cycle_total_usd'))}</b>\n"
@@ -1148,7 +1211,7 @@ def _partner_billing_text(snapshot: dict, *, title: str = "💳 Công nợ tuầ
         f"Đã admin xác nhận: <b>{_usd(snapshot.get('confirmed_paid_usd'))}</b>\n"
         f"Còn cần thanh toán: <b>{_usd(due)}</b>\n"
         f"Bill đang chờ duyệt: <b>{pending_count}</b>\n\n"
-        f"<i>Phí user tính theo lượt active/renew. Support/hạ tầng tính theo user còn hạn giao với chu kỳ server "
+        f"<i>Phí user tính theo lượt kích hoạt. Support/hạ tầng tính theo user còn hạn giao với chu kỳ server "
         f"{cycle_days} ngày; nợ cũ không tự mất khi sang chu kỳ mới.</i>"
     )
 
@@ -1349,22 +1412,22 @@ async def _show_partners(q, ctx):
 
 
 async def _show_bots_admin(q, ctx):
-    reg: BotRegistry = ctx.application.bot_data["registry"]
-    items = await asyncio.to_thread(reg.list_encrypted)
+    items = await _available_bot_items_from_bot_data(ctx.application.bot_data)
     if not items:
         await _safe_edit_message_text(q,
-            "Chưa có bot nào đã mã hóa để cấp quyền.\n"
-            "Hãy mã hóa bot trong thư mục <code>bot-trading</code> trước.",
+            "Chưa có bot nào trong catalog để cấp quyền.\n"
+            "Khi Windows runner hoặc bot-trading báo bot lên backend, danh sách này sẽ tự cập nhật.",
             parse_mode=ParseMode.HTML,
             reply_markup=_back_to_admin(),
         )
         return
-    lines = ["<b>🤖 Kho bot đã mã hóa</b>"]
+    lines = ["<b>🤖 Kho bot hệ thống</b>"]
     for b in items:
-        sm = b.get("summary") or {}
+        source = str(b.get("catalog_source") or "").strip()
+        source_text = f" · {source}" if source else ""
         lines.append(
-            f"• <code>{b['bot_id']}</code> v{b['version']}\n"
-            f"   {sm.get('bot_name', '?')} — {sm.get('owner', '?')}"
+            f"• <code>{_h(_bot_item_code(b))}</code>\n"
+            f"   {_h(_bot_item_label(b))}{_h(source_text)}"
         )
     await _safe_edit_message_text(q,
         "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=_back_to_admin()
@@ -1579,19 +1642,19 @@ async def cb_grant_partner(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     partner_id = q.data.split(":", 1)[1]
     ctx.user_data["grant_partner_id"] = partner_id
 
-    reg: BotRegistry = ctx.application.bot_data["registry"]
-    items = await asyncio.to_thread(reg.list_encrypted)
+    items = await _available_bot_items_from_bot_data(ctx.application.bot_data)
     if not items:
         await _safe_edit_message_text(q, "Chưa có bot nào.", reply_markup=_back_to_admin())
         return
     kb = [
         [
             InlineKeyboardButton(
-                f"{b['bot_id']} v{b['version']}",
-                callback_data=f"grant_b:{b['bot_id']}",
+                _bot_item_label(b),
+                callback_data=f"grant_b:{_bot_item_code(b)}",
             )
         ]
         for b in items
+        if _bot_item_code(b)
     ]
     kb.append([InlineKeyboardButton("⬅️ Quay lại", callback_data="menu:home")])
     await _safe_edit_message_text(q,
@@ -1866,22 +1929,8 @@ async def cb_partner_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if action == "renew":
-        if not _partner_can(member_role, "token_write"):
-            await _safe_edit_message_text(
-                q,
-                _partner_permission_denied_text(member_role, "gia hạn mã"),
-                parse_mode=ParseMode.HTML,
-                reply_markup=_back_to_partner(),
-            )
-            return
-        await _show_renew_pick_token(q, ctx, partner)
-        return
-
-
 async def _show_partner_bots(q, ctx, partner: Partner):
     sf = ctx.application.bot_data["session_factory"]
-    reg: BotRegistry = ctx.application.bot_data["registry"]
 
     def db_q():
         with sf() as s:
@@ -1893,6 +1942,8 @@ async def _show_partner_bots(q, ctx, partner: Partner):
             return [g.bot_id for g in grants]
 
     bot_ids = await asyncio.to_thread(db_q)
+    available_items = await _available_bot_items_from_bot_data(ctx.application.bot_data)
+    available_by_code = {_bot_item_code(item): item for item in available_items if _bot_item_code(item)}
     if not bot_ids:
         await _safe_edit_message_text(q,
             "Bạn chưa được cấp quyền bot nào.\nLiên hệ đội vận hành CNTx Labs.",
@@ -1901,11 +1952,11 @@ async def _show_partner_bots(q, ctx, partner: Partner):
         return
     lines = ["<b>🤖 Bot bạn được phép cấp mã</b>"]
     for bid in bot_ids:
-        try:
-            mf = reg.get_manifest(bid)
-            lines.append(f"• <code>{bid}</code> v{mf['version']} — {mf['bot_name']}")
-        except FileNotFoundError:
-            lines.append(f"• <code>{bid}</code> <i>(bot này chưa sẵn sàng trong kho bot)</i>")
+        item = available_by_code.get(bid)
+        if item:
+            lines.append(f"• <code>{_h(bid)}</code> — {_h(_bot_item_label(item))}")
+        else:
+            lines.append(f"• <code>{_h(bid)}</code> <i>(bot này chưa sẵn sàng trong catalog)</i>")
     await _safe_edit_message_text(q,
         "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=_back_to_partner()
     )
@@ -1937,7 +1988,6 @@ async def _async_partner_stats(ctx, partner: Partner) -> dict[str, int]:
             tokens = (
                 s.query(Token)
                 .filter_by(partner_id=partner.id)
-                .filter(Token.renewed_to_jti.is_(None))
                 .all()
             )
             active = sum(1 for t in tokens if not t.revoked and t.expires_at >= now)
@@ -2013,7 +2063,7 @@ async def _show_partner_tokens_from_backend(q, report: dict, filter_kind: str = 
             f"{header}\n"
             f"{stats_line}\n"
             f"{state_line}\n"
-            f"<i>Chọn 1 mã để xem chi tiết, gia hạn hoặc khóa quyền.</i>"
+            f"<i>Chọn 1 mã để xem chi tiết hoặc khóa quyền.</i>"
         )
         for item in rows:
             token_id = str(item.get("token_id") or "")
@@ -2077,7 +2127,6 @@ async def _show_partner_lock_tokens(q, ctx, partner: Partner):
                 .filter_by(partner_id=partner.id)
                 .filter(Token.revoked == False)  # noqa: E712
                 .filter(Token.locked_at.is_(None))
-                .filter(Token.renewed_to_jti.is_(None))
                 .filter(Token.expires_at >= now)
                 .order_by(Token.issued_at.desc())
                 .limit(25)
@@ -2178,8 +2227,6 @@ async def _show_backend_token_detail(q, item: dict, member_role: str | None = No
     kb: list[list[InlineKeyboardButton]] = []
     token_id = str(item.get("token_id") or "")
     if _partner_can(member_role, "token_write"):
-        if token_id and code != "issued":
-            kb.append([InlineKeyboardButton("♻️ Gia hạn", callback_data=f"renew_t:{token_id}")])
         if token_id and code not in {"revoked", "expired"}:
             kb.append([InlineKeyboardButton("🚫 Khóa bot của khách", callback_data=f"ptok_rv:{token_id}")])
     kb.append([InlineKeyboardButton("⬅️ Danh sách", callback_data="pmenu:mytokens")])
@@ -2244,7 +2291,6 @@ async def _show_partner_tokens(q, ctx, partner: Partner, filter_kind: str = "act
             base = (
                 s.query(Token)
                 .filter_by(partner_id=partner.id)
-                .filter(Token.renewed_to_jti.is_(None))
                 .order_by(Token.issued_at.desc())
                 .limit(200)
                 .all()
@@ -2318,7 +2364,7 @@ async def _show_partner_tokens(q, ctx, partner: Partner, filter_kind: str = "act
         body = (
             f"{header}\n"
             f"{stats_line}\n"
-            f"<i>Chọn 1 mã để xem chi tiết, gia hạn hoặc khóa quyền.</i>"
+            f"<i>Chọn 1 mã để xem chi tiết hoặc khóa quyền.</i>"
         )
         for tk in rows:
             bids = ",".join(json.loads(tk.bot_ids_json))
@@ -2523,7 +2569,6 @@ async def cb_partner_token_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE
                 "expires_at": tk.expires_at,
                 "revoked": tk.revoked,
                 "revoked_at": tk.revoked_at,
-                "renewed_to_jti": tk.renewed_to_jti,
                 "expiry_notice_sent_at": tk.expiry_notice_sent_at,
                 "locked_at": tk.locked_at,
             }
@@ -2537,12 +2582,10 @@ async def cb_partner_token_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         status = "🚫 Đã khóa"
         if info["revoked_at"]:
             status += f" lúc {info['revoked_at']:%Y-%m-%d %H:%M}"
-        if info["renewed_to_jti"]:
-            status += f"\n   <i>(đã gia hạn sang mã mới <code>{_short_ref(info['renewed_to_jti'])}</code>)</i>"
     elif info["locked_at"] is not None:
         status = (
             f"🔒 Đã khóa do hết hạn lúc {info['locked_at']:%Y-%m-%d %H:%M}\n"
-            f"   Bot đã tự dừng cho khách này. Gia hạn để mở lại."
+            f"   Bot đã tự dừng cho khách này. Hãy cấp mã mới để mở lại."
         )
     elif info["expires_at"] < now:
         status = "⌛ Đã hết hạn (đang chờ khóa)"
@@ -2564,12 +2607,7 @@ async def cb_partner_token_detail(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     )
 
     kb: list[list[InlineKeyboardButton]] = []
-    can_renew = not info["renewed_to_jti"] and (
-        not info["revoked"] or info["expires_at"] >= now - timedelta(days=7)
-    )
     can_revoke = not info["revoked"] and info["expires_at"] >= now
-    if can_renew and _partner_can(member_role, "token_write"):
-        kb.append([InlineKeyboardButton("♻️ Gia hạn", callback_data=f"renew_t:{info['jti']}")])
     if can_revoke and _partner_can(member_role, "token_write"):
         kb.append([InlineKeyboardButton("🚫 Khóa bot của khách", callback_data=f"ptok_rv:{info['jti']}")])
     kb.append([InlineKeyboardButton("⬅️ Danh sách", callback_data="pmenu:mytokens")])
@@ -2851,9 +2889,9 @@ async def _show_partner_billing_customers(q, ctx, partner: Partner):
     lines = [
         f"<b>📄 Chi tiết khách tính phí</b>",
         f"Chu kỳ: <code>{_h(snapshot.get('billing_month'))}</code>",
-        "<i>Phí user theo lượt active/renew; block support/hạ tầng theo user còn hạn trong chu kỳ server.</i>",
+        "<i>Phí user theo lượt kích hoạt; block support/hạ tầng theo user còn hạn trong chu kỳ server.</i>",
         "",
-        "<b>Lượt active/renew tính phí user</b>",
+        "<b>Lượt kích hoạt tính phí user</b>",
     ]
     seen: set[str] = set()
     for item in user_fee_items:
@@ -2878,7 +2916,7 @@ async def _show_partner_billing_customers(q, ctx, partner: Partner):
                 f"  Tạo bởi: <code>{_h(detail.get('issuer_label') or 'Không rõ')}</code>"
             )
     if not seen:
-        lines.append("Chưa có lượt active/renew nào trong chu kỳ này.")
+        lines.append("Chưa có lượt kích hoạt nào trong chu kỳ này.")
 
     lines.extend(["", "<b>User còn hạn tính block support/hạ tầng</b>"])
     support_seen: set[str] = set()
@@ -2916,7 +2954,7 @@ async def _show_partner_billing_customers(q, ctx, partner: Partner):
         for bot_code, count in by_bot[:12]:
             lines.append(f"• <code>{_h(bot_code)}</code>: <b>{count}</b> dòng")
     if len(user_fee_items) > 30:
-        lines.append(f"... còn {len(user_fee_items) - 30} lượt active/renew khác.")
+        lines.append(f"... còn {len(user_fee_items) - 30} lượt kích hoạt khác.")
     if len(support_items) > 30:
         lines.append(f"... còn {len(support_items) - 30} user support/hạ tầng khác.")
     kb = [
@@ -3016,10 +3054,10 @@ async def _show_partner_billing_snapshot_detail(q, ctx, partner: Partner, snapsh
         f"Chu kỳ: <code>{_h(row['period'])}</code>",
         f"Từ <b>{row['period_start_at']:%Y-%m-%d}</b> đến <b>{row['period_end_at']:%Y-%m-%d}</b>",
         "",
-        f"Lượt user active/renew: <b>{row['users']}</b>",
+        f"Lượt user kích hoạt: <b>{row['users']}</b>",
         f"User còn hạn tính support/hạ tầng: <b>{row['support_users']}</b>",
         f"Block: <b>{row['blocks']}</b> / {row['block_size']} user còn hạn",
-        f"Phí user active/renew: <b>{_usd(row['user_fee'])}</b>",
+        f"Phí user kích hoạt: <b>{_usd(row['user_fee'])}</b>",
         f"Support/kỹ thuật: <b>{_usd(row['support_fee'])}</b>",
         f"Hạ tầng: <b>{_usd(row['infra_fee'])}</b>",
         f"Tổng đã phát sinh tới lúc xác nhận: <b>{_usd(row['total'])}</b>",
@@ -3658,7 +3696,6 @@ async def cb_issue_days(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     sf = ctx.application.bot_data["session_factory"]
-    reg: BotRegistry = ctx.application.bot_data["registry"]
     bc: BackendClient | None = ctx.application.bot_data.get("backend_client")
 
     def check():
@@ -3678,12 +3715,15 @@ async def cb_issue_days(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=_back_to_partner(),
         )
         return
-    if not reg.has(bot_id):
+    available_items = await _available_bot_items_from_bot_data(ctx.application.bot_data)
+    available_codes = {_bot_item_code(item) for item in available_items if _bot_item_code(item)}
+    if _norm_bot_code(bot_id) not in available_codes:
         await _safe_edit_message_text(q,
-            f"Bot {bot_id} hiện chưa sẵn sàng trong kho bot.",
+            f"Bot {bot_id} hiện chưa sẵn sàng trong catalog.",
             reply_markup=_back_to_partner(),
         )
         return
+    allowed_bot_ids = [item for item in allowed_bot_ids if _norm_bot_code(item) in available_codes]
 
     if bc is None or not bc.enabled:
         await _safe_edit_message_text(q,
@@ -3742,300 +3782,6 @@ async def cb_issue_days(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         expires_at=exp,
         activation_code=token,
         management_ref=jti,
-    )
-    await _safe_edit_message_text(q,
-        msg, parse_mode=ParseMode.HTML, reply_markup=_back_to_partner()
-    )
-
-
-# ───────────────────────── renew flow (partner) ─────────────────────────
-
-async def _show_renew_pick_token(q, ctx, partner: Partner):
-    backend_report = await _backend_partner_token_report(ctx, partner, scope="all", limit=500)
-    if backend_report is not None:
-        rows = [
-            item for item in list(backend_report.get("items") or [])
-            if str(item.get("status_code") or "") != "issued"
-        ][:25]
-        if not rows:
-            await _safe_edit_message_text(
-                q,
-                "Chưa có khách nào cần gia hạn.\n\n"
-                "Mã chưa kích hoạt thì chưa tính phí và chưa cần gia hạn.",
-                reply_markup=_back_to_partner(),
-            )
-            return
-        kb: list[list[InlineKeyboardButton]] = []
-        for item in rows:
-            token_id = str(item.get("token_id") or "")
-            code = str(item.get("status_code") or "")
-            label = (
-                f"{_backend_status_icon(code)} {item.get('customer_label') or 'Không tên'} · "
-                f"{item.get('bot_code') or '?'} · {_backend_status_label(item)}"
-            )
-            kb.append([InlineKeyboardButton(label[:64], callback_data=f"renew_t:{token_id}")])
-        kb.append([InlineKeyboardButton("⬅️ Menu", callback_data="pmenu:home")])
-        await _safe_edit_message_text(
-            q,
-            "<b>♻️ Gia hạn mã kích hoạt</b>\n\n"
-            "Chọn khách cần gia hạn:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-        return
-
-    sf = ctx.application.bot_data["session_factory"]
-    now = datetime.utcnow()
-
-    def db_q():
-        with sf() as s:
-            rows = (
-                s.query(Token)
-                .filter(Token.partner_id == partner.id)
-                .filter(Token.renewed_to_jti.is_(None))
-                .order_by(Token.expires_at.asc())
-                .limit(30)
-                .all()
-            )
-            return [t for t in rows if not t.revoked or t.expires_at >= now - timedelta(days=7)][:15]
-
-    rows = await asyncio.to_thread(db_q)
-    rows.sort(key=lambda t: (t.revoked, t.expires_at < now, t.expires_at))
-    if not rows:
-        await _safe_edit_message_text(q,
-            "Bạn chưa có mã kích hoạt nào để gia hạn.",
-            reply_markup=_back_to_partner(),
-        )
-        return
-
-    kb = []
-    for tk in rows:
-        khach = tk.end_user_username or "?"
-        bids = ",".join(json.loads(tk.bot_ids_json))
-        if tk.revoked:
-            tag = "🚫"
-        elif tk.expires_at < now:
-            tag = "⌛"
-        elif tk.expires_at - now <= timedelta(days=1):
-            tag = "⚠️"
-        else:
-            tag = "✅"
-        label = f"{tag} {khach} · {bids} · {tk.expires_at:%d/%m}"
-        kb.append([InlineKeyboardButton(label[:60], callback_data=f"renew_t:{tk.jti}")])
-    kb.append([InlineKeyboardButton("⬅️ Quay lại", callback_data="pmenu:home")])
-
-    await _safe_edit_message_text(q,
-        "<b>♻️ Gia hạn mã kích hoạt</b>\n\nChọn khách cần gia hạn:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
-
-
-async def cb_renew_pick_token(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    role, partner = await _async_role(ctx, update.effective_user.id)
-    if role != "partner":
-        return
-    member_role = await _async_partner_member_role(ctx, partner, update.effective_user.id)
-    if not _partner_can(member_role, "token_write"):
-        await _safe_edit_message_text(
-            q,
-            _partner_permission_denied_text(member_role, "gia hạn mã"),
-            parse_mode=ParseMode.HTML,
-            reply_markup=_back_to_partner(),
-        )
-        return
-    jti = q.data.split(":", 1)[1]
-    sf = ctx.application.bot_data["session_factory"]
-
-    def fetch():
-        with sf() as s:
-            tk = s.get(Token, jti)
-            if not tk or tk.partner_id != partner.id:
-                return None
-            return {
-                "jti": tk.jti,
-                "khach": tk.end_user_username,
-                "bot_id": json.loads(tk.bot_ids_json)[0],
-                "expires_at": tk.expires_at,
-                "revoked": tk.revoked,
-                "renewed_to_jti": tk.renewed_to_jti,
-            }
-
-    info = await asyncio.to_thread(fetch)
-    if not info:
-        backend_report = await _backend_partner_token_report(ctx, partner, scope="all", query=jti, limit=20)
-        for item in list((backend_report or {}).get("items") or []):
-            if str(item.get("token_id") or "") == jti:
-                info = {
-                    "jti": jti,
-                    "khach": item.get("customer_label") or "Không tên",
-                    "bot_id": item.get("bot_code") or "",
-                    "expires_at": item.get("entitlement_expires_at") or item.get("redeem_expires_at"),
-                    "revoked": str(item.get("status_code") or "") == "revoked",
-                    "renewed_to_jti": None,
-                }
-                break
-        if not info:
-            await _safe_edit_message_text(q, "Không tìm thấy mã kích hoạt này.", reply_markup=_back_to_partner())
-            return
-    if info["renewed_to_jti"]:
-        await _safe_edit_message_text(q,
-            f"Mã này đã được gia hạn sang mã mới <code>{_short_ref(info['renewed_to_jti'])}</code>.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=_back_to_partner(),
-        )
-        return
-
-    ctx.user_data["renew_jti"] = jti
-    ctx.user_data["renew_khach"] = info["khach"]
-    ctx.user_data["renew_bot_id"] = info["bot_id"]
-    expires_at = info.get("expires_at")
-    expires_text = (
-        expires_at.strftime("%Y-%m-%d %H:%M")
-        if isinstance(expires_at, datetime)
-        else _backend_short_date(expires_at)
-    )
-
-    kb = [
-        [
-            InlineKeyboardButton("1 ngày", callback_data="renew_d:1"),
-            InlineKeyboardButton("3 ngày", callback_data="renew_d:3"),
-        ],
-        [
-            InlineKeyboardButton("7 ngày", callback_data="renew_d:7"),
-            InlineKeyboardButton("30 ngày", callback_data="renew_d:30"),
-        ],
-        [InlineKeyboardButton("⬅️ Hủy", callback_data="pmenu:home")],
-    ]
-    await _safe_edit_message_text(q,
-        f"<b>♻️ Gia hạn mã kích hoạt</b>\n"
-        f"Khách: <b>{_h(info['khach'])}</b>\n"
-        f"Bot: <code>{_h(info['bot_id'])}</code>\n"
-        f"Hết hạn hiện tại: {expires_text}\n\n"
-        f"Chọn thời hạn mới:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
-
-
-async def cb_renew_days(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    role, partner = await _async_role(ctx, update.effective_user.id)
-    if role != "partner":
-        return
-    member_role = await _async_partner_member_role(ctx, partner, update.effective_user.id)
-    if not _partner_can(member_role, "token_write"):
-        await _safe_edit_message_text(
-            q,
-            _partner_permission_denied_text(member_role, "gia hạn mã"),
-            parse_mode=ParseMode.HTML,
-            reply_markup=_back_to_partner(),
-        )
-        return
-    days = int(q.data.split(":", 1)[1])
-    old_jti = ctx.user_data.pop("renew_jti", None)
-    khach = ctx.user_data.pop("renew_khach", None)
-    bot_id = ctx.user_data.pop("renew_bot_id", None)
-    if not old_jti or not bot_id:
-        await _safe_edit_message_text(q, "Phiên thao tác đã hết hạn. Thử lại nhé.", reply_markup=_back_to_partner())
-        return
-
-    sf = ctx.application.bot_data["session_factory"]
-    reg: BotRegistry = ctx.application.bot_data["registry"]
-    bc: BackendClient | None = ctx.application.bot_data.get("backend_client")
-
-    def check_grant():
-        with sf() as s:
-            allowed = [
-                g.bot_id
-                for g in s.query(PartnerBotGrant)
-                .filter_by(partner_id=partner.id, revoked=False)
-                .all()
-            ]
-            return bot_id in allowed, allowed
-
-    allowed_ok, allowed_bot_ids = await asyncio.to_thread(check_grant)
-    if not allowed_ok:
-        await _safe_edit_message_text(q,
-            f"Bạn không còn quyền dùng bot {bot_id}.",
-            reply_markup=_back_to_partner(),
-        )
-        return
-    if not reg.has(bot_id):
-        await _safe_edit_message_text(q,
-            f"Bot {bot_id} hiện chưa sẵn sàng trong kho bot.",
-            reply_markup=_back_to_partner(),
-        )
-        return
-
-    if bc is None or not bc.enabled:
-        await _safe_edit_message_text(q,
-            "Hệ thống cấp mã chưa sẵn sàng. Vui lòng thử lại sau vài phút.",
-            reply_markup=_back_to_partner(),
-        )
-        return
-    if not await _sync_product_partner(ctx, partner, allowed_bot_ids):
-        await _safe_edit_message_text(q,
-            "Chưa cập nhật được quyền đối tác. Vui lòng thử lại sau vài phút.",
-            reply_markup=_back_to_partner(),
-        )
-        return
-    issued = await bc.issue_activation_token(
-        partner_id=partner.id,
-        bot_code=bot_id,
-        duration_days=days,
-        issued_by_telegram_id=update.effective_user.id if update.effective_user else None,
-        customer_label=khach,
-    )
-    if not issued or not issued.get("raw_token") or not issued.get("token_id"):
-        await _safe_edit_message_text(q,
-            "Hệ thống chưa cấp được mã gia hạn. Vui lòng thử lại sau vài phút.",
-            reply_markup=_back_to_partner(),
-        )
-        return
-
-    token = str(issued["raw_token"])
-    new_jti = str(issued["token_id"])
-    exp = datetime.utcnow() + timedelta(days=days)
-
-    def save():
-        with sf() as s:
-            s.add(
-                Token(
-                    jti=new_jti,
-                    partner_id=partner.id,
-                    bot_ids_json=json.dumps([bot_id]),
-                    issued_at=datetime.utcnow(),
-                    expires_at=exp.replace(tzinfo=None),
-                    revoked=False,
-                    end_user_username=khach,
-                    created_by=f"backend-product:partner:{partner.id}:renew",
-                    issued_by_telegram_id=update.effective_user.id if update.effective_user else None,
-                    issued_by_username=update.effective_user.username if update.effective_user else None,
-                )
-            )
-            old = s.get(Token, old_jti)
-            if old:
-                old.renewed_to_jti = new_jti
-            s.commit()
-
-    await asyncio.to_thread(save)
-    transfer_note = (
-        "\nKhách dán mã mới vào ứng dụng CNTxLabs để gia hạn quyền. "
-        "Mã cũ vẫn chạy đến hết hạn nếu đã được kích hoạt."
-    )
-    msg = _activation_code_message(
-        title="♻️ <b>Mã kích hoạt đã gia hạn</b>",
-        customer_label=khach or "?",
-        bot_id=bot_id,
-        days=days,
-        expires_at=exp,
-        activation_code=token,
-        management_ref=new_jti,
-        extra_note=transfer_note,
     )
     await _safe_edit_message_text(q,
         msg, parse_mode=ParseMode.HTML, reply_markup=_back_to_partner()
@@ -4259,7 +4005,6 @@ async def msg_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data.pop("awaiting", None)
 
         sf = ctx.application.bot_data["session_factory"]
-        reg: BotRegistry = ctx.application.bot_data["registry"]
 
         def db_q():
             with sf() as s:
@@ -4271,7 +4016,9 @@ async def msg_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ]
 
         bot_ids = await asyncio.to_thread(db_q)
-        bot_ids = [b for b in bot_ids if reg.has(b)]
+        available_items = await _available_bot_items_from_bot_data(ctx.application.bot_data)
+        available_by_code = {_bot_item_code(item): item for item in available_items if _bot_item_code(item)}
+        bot_ids = [b for b in bot_ids if _norm_bot_code(b) in available_by_code]
         if not bot_ids:
             await update.message.reply_text(
                 "Bạn chưa có bot nào đang dùng được. Liên hệ đội vận hành CNTx Labs.",
@@ -4279,7 +4026,7 @@ async def msg_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         kb = [
-            [InlineKeyboardButton(b, callback_data=f"issue_b:{b}")]
+            [InlineKeyboardButton(_bot_item_label(available_by_code.get(b, {"bot_code": b})), callback_data=f"issue_b:{b}")]
             for b in bot_ids
         ]
         kb.append([InlineKeyboardButton("⬅️ Hủy", callback_data="pmenu:home")])
@@ -4320,7 +4067,6 @@ async def _notifier_tick(app: Application):
                 .join(Partner, Token.partner_id == Partner.id)
                 .filter(Token.revoked == False)  # noqa: E712
                 .filter(~Token.created_by.like("backend-product:%"))
-                .filter(Token.renewed_to_jti.is_(None))
                 .filter(Token.expiry_notice_sent_at.is_(None))
                 .filter(Token.expires_at > now)
                 .filter(Token.expires_at <= deadline)
@@ -4343,7 +4089,7 @@ async def _notifier_tick(app: Application):
                 f"Khách: <b>{_h(it['khach'])}</b>\n"
                 f"Bot: <code>{_h(it['bot_id'])}</code>\n"
                 f"Còn ~{hours_left}h (đến {it['expires_at']:%Y-%m-%d %H:%M UTC})\n\n"
-                f"Vào /start → <b>♻️ Gia hạn mã</b> để cấp tiếp."
+                f"Vào /start → <b>🎫 Tạo mã</b> để cấp mã mới."
             )
             await app.bot.send_message(
                 chat_id=it["partner_tg_id"],
@@ -4402,7 +4148,6 @@ async def _lock_check_tick(app: Application):
                 .join(Partner, Token.partner_id == Partner.id)
                 .filter(Token.revoked == False)  # noqa: E712
                 .filter(~Token.created_by.like("backend-product:%"))
-                .filter(Token.renewed_to_jti.is_(None))
                 .filter(Token.locked_at.is_(None))
                 .filter(Token.expires_at < now)
                 .filter(Partner.telegram_user_id.isnot(None))
@@ -4461,7 +4206,7 @@ async def _lock_check_tick(app: Application):
                 f"Tài khoản giao dịch: <code>{it['account_id']}</code>\n"
                 f"Hết hạn: {it['expires_at']:%Y-%m-%d %H:%M UTC}"
                 f"{stop_note}\n\n"
-                f"Vào /start → <b>♻️ Gia hạn mã</b> để cấp lại quyền."
+                f"Vào /start → <b>🎫 Tạo mã</b> để cấp lại quyền."
             )
             if it["partner_tg_id"]:
                 await app.bot.send_message(
@@ -4528,8 +4273,7 @@ def build_application(settings: Settings) -> Application:
         raise RuntimeError("TELEGRAM_BOT_TOKEN chưa được cấu hình")
 
     engine = make_engine(settings.database_url)
-    Base.metadata.create_all(engine)
-    ensure_schema_patches(engine)
+    initialize_schema(engine, Base.metadata)
     sf = make_session_factory(engine)
     cipher = BotCipher(base64.b64decode(settings.master_key_b64))
     registry = BotRegistry(settings.source_bot_dir, settings.encrypted_bot_dir, cipher)
@@ -4581,8 +4325,6 @@ def build_application(settings: Settings) -> Application:
     app.add_handler(CallbackQueryHandler(cb_revoke_confirm, pattern=r"^rg_b:"))
     app.add_handler(CallbackQueryHandler(cb_issue_pick_bot, pattern=r"^issue_b:"))
     app.add_handler(CallbackQueryHandler(cb_issue_days, pattern=r"^issue_d:"))
-    app.add_handler(CallbackQueryHandler(cb_renew_pick_token, pattern=r"^renew_t:"))
-    app.add_handler(CallbackQueryHandler(cb_renew_days, pattern=r"^renew_d:"))
     app.add_handler(CallbackQueryHandler(cb_admin_tokens_filter, pattern=r"^atok:"))
     app.add_handler(CallbackQueryHandler(cb_partner_tokens_filter, pattern=r"^ptok_f:"))
     app.add_handler(CallbackQueryHandler(cb_partner_tokens_summary, pattern=r"^ptok_sum:"))

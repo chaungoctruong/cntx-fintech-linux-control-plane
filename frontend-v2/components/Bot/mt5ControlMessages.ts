@@ -5,6 +5,8 @@ import {
 } from "@/lib/api";
 import { getBackendErrorCode } from "@/lib/api";
 import {
+  getMt5AccountLoginIssueMessage,
+  getMt5LoginFailureMessage,
   isMt5AccountReady,
   isTransitionalDeploymentStatus,
 } from "@/components/Bot/mt5ControlUtils";
@@ -52,6 +54,20 @@ export function getFriendlyRuntimeReason(
   }
 
   if (
+    code.includes("mt5_login_failed") ||
+    code.includes("invalid_account") ||
+    code.includes("invalid_password") ||
+    code.includes("authorization_failed") ||
+    code.includes("login_returned_false") ||
+    code.includes("login_mismatch") ||
+    code.includes("login_slot_timeout") ||
+    code.includes("terminal_log_ready_timeout") ||
+    code.includes("log_ready_timeout")
+  ) {
+    return getMt5LoginFailureMessage(code);
+  }
+
+  if (
     code.includes("failed to fetch") ||
     code.includes("networkerror") ||
     code.includes("network request failed") ||
@@ -71,6 +87,12 @@ export function getFriendlyRuntimeReason(
   switch (code) {
     case "account_not_connected":
       return "Tài khoản này chưa sẵn sàng. Kiểm tra kết nối MT5 rồi thử lại.";
+    case "account_login_required":
+      return "Vui lòng đăng nhập MT5 thành công trước khi bật bot.";
+    case "account_login_in_progress":
+      return "Tài khoản đang đăng nhập MT5. Đợi kết quả trước khi bật bot.";
+    case "mt5_login_failed":
+      return getMt5LoginFailureMessage(code);
     case "account_has_active_deployment":
       return "Tài khoản đang có bot chạy. Tắt bot hiện tại trước.";
     case "telegram_user_has_active_bot":
@@ -103,7 +125,7 @@ export function getFriendlyRuntimeReason(
     case "no_compatible_runner_for_broker":
     case "broker_not_supported_on_runner":
     case "broker_route_not_supported":
-      return "Sàn này chưa có máy MT5 tương thích đang sẵn sàng. Liên hệ hỗ trợ để kích hoạt node đúng sàn.";
+      return "Sàn này chưa có máy giao dịch phù hợp đang sẵn sàng. Liên hệ hỗ trợ để kích hoạt sàn này.";
     case "runner_full":
     case "no_available_unreserved_slot":
     case "no_scheduler_candidate":
@@ -122,6 +144,20 @@ export function getFriendlyMt5ActionError(action: Mt5BotAction, error: unknown):
 
   if (isTradeDisabledReason(code)) {
     return TRADE_DISABLED_MESSAGE;
+  }
+
+  if (
+    code.includes("mt5_login_failed") ||
+    code.includes("invalid_account") ||
+    code.includes("invalid_password") ||
+    code.includes("authorization_failed") ||
+    code.includes("login_returned_false") ||
+    code.includes("login_mismatch") ||
+    code.includes("login_slot_timeout") ||
+    code.includes("terminal_log_ready_timeout") ||
+    code.includes("log_ready_timeout")
+  ) {
+    return getMt5LoginFailureMessage(code);
   }
 
   if (
@@ -145,6 +181,12 @@ export function getFriendlyMt5ActionError(action: Mt5BotAction, error: unknown):
       return action === "start"
         ? "Tài khoản chưa sẵn sàng nên chưa thể bật bot."
         : "Tài khoản chưa sẵn sàng cho thao tác này.";
+    case "account_login_required":
+      return "Vui lòng đăng nhập MT5 thành công trước khi bật bot.";
+    case "account_login_in_progress":
+      return "Tài khoản đang đăng nhập MT5. Đợi kết quả trước khi thao tác tiếp.";
+    case "mt5_login_failed":
+      return getMt5LoginFailureMessage(code);
     case "account_has_active_deployment":
       return action === "delete"
         ? "Tài khoản đang có bot chạy. Tắt bot trước khi gỡ tài khoản."
@@ -200,7 +242,7 @@ export function getFriendlyMt5ActionError(action: Mt5BotAction, error: unknown):
     case "no_compatible_runner_for_broker":
     case "broker_not_supported_on_runner":
     case "broker_route_not_supported":
-      return "Sàn này chưa có máy MT5 tương thích đang sẵn sàng. Liên hệ hỗ trợ để kích hoạt node đúng sàn.";
+      return "Sàn này chưa có máy giao dịch phù hợp đang sẵn sàng. Liên hệ hỗ trợ để kích hoạt sàn này.";
     case "runner_full":
     case "no_available_unreserved_slot":
     case "no_scheduler_candidate":
@@ -314,7 +356,7 @@ export function getActionHint(params: {
     return "Chọn tài khoản MT5";
   }
   if (!isMt5AccountReady(selectedAccount)) {
-    return "Hoàn tất kết nối tài khoản";
+    return getMt5AccountLoginIssueMessage(selectedAccount) ?? "Hoàn tất kết nối tài khoản";
   }
   if (!selectedBot) {
     return "Chọn bot";

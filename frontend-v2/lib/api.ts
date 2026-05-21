@@ -161,6 +161,9 @@ const friendlyErrorMessages: Record<string, string> = {
   runner_queue_backlog: "Hệ thống đang xử lý nhiều yêu cầu. Đợi ít phút rồi thử lại.",
   runner_offline: "Kết nối tới máy chạy MT5 tạm gián đoạn. Đợi ít phút rồi thử lại.",
   runner_full: "Hệ thống đang hết phiên MT5 trống. Đợi ít phút rồi thử lại.",
+  account_login_required: "Đăng nhập MT5 chưa thành công. Kiểm tra lại tài khoản trước khi bật bot.",
+  account_login_in_progress: "Tài khoản đang đăng nhập MT5. Đợi kết quả trước khi thao tác tiếp.",
+  mt5_login_failed: "Thông tin tài khoản MT5 chưa đúng. Vui lòng kiểm tra login, mật khẩu hoặc server.",
   slot_not_ipc_ready: "Phiên MT5 đang khởi động lại. Đợi ít phút rồi thử lại.",
   slot_resident_worker_missing: "Phiên MT5 đang khởi động lại. Đợi ít phút rồi thử lại.",
   no_available_unreserved_slot: "Hệ thống đang hết phiên MT5 trống. Đợi ít phút rồi thử lại.",
@@ -594,26 +597,7 @@ interface MiniBotCatalogItem {
   source_path?: string;
 }
 
-const GSALGO_DISPLAY_NAME = "Gs Algo";
-const GSALGO_DISPLAY_IDENTITIES = new Set(["gsalgovip", "gsalgo", "gsalgomt5bot"]);
-
-function normalizeBotDisplayIdentity(value?: string | null): string {
-  return String(value || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
-}
-
 function formatMt5BotDisplayName(bot: MiniBotCatalogItem): string {
-  const identities = [
-    bot.bot_id,
-    bot.bot_code,
-    bot.bot_name,
-    bot.display_name,
-    bot.label,
-  ].map(normalizeBotDisplayIdentity);
-
-  if (identities.some((identity) => GSALGO_DISPLAY_IDENTITIES.has(identity))) {
-    return GSALGO_DISPLAY_NAME;
-  }
-
   return bot.display_name || bot.bot_name || bot.label || bot.bot_code;
 }
 

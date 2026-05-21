@@ -31,6 +31,19 @@ def _canonical_slot_id(value: Any) -> str:
     return raw
 
 
+def _coerce_command_type(value: Any) -> CommandType:
+    if isinstance(value, CommandType):
+        return value
+    return CommandType(str(value))
+
+
+def _runner_queue_name(runner_id: Any) -> str:
+    runner_id_s = str(runner_id or "").strip()
+    if not runner_id_s:
+        raise ValueError("runner_id_required")
+    return f"mt5:runner:{runner_id_s}:commands"
+
+
 def _dict_payload(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return dict(value)
@@ -62,34 +75,38 @@ def _slot_inventory_entry(slot: dict[str, Any], metadata: dict[str, Any]) -> dic
     return {}
 
 
+def _slot_runtime_hints_from_slots(slots: list[dict[str, Any]], *, runner_id: str, slot_id: str) -> dict[str, Any]:
+    runner_id_s = str(runner_id or "").strip()
+    slot_id_s = _canonical_slot_id(slot_id)
+    if not runner_id_s or not slot_id_s:
+        return {}
+    for slot in slots:
+        if str(slot.get("runner_id") or "").strip() != runner_id_s:
+            continue
+        if _canonical_slot_id(slot.get("slot_id")) != slot_id_s:
+            continue
+        metadata = _dict_payload(slot.get("metadata_json") or slot.get("metadata"))
+        inventory_entry = _slot_inventory_entry(slot, metadata)
+        hints: dict[str, Any] = {}
+        for source in (metadata, inventory_entry):
+            for key, value in source.items():
+                if value not in (None, ""):
+                    hints[str(key)] = value
+        return hints
+    return {}
+
+
 class CommandRouterService:
     def __init__(self, repo: ControlPlaneRepository) -> None:
         self._repo = repo
         self._publisher = RedisStreamPublisher()
 
     def _slot_runtime_hints(self, *, runner_id: str, slot_id: str) -> dict[str, Any]:
-        runner_id_s = str(runner_id or "").strip()
-        slot_id_s = _canonical_slot_id(slot_id)
-        if not runner_id_s or not slot_id_s:
-            return {}
         try:
             slots = self._repo.list_slots()
         except Exception:
             return {}
-        for slot in slots:
-            if str(slot.get("runner_id") or "").strip() != runner_id_s:
-                continue
-            if _canonical_slot_id(slot.get("slot_id")) != slot_id_s:
-                continue
-            metadata = _dict_payload(slot.get("metadata_json") or slot.get("metadata"))
-            inventory_entry = _slot_inventory_entry(slot, metadata)
-            hints: dict[str, Any] = {}
-            for source in (metadata, inventory_entry):
-                for key, value in source.items():
-                    if value not in (None, ""):
-                        hints[str(key)] = value
-            return hints
-        return {}
+        return _slot_runtime_hints_from_slots(slots, runner_id=runner_id, slot_id=slot_id)
 
     async def dispatch(
         self,
@@ -105,16 +122,20 @@ class CommandRouterService:
         trace_id: str,
         command_id: str | None = None,
     ) -> dict[str, Any]:
+        command_type = _coerce_command_type(command_type)
         command_id_value = str(command_id or uuid.uuid4().hex).strip()
+        runner_id_s = str(runner_id or "").strip()
+        runner_queue_name = _runner_queue_name(runner_id_s)
+        slot_id_s = _canonical_slot_id(slot_id)
         requested_cmd_type = runner_command_request_type(command_type)
         routed_payload = normalize_runner_command_payload(
             payload or {},
             command_type=command_type,
             account_id=account_id,
             deployment_id=deployment_id,
-            runner_id=runner_id,
-            slot_id=slot_id,
-            slot_runtime_hints=self._slot_runtime_hints(runner_id=runner_id, slot_id=slot_id),
+            runner_id=runner_id_s,
+            slot_id=slot_id_s,
+            slot_runtime_hints=self._slot_runtime_hints(runner_id=runner_id_s, slot_id=slot_id_s),
         )
         routed_payload["command_id"] = command_id_value
         routed_payload["bot_id"] = bot_id
@@ -130,8 +151,8 @@ class CommandRouterService:
                 "profile_id": account_id,
                 "deployment_id": deployment_id,
                 "bot_id": bot_id,
-                "runner_id": runner_id,
-                "slot_id": slot_id,
+                "runner_id": runner_id_s,
+                "slot_id": slot_id_s,
                 "priority": priority,
                 "payload": routed_payload,
                 "created_at": datetime.now(timezone.utc).isoformat(),
@@ -141,14 +162,14 @@ class CommandRouterService:
         bind_log_context(
             account_id=account_id,
             deployment_id=deployment_id,
-            runner_id=runner_id,
+            runner_id=runner_id_s,
             trace_id=trace_id,
         )
         dispatch_ctx = {
             "command_id": envelope_model.command_id,
             "command_type": command_type.value,
-            "runner_id": runner_id,
-            "slot_id": slot_id,
+            "runner_id": runner_id_s,
+            "slot_id": slot_id_s,
             "account_id": account_id,
             "deployment_id": deployment_id,
             "bot_id": bot_id,
@@ -183,12 +204,12 @@ class CommandRouterService:
             account_id=account_id,
             deployment_id=deployment_id,
             bot_id=bot_id,
-            runner_id=runner_id,
-            slot_id=slot_id,
+            runner_id=runner_id_s,
+            slot_id=slot_id_s,
             priority=priority,
             payload=envelope_model.payload,
             trace_id=trace_id,
-            queue_name=f"mt5:account:{account_id}:commands",
+            queue_name=runner_queue_name,
         )
         if str(command_record.get("command_id") or "").strip() != envelope_model.command_id:
             log_agent_event(
@@ -275,7 +296,7 @@ class CommandRouterService:
         if command_type == CommandType.START_BOT and login_s and login_lease.is_enabled():
             acquire_result = await login_lease.acquire(
                 login=login_s,
-                runner_id=runner_id,
+                runner_id=runner_id_s,
                 command_id=envelope_model.command_id,
                 broker=str(routed_payload.get("broker") or "") or None,
                 server=str(routed_payload.get("server") or "") or None,
@@ -314,7 +335,7 @@ class CommandRouterService:
                 operation="command_dispatch",
                 hint=(
                     "Backend created the command row in Postgres but failed to publish to Redis. "
-                    "Reconciler will retry; check Redis health and `mt5:account:{account_id}:commands` stream. "
+                    "Reconciler will retry; check Redis health and `mt5:runner:{runner_id}:commands` queue. "
                     "If repeats, inspect command_delivery_reconciler logs for the same command_id."
                 ),
                 publish_elapsed_ms=round((time.monotonic() - publish_started) * 1000, 1),
@@ -325,7 +346,7 @@ class CommandRouterService:
             # blocked by a phantom lease.
             if command_type == CommandType.START_BOT and login_s and login_lease.is_enabled():
                 try:
-                    await login_lease.release(login=login_s, runner_id=runner_id)
+                    await login_lease.release(login=login_s, runner_id=runner_id_s)
                 except Exception:
                     pass
             raise
@@ -378,6 +399,22 @@ class CommandRouterService:
         if not items:
             return []
         broadcast_marker = str(broadcast_id or uuid.uuid4().hex[:12])
+        slots_snapshot: list[dict[str, Any]] | None = None
+        slot_hints_cache: dict[tuple[str, str], dict[str, Any]] = {}
+
+        def _batch_slot_runtime_hints(*, runner_id: str, slot_id: str) -> dict[str, Any]:
+            nonlocal slots_snapshot
+            key = (str(runner_id or "").strip(), _canonical_slot_id(slot_id))
+            if key in slot_hints_cache:
+                return dict(slot_hints_cache[key])
+            if slots_snapshot is None:
+                try:
+                    slots_snapshot = self._repo.list_slots()
+                except Exception:
+                    slots_snapshot = []
+            hints = _slot_runtime_hints_from_slots(slots_snapshot, runner_id=key[0], slot_id=key[1])
+            slot_hints_cache[key] = hints
+            return dict(hints)
 
         # Phase 1: build envelopes + create DB rows (sequential, fast).
         envelopes: list[Any] = []
@@ -391,6 +428,7 @@ class CommandRouterService:
                 account_id = int(item["account_id"])
                 deployment_id = int(item["deployment_id"])
                 runner_id = str(item["runner_id"]).strip()
+                runner_queue_name = _runner_queue_name(runner_id)
                 slot_id = str(item.get("slot_id") or "").strip()
                 bot_id = str(item.get("bot_id") or "")
                 priority = int(item.get("priority") or 50)
@@ -406,7 +444,7 @@ class CommandRouterService:
                     deployment_id=deployment_id,
                     runner_id=runner_id,
                     slot_id=slot_id,
-                    slot_runtime_hints=self._slot_runtime_hints(runner_id=runner_id, slot_id=slot_id),
+                    slot_runtime_hints=_batch_slot_runtime_hints(runner_id=runner_id, slot_id=slot_id),
                 )
                 routed_payload["command_id"] = command_id_value
                 routed_payload["bot_id"] = bot_id
@@ -458,7 +496,7 @@ class CommandRouterService:
                     priority=priority,
                     payload=envelope_model.payload,
                     trace_id=trace_id,
-                    queue_name=f"mt5:account:{account_id}:commands",
+                    queue_name=runner_queue_name,
                 )
                 envelopes.append(envelope_model)
                 records.append(command_record)
@@ -476,6 +514,10 @@ class CommandRouterService:
                 continue
             publish_inputs.append(env.model_dump(mode="json"))
             publish_index_map.append(idx)
+        publish_pos_by_input_index = {
+            input_idx: pos
+            for pos, input_idx in enumerate(publish_index_map)
+        }
 
         publish_started = time.monotonic()
         pipeline_results: list[dict[str, Any]] = []
@@ -516,8 +558,8 @@ class CommandRouterService:
                 out.append({"ok": True, "command_record": record, "deduped": True})
                 continue
             # Find this envelope's pipeline result
-            pos = publish_index_map.index(idx)
-            pub = pipeline_results[pos] if pos < len(pipeline_results) else {}
+            pos = publish_pos_by_input_index.get(idx, -1)
+            pub = pipeline_results[pos] if 0 <= pos < len(pipeline_results) else {}
             stream_id = str(pub.get("stream_id") or "")
             duplicate = bool(pub.get("duplicate"))
             if not stream_id:

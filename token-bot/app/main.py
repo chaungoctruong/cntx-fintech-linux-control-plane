@@ -8,7 +8,7 @@ from . import api
 from .bot_registry import BotRegistry
 from .config import Settings
 from .crypto import BotCipher
-from .db import ensure_schema_patches, make_engine, make_session_factory
+from .db import initialize_schema, make_engine, make_session_factory
 from .models import Base
 from .token_service import TokenService
 
@@ -21,8 +21,7 @@ def build_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         engine = make_engine(settings.database_url)
-        Base.metadata.create_all(engine)
-        ensure_schema_patches(engine)
+        initialize_schema(engine, Base.metadata)
         session_factory = make_session_factory(engine)
 
         cipher = BotCipher(base64.b64decode(settings.master_key_b64))

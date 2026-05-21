@@ -6,7 +6,6 @@ import {
   type StartMt5DeploymentResponse,
 } from "@/lib/api";
 
-const GSALGO_DISPLAY_NAME = "Gs Algo";
 export const LOT_SIZE_DEFAULT = "0.01";
 
 export function isMt5AccountReady(account: MT5AccountItem | null): boolean {
@@ -44,27 +43,6 @@ function compactIdentity(value?: string | null): string {
   return String(value || "").trim().toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function botIdentityKeys(bot: MT5BotCatalogItem): string[] {
-  return [bot.bot_id, bot.bot_name, bot.display_name]
-    .map(compactIdentity)
-    .filter(Boolean);
-}
-
-function legacyBrokerGuard(bot: MT5BotCatalogItem, broker?: string | null): boolean | null {
-  const selectedBroker = brokerRouteKey(broker);
-  if (!selectedBroker) {
-    return null;
-  }
-  const identities = botIdentityKeys(bot);
-  if (identities.some((item) => item === "gsalgovip" || item === "gsalgo" || item === "gsalgomt5bot")) {
-    return selectedBroker === "dbg" || selectedBroker === "exness";
-  }
-  if (identities.some((item) => item === "xaubotai" || item === "xaubot")) {
-    return selectedBroker === "exness";
-  }
-  return null;
-}
-
 function stringList(value: unknown): string[] {
   if (Array.isArray(value)) {
     return value.map((item) => String(item || "").trim()).filter(Boolean);
@@ -93,10 +71,6 @@ export function botSupportsBroker(bot: MT5BotCatalogItem | null, broker?: string
   if (!bot) {
     return false;
   }
-  const legacyGuard = legacyBrokerGuard(bot, broker);
-  if (legacyGuard !== null) {
-    return legacyGuard;
-  }
   const hints = getRecord(bot.resource_hints);
   const runtimeEnv = getRecord(bot.runtime_env);
   const supported = [
@@ -115,12 +89,7 @@ export function botSupportsBroker(bot: MT5BotCatalogItem | null, broker?: string
 }
 
 export function formatBotDisplayName(value?: string | null): string {
-  const raw = String(value || "").trim();
-  const normalized = compactIdentity(raw);
-  if (normalized === "gsalgovip" || normalized === "gsalgo" || normalized === "gsalgomt5bot") {
-    return GSALGO_DISPLAY_NAME;
-  }
-  return raw;
+  return String(value || "").trim();
 }
 
 export function formatBotProfileClass(value?: string | null): string {
@@ -215,6 +184,31 @@ export function getDeploymentLotSize(config?: Record<string, unknown> | null): s
     return null;
   }
   return String(raw);
+}
+
+function normalizeMt5LoginReason(rawReason?: unknown): string {
+  return String(rawReason || "").trim().replace(/^"+|"+$/g, "").toLowerCase();
+}
+
+export function getMt5LoginFailureMessage(_rawReason?: unknown): string {
+  return "Thông tin tài khoản MT5 chưa đúng. Vui lòng kiểm tra login, mật khẩu hoặc server.";
+}
+
+export function getMt5AccountLoginIssueMessage(account: MT5AccountItem | null): string | null {
+  if (!account) {
+    return null;
+  }
+  const status = String(account.status || "").trim().toLowerCase();
+  if (status === "login_failed") {
+    return getMt5LoginFailureMessage(account.last_error || account.status);
+  }
+  if (status === "pending_login") {
+    return "Đang đăng nhập MT5. Đợi kết quả trước khi bật bot.";
+  }
+  if (!isMt5AccountReady(account)) {
+    return "Kết nối lại tài khoản MT5 trước khi bật bot.";
+  }
+  return null;
 }
 
 export function humanizeAccountStatus(account: MT5AccountItem | null): string {

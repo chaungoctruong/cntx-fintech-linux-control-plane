@@ -357,6 +357,9 @@ class Settings(BaseSettings):
     CONTROL_PLANE_EVENT_CONSUMER_GROUP: str = "control-plane-event-audit"
     CONTROL_PLANE_EVENT_CONSUMER_BLOCK_MS: int = 5000
     EVENT_STREAM_MAXLEN: int = 20000
+    RUNNER_HTTP_RETRY_ATTEMPTS: int = 3
+    RUNNER_HTTP_RETRY_BASE_SEC: float = 0.25
+    RUNNER_HTTP_RETRY_MAX_SEC: float = 3.0
     RUNTIME_HOUSEKEEPING_ENABLED: bool = True
     RUNTIME_HOUSEKEEPING_INTERVAL_SEC: int = 3600
     RUNTIME_HOUSEKEEPING_BATCH_SIZE: int = 5000
@@ -365,6 +368,7 @@ class Settings(BaseSettings):
     OPS_LOGIN_SLOT_BACKLOG_THRESHOLD: int = 20
     OPS_COMMAND_BACKLOG_THRESHOLD: int = 40
     OPS_EVENT_BACKLOG_THRESHOLD: int = 100
+    OPS_BROKER_POOL_MIN_ONLINE_RUNNERS: int = 2
     ZINGSERVER_API_BASE_URL: str = "https://api.zingserver.com"
     ZINGSERVER_API_TOKEN: str = ""
     ZINGSERVER_API_TIMEOUT_SEC: float = 15.0
@@ -381,6 +385,19 @@ class Settings(BaseSettings):
     # TradingView alert ingress: optional shared secret (header X-TradingView-Secret, query `secret`, or JSON field `secret`).
     # Empty = no auth (dev only); set in production.
     TRADINGVIEW_WEBHOOK_SECRET: str = ""
+    # Product-grade webhook contract guards. These reject only the incoming
+    # alert/command; they do not disable accounts or deployments.
+    TRADINGVIEW_ORDER_CONTRACT_VERSION: int = 2
+    TRADINGVIEW_REQUIRE_CONTRACT_VERSION: bool = True
+    TRADINGVIEW_ALERT_MAX_AGE_SEC: int = 300
+    TRADINGVIEW_ALERT_FUTURE_SKEW_SEC: int = 60
+    TRADINGVIEW_MAX_VOLUME: float = 10.0
+    TRADINGVIEW_MIN_PRICE_DISTANCE: float = 0.0
+    TRADINGVIEW_MAX_PRICE_DISTANCE: float = 250.0
+    # DCA limit orders must only fan out to runners that explicitly advertise
+    # pending/limit order support. This prevents older runners from treating a
+    # DCA limit payload as a market order.
+    TRADINGVIEW_REQUIRE_DCA_LIMIT_RUNNER_CAPABILITY: bool = True
 
     model_config = SettingsConfigDict(
         env_file=str(_ENV_FILE),

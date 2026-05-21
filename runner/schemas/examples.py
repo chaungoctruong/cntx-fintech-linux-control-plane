@@ -65,6 +65,36 @@ PLACE_ORDER_COMMAND = RunnerCommand.model_validate(
     }
 ).model_dump(mode="json")
 
+PLACE_LIMIT_ORDER_COMMAND = RunnerCommand.model_validate(
+    {
+        "command_id": "cmd-place-limit-001",
+        "command_type": "PLACE_ORDER",
+        "account_id": 101,
+        "deployment_id": 9001,
+        "bot_id": "gsalgovip",
+        "runner_id": "runner-win-01",
+        "slot_id": "slot-01",
+        "priority": 80,
+        "payload": {
+            "request": {
+                "symbol": "XAUUSD",
+                "side": "buy",
+                "volume": 0.1,
+                "entry_type": "limit",
+                "order_type": "BUY_LIMIT",
+                "pending_order": True,
+                "limit_price": 2397.5,
+                "entry_price": 2397.5,
+                "take_profit": 2410.0,
+                "stop_loss": 2395.0,
+            },
+            "signal_role": "DCA",
+        },
+        "created_at": "2026-04-22T10:06:10Z",
+        "trace_id": "trace-place-limit-001",
+    }
+).model_dump(mode="json")
+
 MODIFY_ORDER_COMMAND = RunnerCommand.model_validate(
     {
         "command_id": "cmd-modify-001",
@@ -339,6 +369,7 @@ EXAMPLE_COMMANDS = {
     "START_BOT": START_BOT_COMMAND,
     "STOP_BOT": STOP_BOT_COMMAND,
     "PLACE_ORDER": PLACE_ORDER_COMMAND,
+    "PLACE_LIMIT_ORDER": PLACE_LIMIT_ORDER_COMMAND,
     "MODIFY_ORDER": MODIFY_ORDER_COMMAND,
     "CLOSE_ORDER": CLOSE_ORDER_COMMAND,
     "SYNC_STATE": SYNC_STATE_COMMAND,

@@ -4,7 +4,7 @@ import { usePathname } from "next/navigation";
 import { useRef } from "react";
 import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 
-const ROUTES_ORDER = ["/", "/bot/", "/bot/control/", "/rankbot/", "/wallet/", "/rewards/"];
+const ROUTES_ORDER = ["/", "/bot/", "/bot/control/", "/wallet/", "/rewards/"];
 
 function routeIndex(path: string): number {
   const normalized = path.endsWith("/") ? path : `${path}/`;

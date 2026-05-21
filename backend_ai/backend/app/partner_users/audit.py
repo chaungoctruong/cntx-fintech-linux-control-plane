@@ -48,7 +48,3 @@ def bot_stop(*, jti: str, account_id: int, bot_id: str, partner_id: str, action:
 
 def force_stop(*, jti: str, account_id: int | None, reason: str, action: str, dm_sent: bool = False) -> None:
     _emit("force_stop", jti=jti, account_id=account_id, reason=reason, action=action, dm_sent=dm_sent)
-
-
-def transfer_link(*, old_jti: str, new_jti: str, transferred: bool, account_id: int | None = None) -> None:
-    _emit("transfer_link", old_jti=old_jti, new_jti=new_jti, transferred=transferred, account_id=account_id)

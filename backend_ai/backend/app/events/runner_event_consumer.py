@@ -12,6 +12,7 @@ from app.core.redis_client import (
     is_redis_retryable_connection_error,
     reset_redis_write_client,
 )
+from app.events.runner_event_ingest import LOGIN_SLOT_FINAL_EVENT_TYPES, apply_login_slot_final_event
 from app.infra.redis_streams import EVENT_STREAM_KEY
 from app.repositories.control_plane_repository import ControlPlaneRepository
 from app.services.store_service import get_process_store
@@ -40,6 +41,29 @@ def _login_slot_command_type(payload: dict[str, Any]) -> str:
         or _clean(payload.get("command_type"))
         or _clean(payload.get("cmd_type"))
     ).upper()
+
+
+def _merge_event_field_payload(fields: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(payload or {})
+    for key in (
+        "status",
+        "reason",
+        "error",
+        "error_code",
+        "message",
+        "reservation_id",
+        "login_reservation_id",
+        "elapsed_ms",
+        "slot_ttl_sec",
+        "expires_at",
+        "account_login",
+        "account_server",
+        "runner_event_type",
+    ):
+        value = fields.get(key)
+        if value not in (None, "") and key not in merged:
+            merged[key] = value
+    return merged
 
 
 class RunnerEventConsumerService:
@@ -79,6 +103,7 @@ class RunnerEventConsumerService:
             payload = json.loads(payload_raw)
         except Exception:
             payload = {"_raw_payload_json": payload_raw}
+        payload = _merge_event_field_payload(fields, payload if isinstance(payload, dict) else {})
         event_type = _clean(fields.get("event_type")).upper()
         command_id = _clean(fields.get("command_id")) or _clean(payload.get("command_id")) or None
         runner_id = _clean(fields.get("runner_id")) or _clean(payload.get("runner_id")) or None
@@ -111,6 +136,16 @@ class RunnerEventConsumerService:
                     error_text=error_text or "runtime_log_login_slot_failed",
                     payload={**payload, "stream_id": stream_id, "compat_event_type": "RUNTIME_LOG_FAILED"},
                 )
+        elif event_type in LOGIN_SLOT_FINAL_EVENT_TYPES:
+            apply_login_slot_final_event(
+                self._repo,
+                event_type_value=event_type,
+                account_id=account_id,
+                command_id=command_id,
+                runner_id=runner_id or "",
+                slot_id=slot_id,
+                payload_map={**payload, "stream_id": stream_id},
+            )
         self._repo.upsert_execution_audit(
             event_id=str(fields.get("event_id") or "").strip(),
             command_id=command_id,

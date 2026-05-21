@@ -1428,21 +1428,6 @@ def frontend_v2_rewards_rsc():
     return _frontend_rsc_response("rewards")
 
 
-@app.get("/rankbot", include_in_schema=False)
-def frontend_v2_rankbot_redirect():
-    return RedirectResponse(url="/rankbot/", status_code=302)
-
-
-@app.get("/rankbot/", include_in_schema=False)
-def frontend_v2_rankbot():
-    return _frontend_page_response("rankbot")
-
-
-@app.get("/rankbot/index.txt", include_in_schema=False)
-def frontend_v2_rankbot_rsc():
-    return _frontend_rsc_response("rankbot")
-
-
 @app.get("/live")
 async def live() -> JSONResponse:
     payload = {

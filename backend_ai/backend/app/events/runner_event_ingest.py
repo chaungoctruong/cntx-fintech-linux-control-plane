@@ -31,6 +31,12 @@ from ops_telegram_alerts import schedule_error_alert
 
 _log = logging.getLogger("runner.event.ingest")
 
+LOGIN_SLOT_FINAL_EVENT_TYPES = {
+    EventType.LOGIN_SLOT_VERIFIED.value,
+    EventType.LOGIN_SLOT_FAILED.value,
+    EventType.LOGIN_SLOT_RELEASED.value,
+}
+
 _HEARTBEAT_STATE_KEYS = {
     "account_id",
     "active_account_id",
@@ -141,6 +147,7 @@ def _deployment_wants_stopped(deployment: dict[str, Any] | None) -> bool:
 def _event_reason(payload: dict[str, Any]) -> str:
     return str(
         payload.get("reason")
+        or payload.get("error_code")
         or payload.get("error")
         or payload.get("error_text")
         or payload.get("message")
@@ -258,6 +265,102 @@ def _payload_command_id(payload: dict[str, Any]) -> str | None:
 
 def _payload_truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "ok", "ready", "healthy", "verified"}
+
+
+def _payload_int(value: Any) -> int | None:
+    try:
+        if value in (None, ""):
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _payload_positive_int(value: Any, default: int = 300) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def apply_login_slot_final_event(
+    repo: ControlPlaneRepository,
+    *,
+    event_type_value: str,
+    account_id: int | None,
+    command_id: str | None,
+    runner_id: str,
+    slot_id: str | None,
+    payload_map: dict[str, Any],
+) -> dict[str, Any]:
+    """Project a final login-slot event into DB state.
+
+    Used by both HTTP runner event ingest and Redis stream consumer so
+    LOGIN_SLOT_* behavior stays identical across transports.
+    """
+    event_type_s = str(event_type_value or "").strip().upper()
+    if event_type_s not in LOGIN_SLOT_FINAL_EVENT_TYPES:
+        return {"handled": False}
+
+    reservation_id = _payload_int(payload_map.get("login_reservation_id") or payload_map.get("reservation_id"))
+    error_text = _event_reason(payload_map)
+
+    if event_type_s == EventType.LOGIN_SLOT_RELEASED.value:
+        released_count = 0
+        if reservation_id is not None and account_id is not None and hasattr(repo, "release_login_reservation_by_id"):
+            released_count = int(
+                repo.release_login_reservation_by_id(
+                    reservation_id=reservation_id,
+                    account_id=int(account_id),
+                    reason=error_text or "runner_login_slot_released",
+                )
+                or 0
+            )
+        elif account_id is not None:
+            released_count = int(
+                repo.release_login_reservation(
+                    account_id=int(account_id),
+                    reason=error_text or "runner_login_slot_released",
+                )
+                or 0
+            )
+        if command_id and released_count > 0:
+            repo.update_execution_command_delivery(
+                command_id=command_id,
+                status="acknowledged",
+                error_text=None,
+                payload={"last_event_type": event_type_s, "runner_id": runner_id, "slot_id": slot_id},
+            )
+        return {
+            "handled": True,
+            "login_slot_released": released_count > 0,
+            "released_count": released_count,
+            "stale_ignored": released_count == 0,
+        }
+
+    ok = event_type_s == EventType.LOGIN_SLOT_VERIFIED.value
+    result = repo.complete_login_reservation(
+        reservation_id=reservation_id,
+        command_id=command_id,
+        ok=ok,
+        runner_id=runner_id,
+        slot_id=slot_id,
+        error_text=None if ok else (error_text or "login_slot_failed"),
+        payload=payload_map,
+        ttl_sec=_payload_positive_int(
+            payload_map.get("login_slot_ttl_sec") or payload_map.get("slot_ttl_sec") or payload_map.get("ttl_sec"),
+            300,
+        ),
+    )
+    if command_id:
+        repo.update_execution_command_delivery(
+            command_id=command_id,
+            status="acknowledged" if ok else "failed",
+            error_text=None if ok else (error_text or "login_slot_failed"),
+            payload={"last_event_type": event_type_s, "runner_id": runner_id, "slot_id": slot_id},
+        )
+    return {"handled": True, "login_reservation": result, "ok": ok}
 
 
 def _payload_login_slot_command_type(payload: dict[str, Any]) -> str:
@@ -1549,50 +1652,17 @@ class RunnerEventIngestService:
                 )
                 return {"event": event, "login_reservation": result, "ok": False, "compat": "runtime_log_failed"}
 
-        if event_type_value in {
-            EventType.LOGIN_SLOT_VERIFIED.value,
-            EventType.LOGIN_SLOT_FAILED.value,
-            EventType.LOGIN_SLOT_RELEASED.value,
-        }:
-            reservation_id_raw = payload_map.get("login_reservation_id") or payload_map.get("reservation_id")
-            try:
-                reservation_id = int(reservation_id_raw) if reservation_id_raw not in (None, "") else None
-            except (TypeError, ValueError):
-                reservation_id = None
-            if event_type_value == EventType.LOGIN_SLOT_RELEASED.value:
-                if event_model.account_id is not None:
-                    self._repo.release_login_reservation(
-                        account_id=int(event_model.account_id),
-                        reason=_event_reason(payload_map) or "runner_login_slot_released",
-                    )
-                if event_command_id:
-                    self._repo.update_execution_command_delivery(
-                        command_id=event_command_id,
-                        status="acknowledged",
-                        error_text=None,
-                        payload={"last_event_type": event_type_value, "runner_id": event_model.runner_id, "slot_id": event_model.slot_id},
-                    )
-                return {"event": event, "login_slot_released": True}
-
-            ok = event_type_value == EventType.LOGIN_SLOT_VERIFIED.value
-            result = self._repo.complete_login_reservation(
-                reservation_id=reservation_id,
+        if event_type_value in LOGIN_SLOT_FINAL_EVENT_TYPES:
+            result = apply_login_slot_final_event(
+                self._repo,
+                event_type_value=event_type_value,
+                account_id=event_model.account_id,
                 command_id=event_command_id,
-                ok=ok,
                 runner_id=event_model.runner_id,
                 slot_id=event_model.slot_id,
-                error_text=str(payload_map.get("reason") or payload_map.get("error") or payload_map.get("message") or ""),
-                payload=payload_map,
-                ttl_sec=int(payload_map.get("login_slot_ttl_sec") or 300),
+                payload_map=payload_map,
             )
-            if event_command_id:
-                self._repo.update_execution_command_delivery(
-                    command_id=event_command_id,
-                    status="acknowledged" if ok else "failed",
-                    error_text=None if ok else str(payload_map.get("reason") or payload_map.get("error") or "login_slot_failed"),
-                    payload={"last_event_type": event_type_value, "runner_id": event_model.runner_id, "slot_id": event_model.slot_id},
-                )
-            return {"event": event, "login_reservation": result, "ok": ok}
+            return {"event": event, **result}
 
         recovery_event_type = _payload_recovery_event_type(event_type=event_type_value, payload=payload_map)
         if recovery_event_type and event_type_value != EventType.RUNTIME_LOG.value:

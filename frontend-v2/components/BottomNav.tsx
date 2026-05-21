@@ -2,12 +2,11 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Bot, SlidersHorizontal, Wallet, Trophy } from "lucide-react";
+import { Bot, SlidersHorizontal, Wallet } from "lucide-react";
 
 const navItems = [
   { href: "/bot/", label: "Bot", icon: Bot },
   { href: "/bot/control/", label: "Điều khiển", icon: SlidersHorizontal },
-  { href: "/rankbot/", label: "Xếp hạng", icon: Trophy },
   { href: "/wallet/", label: "Ví", icon: Wallet },
 ] as const;
 
