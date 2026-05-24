@@ -10,6 +10,11 @@ from app.core.redis_client import get_resolved_redis_write_url
 from app.events.command_router import CommandRouterService
 from app.models.control_plane import CommandType
 from app.orchestration.broker_routing import BrokerRoutePolicy, broker_route_policy_from_settings
+from app.orchestration.bot_runtime_contract import (
+    bot_runtime_start_guard_reason,
+    bot_start_runtime_disabled_reason,
+    bot_start_runtime_supported,
+)
 from app.orchestration.deployment_config import TRADING_CONFIG_SCHEMA_VERSION, normalize_deployment_config
 from app.orchestration.scheduler import SchedulerDecision, choose_slot_for_account
 from app.repositories.control_plane_repository import ControlPlaneRepository
@@ -61,10 +66,12 @@ def _canonical_slot_id(value: Any) -> str:
 
 
 _BOT_EXECUTION_CONTRACT_TEXT_KEYS = (
+    "catalog_lane",
     "bot_type",
     "execution_owner",
     "windows_role",
     "tradingview_webhook_owner",
+    "runtime_language",
 )
 _BOT_EXECUTION_CONTRACT_BOOL_KEYS = ("requires_executor_slot",)
 
@@ -156,6 +163,22 @@ def _merge_bot_execution_contract(target: dict[str, Any], contract: dict[str, An
     return target
 
 
+def _validate_bot_runtime_start_supported(
+    bot: dict[str, Any] | None,
+    *,
+    requested_runtime_lane: Any = None,
+    require_explicit_lane: bool = False,
+) -> None:
+    reason = bot_runtime_start_guard_reason(
+        bot,
+        settings_obj=settings,
+        requested_runtime_lane=requested_runtime_lane,
+        require_explicit_lane=require_explicit_lane,
+    )
+    if reason:
+        raise OrchestrationPolicyError(reason)
+
+
 def _runner_queue_depths(runner_ids: list[str]) -> dict[str, dict[str, int]]:
     ids = sorted({str(item or "").strip() for item in runner_ids if str(item or "").strip()})
     if not ids:
@@ -228,11 +251,24 @@ class DeploymentManagerService:
     def refresh_catalog(self, *, force: bool = False) -> list[dict[str, Any]]:
         return self._catalog_loader.sync_catalog(force=force)
 
-    def select_bot(self, *, user_id: int, account_id: int, bot_name: str, bot_config_overrides: dict[str, Any]) -> dict[str, Any]:
+    def select_bot(
+        self,
+        *,
+        user_id: int,
+        account_id: int,
+        bot_name: str,
+        bot_config_overrides: dict[str, Any],
+        requested_runtime_lane: Any = None,
+    ) -> dict[str, Any]:
         self._catalog_loader.sync_catalog(force=False)
         bot = self._repo.get_bot_by_name(bot_name=bot_name)
         if not bot:
             raise ValueError("bot_not_found")
+        _validate_bot_runtime_start_supported(
+            bot,
+            requested_runtime_lane=requested_runtime_lane,
+            require_explicit_lane=True,
+        )
         account = self._repo.get_account(account_id=account_id, user_id=user_id)
         if not account:
             raise ValueError("account_not_found")
@@ -581,6 +617,7 @@ class DeploymentManagerService:
             bot=bot,
             active_deployment=self._repo.get_active_deployment_for_account(account_id=int(queued["account_id"])),
         )
+        _validate_bot_runtime_start_supported(bot)
         self._repo.reconcile_terminal_bot_control_commands(account_id=int(queued["account_id"]))
         pending_command = self._repo.get_pending_account_start_stop_command(account_id=int(queued["account_id"]))
         if pending_command:
@@ -749,6 +786,7 @@ class DeploymentManagerService:
         bot_config_overrides: dict[str, Any],
         mode: str = "live",
         start_payload_extra: dict[str, Any] | None = None,
+        requested_runtime_lane: Any = None,
     ) -> dict[str, Any]:
         deployment_mode = _normalize_deployment_mode(mode)
         start_extra = dict(start_payload_extra or {})
@@ -765,6 +803,11 @@ class DeploymentManagerService:
             raise ValueError("paper_mode_unavailable")
         validate_account_ready(account)
         validate_bot_available(bot)
+        _validate_bot_runtime_start_supported(
+            bot,
+            requested_runtime_lane=requested_runtime_lane,
+            require_explicit_lane=True,
+        )
         self._repo.reconcile_terminal_bot_control_commands(account_id=int(account["id"]))
         blocker = self._repo.get_account_runtime_start_blocker(
             account_id=int(account["id"]),

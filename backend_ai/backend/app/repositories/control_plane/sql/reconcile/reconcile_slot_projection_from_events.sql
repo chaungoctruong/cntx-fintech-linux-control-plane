@@ -79,66 +79,66 @@ latest_slot_events AS (
 	        created_at,
 	        (
 	            COALESCE(NULLIF(SUBSTRING(slot_id FROM '([0-9]+)$'), ''), '') <> ''
-	            AND CAST(SUBSTRING(slot_id FROM '([0-9]+)$') AS INTEGER) > 10
+	            AND CAST(SUBSTRING(slot_id FROM '([0-9]+)$') AS INTEGER) > 12
 	        ) AS over_node_slot_cap,
 	        CASE
 	            WHEN (
 	                COALESCE(NULLIF(SUBSTRING(slot_id FROM '([0-9]+)$'), ''), '') <> ''
-	                AND CAST(SUBSTRING(slot_id FROM '([0-9]+)$') AS INTEGER) > 10
+	                AND CAST(SUBSTRING(slot_id FROM '([0-9]+)$') AS INTEGER) > 12
 	            ) THEN 'disabled'
 	            WHEN LOWER(COALESCE(
-                payload_json->>'current_control_plane_state',
-                payload_json->>'control_plane_state',
-                payload_json->>'new_state',
+                payload_json->>'runner_state',
+                payload_json->>'current_runner_state',
+                payload_json->>'current_state',
                 payload_json->>'slot_state',
                 payload_json->>'to_state',
-                payload_json->>'runner_state',
-                payload_json->>'current_state',
-                payload_json->>'current_runner_state',
+                payload_json->>'new_state',
+                payload_json->>'current_control_plane_state',
+                payload_json->>'control_plane_state',
                 ''
             )) IN ('ready', 'empty', 'stopped') THEN 'ready'
             WHEN LOWER(COALESCE(
-                payload_json->>'current_control_plane_state',
-                payload_json->>'control_plane_state',
-                payload_json->>'new_state',
+                payload_json->>'runner_state',
+                payload_json->>'current_runner_state',
+                payload_json->>'current_state',
                 payload_json->>'slot_state',
                 payload_json->>'to_state',
-                payload_json->>'runner_state',
-                payload_json->>'current_state',
-                payload_json->>'current_runner_state',
+                payload_json->>'new_state',
+                payload_json->>'current_control_plane_state',
+                payload_json->>'control_plane_state',
                 ''
             )) IN ('allocated', 'active', 'running', 'verifying', 'preparing', 'stopping') THEN 'allocated'
             WHEN LOWER(COALESCE(
-                payload_json->>'current_control_plane_state',
-                payload_json->>'control_plane_state',
-                payload_json->>'new_state',
+                payload_json->>'runner_state',
+                payload_json->>'current_runner_state',
+                payload_json->>'current_state',
                 payload_json->>'slot_state',
                 payload_json->>'to_state',
-                payload_json->>'runner_state',
-                payload_json->>'current_state',
-                payload_json->>'current_runner_state',
+                payload_json->>'new_state',
+                payload_json->>'current_control_plane_state',
+                payload_json->>'control_plane_state',
                 ''
             )) IN ('degraded', 'rebuilding') THEN 'degraded'
             WHEN LOWER(COALESCE(
-                payload_json->>'current_control_plane_state',
-                payload_json->>'control_plane_state',
-                payload_json->>'new_state',
+                payload_json->>'runner_state',
+                payload_json->>'current_runner_state',
+                payload_json->>'current_state',
                 payload_json->>'slot_state',
                 payload_json->>'to_state',
-                payload_json->>'runner_state',
-                payload_json->>'current_state',
-                payload_json->>'current_runner_state',
+                payload_json->>'new_state',
+                payload_json->>'current_control_plane_state',
+                payload_json->>'control_plane_state',
                 ''
             )) = 'broken' THEN 'broken'
             WHEN LOWER(COALESCE(
-                payload_json->>'current_control_plane_state',
-                payload_json->>'control_plane_state',
-                payload_json->>'new_state',
+                payload_json->>'runner_state',
+                payload_json->>'current_runner_state',
+                payload_json->>'current_state',
                 payload_json->>'slot_state',
                 payload_json->>'to_state',
-                payload_json->>'runner_state',
-                payload_json->>'current_state',
-                payload_json->>'current_runner_state',
+                payload_json->>'new_state',
+                payload_json->>'current_control_plane_state',
+                payload_json->>'control_plane_state',
                 ''
             )) = 'disabled' THEN 'disabled'
             ELSE NULL
@@ -183,8 +183,8 @@ SET status = normalized.slot_status,
                 )
                 || jsonb_build_object(
                     'disabled_by_node_slot_cap', TRUE,
-                    'node_slot_cap', 10,
-                    'disabled_reason', 'node_slot_cap_10',
+                    'node_slot_cap', 12,
+                    'disabled_reason', 'node_slot_cap_12',
                     'available_for_new_account', FALSE,
                     'control_plane_state', 'disabled',
                     'current_control_plane_state', 'disabled'

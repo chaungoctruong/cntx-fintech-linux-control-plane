@@ -8,6 +8,8 @@ Runbook nối **một tín hiệu TradingView** với **nhiều tài khoản MT5
 
 **Webhook công khai:** `https://<HOST_CONTROL_PLANE_PUBLIC>/api/v2/public/tradingview/broadcast` (thay host bằng domain/tunnel thật).
 
+**Order contract:** đọc thêm [TRADINGVIEW_ORDER_CONTRACT.md](TRADINGVIEW_ORDER_CONTRACT.md) trước khi sửa Pine/backend/runner. TradingView gửi SL/TP theo giá absolute trên chart; backend gửi xuống runner theo distance contract v3 để tránh runner hiểu nhầm `sl_price`/`tp_price`.
+
 Luồng tóm tắt:
 
 ```text

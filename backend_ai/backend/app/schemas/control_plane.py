@@ -110,6 +110,7 @@ class CommandDeliveryUpdateRequest(BaseModel):
 class BotSelectRequest(BaseModel):
     account_id: int
     bot_name: str = Field(min_length=1)
+    runtime_lane: Optional[str] = None
     bot_config_overrides: dict[str, Any] = Field(default_factory=dict)
     lot_size: Optional[float] = Field(default=None, gt=0)
     stop_loss: Optional[float] = Field(default=None, gt=0)
@@ -132,6 +133,7 @@ class BotSelectRequest(BaseModel):
 class DeploymentStartRequest(BaseModel):
     account_id: int
     bot_name: str = Field(min_length=1)
+    runtime_lane: Optional[str] = None
     bot_config_overrides: dict[str, Any] = Field(default_factory=dict)
     mode: Literal["live", "paper"] = "live"
     entitlement_id: Optional[str] = None

@@ -100,6 +100,7 @@ class Settings(BaseSettings):
     CONNECT_RETURN_STARTAPP: str = "bot_connected"
     MINIAPP_BOTS_CACHE_TTL_SEC: float = 1.5
     MT5_BOT_CATALOG_DISABLED_CODES: List[str] = []
+    MT5_DIRECT_EA_RUNTIME_ENABLED: bool = False
     BOT_CONTROL_COOLDOWN_SEC: int = 60
     # Broker-aware runner placement. Prefer runner self-declared capability
     # from register/heartbeat; MT5_RUNNER_BROKER_MAP is only an optional
@@ -327,6 +328,10 @@ class Settings(BaseSettings):
     RUNNER_OFFLINE_FAILOVER_BATCH_SIZE: int = 5
     RUNNER_OFFLINE_FAILOVER_RETRY_SEC: int = 60
     RUNNER_OFFLINE_FAILOVER_FENCE_STOP_ENABLED: bool = True
+    RUNNER_BACKEND_RECOVERY_COOLDOWN_SEC: int = 30
+    RUNNER_BACKEND_RECOVERY_BUDGET_COUNT: int = 3
+    RUNNER_BACKEND_RECOVERY_BUDGET_WINDOW_SEC: int = 900
+    RUNNER_BACKEND_RECOVERY_NOOP_EVENT_TTL_SEC: int = 120
     RUNNER_HEARTBEAT_WRITE_THROTTLE_SEC: float = 5.0
     RUNNER_RECOMMENDED_TRANSPORT: str = "redis_queue"  # Bootstrap hint only; command transport is Redis queue.
     RUNNER_SLOT_PROJECTION_EVENT_LOOKBACK_SEC: int = 21600

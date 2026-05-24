@@ -84,6 +84,7 @@ Use this file to find the right document without hunting the tree. **Do not past
 | [ops/README.md](../ops/README.md) | Ops layout |
 | [ops/monitoring/README.md](../ops/monitoring/README.md) | Monitoring notes |
 | [TRADINGVIEW_MT5_WEBHOOK_RUNBOOK.md](TRADINGVIEW_MT5_WEBHOOK_RUNBOOK.md) | Runbook tiếng Việt: TradingView → broadcast → Redis → runner |
+| [TRADINGVIEW_ORDER_CONTRACT.md](TRADINGVIEW_ORDER_CONTRACT.md) | Contract chuẩn product: TradingView absolute levels → backend normalized distance request → Windows runner |
 
 ---
 

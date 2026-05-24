@@ -42,6 +42,7 @@ def _safe_tradingview_context(body: dict[str, Any], *, path_signal_id: str = "")
     return {
         "body_keys": sorted(str(key) for key in body.keys()),
         "signal_id": signal_id,
+        "strategy_code": str(body.get("strategy_code") or body.get("strategy_id") or "").strip()[:80],
         "action": str(body.get("action") or body.get("signal") or body.get("side") or "").strip()[:40],
         "symbol_present": bool(str(body.get("symbol") or body.get("ticker") or "").strip()),
         "deployment_present": bool(str(body.get("deployment_id") or "").strip()),

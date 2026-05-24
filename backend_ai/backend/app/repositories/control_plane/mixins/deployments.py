@@ -810,6 +810,315 @@ class ControlPlaneDeploymentsMixin:
 
         return self._store._with_retry_locked(_do)
 
+    def claim_backend_runner_recovery(
+        self,
+        *,
+        deployment_id: int,
+        account_id: Optional[int],
+        runner_id: str,
+        slot_id: str,
+        reason: str,
+        cooldown_sec: int,
+        budget_count: int,
+        budget_window_sec: int,
+    ) -> dict[str, Any]:
+        runner_id_s = _norm(runner_id)
+        slot_id_s = _norm_slot_id(slot_id)
+        reason_s = (_norm(reason) or "mt5_recovery_deferred_to_backend")[:200]
+        cooldown_i = max(30, int(cooldown_sec or 120))
+        budget_count_i = max(1, int(budget_count or 3))
+        budget_window_i = max(cooldown_i, int(budget_window_sec or 900))
+        account_id_i = int(account_id) if account_id is not None else None
+
+        def _do(con: Any, cur: Any) -> dict[str, Any]:
+            cur.execute(
+                """
+                WITH target AS (
+                    SELECT
+                        d.*,
+                        latest.id AS latest_active_deployment_id,
+                        latest.status AS latest_active_status,
+                        latest.desired_state AS latest_active_desired_state,
+                        EXISTS (
+                            SELECT 1
+                            FROM execution_commands c
+                            WHERE c.account_id = d.account_id
+                              AND c.command_type IN ('START_BOT', 'STOP_BOT')
+                              AND c.delivery_status IN ('pending', 'queued', 'dispatched')
+                        ) AS account_start_stop_in_flight
+                    FROM bot_deployments d
+                    LEFT JOIN LATERAL (
+                        SELECT ad.id, ad.status, ad.desired_state
+                        FROM bot_deployments ad
+                        WHERE ad.account_id = d.account_id
+                          AND ad.status = ANY(%s)
+                        ORDER BY ad.updated_at DESC, ad.id DESC
+                        LIMIT 1
+                    ) latest ON TRUE
+                    WHERE d.id = %s
+                      AND (%s::BIGINT IS NULL OR d.account_id = %s)
+                    FOR UPDATE OF d
+                ),
+                decision AS (
+                    SELECT
+                        target.*,
+                        CASE
+                            WHEN target.id IS NULL THEN 'deployment_not_found'
+                            WHEN target.desired_state <> 'running' THEN 'deployment_not_running'
+                            WHEN target.status IN ('draft', 'queued', 'stop_requested', 'stopped', 'failed', 'blocked') THEN 'deployment_not_running'
+                            WHEN LOWER(COALESCE(target.health_status, '')) IN ('disabled', 'paused', 'manual_disabled', 'risk_blocked', 'account_blocked') THEN 'guard_blocked'
+                            WHEN target.latest_active_deployment_id IS NOT NULL
+                                 AND target.latest_active_deployment_id <> target.id THEN 'newer_active_deployment'
+                            WHEN target.account_start_stop_in_flight THEN 'start_stop_in_flight'
+                            WHEN COALESCE(target.runner_recovery_in_flight, FALSE)
+                                 AND COALESCE(target.runner_recovery_in_flight_since, target.last_runner_recovery_at, target.updated_at)
+                                     > NOW() - (%s * INTERVAL '1 second') THEN 'recovery_in_flight'
+                            WHEN target.runner_recovery_cooldown_until IS NOT NULL
+                                 AND target.runner_recovery_cooldown_until > NOW() THEN 'cooldown'
+                            WHEN target.runner_recovery_window_started_at IS NOT NULL
+                                 AND target.runner_recovery_window_started_at >= NOW() - (%s * INTERVAL '1 second')
+                                 AND COALESCE(target.runner_recovery_attempt_count, 0) >= %s THEN 'budget_exhausted'
+                            ELSE 'claim'
+                        END AS recovery_action,
+                        CASE
+                            WHEN target.runner_recovery_window_started_at IS NULL
+                                 OR target.runner_recovery_window_started_at < NOW() - (%s * INTERVAL '1 second')
+                                THEN 0
+                            ELSE COALESCE(target.runner_recovery_attempt_count, 0)
+                        END AS base_attempt_count
+                    FROM target
+                ),
+                claimed AS (
+                    UPDATE bot_deployments d
+                    SET status = 'running',
+                        desired_state = 'running',
+                        is_active = TRUE,
+                        health_status = 'runner_recovery_pending',
+                        last_error = %s,
+                        runner_id = COALESCE(NULLIF(%s, ''), d.runner_id),
+                        slot_id = COALESCE(NULLIF(%s, ''), d.slot_id),
+                        last_runner_recovery_reason = %s,
+                        last_runner_recovery_at = NOW(),
+                        runner_recovery_first_seen_at = COALESCE(d.runner_recovery_first_seen_at, NOW()),
+                        runner_recovery_last_seen_at = NOW(),
+                        runner_recovery_attempt_count = decision.base_attempt_count + 1,
+                        runner_recovery_window_started_at = CASE
+                            WHEN d.runner_recovery_window_started_at IS NULL
+                                 OR d.runner_recovery_window_started_at < NOW() - (%s * INTERVAL '1 second')
+                                THEN NOW()
+                            ELSE d.runner_recovery_window_started_at
+                        END,
+                        runner_recovery_cooldown_until = NOW() + (%s * INTERVAL '1 second'),
+                        runner_recovery_in_flight = TRUE,
+                        runner_recovery_in_flight_since = NOW(),
+                        updated_at = NOW()
+                    FROM decision
+                    WHERE d.id = decision.id
+                      AND decision.recovery_action = 'claim'
+                    RETURNING
+                        d.id,
+                        d.runner_recovery_attempt_count,
+                        d.runner_recovery_cooldown_until,
+                        d.runner_recovery_in_flight,
+                        d.runner_recovery_in_flight_since
+                ),
+                budget_marked AS (
+                    UPDATE bot_deployments d
+                    SET health_status = 'recovery_failed',
+                        last_error = 'backend_runner_recovery_budget_exhausted:' || %s,
+                        last_runner_recovery_reason = %s,
+                        last_runner_recovery_at = NOW(),
+                        runner_recovery_last_seen_at = NOW(),
+                        runner_recovery_in_flight = FALSE,
+                        updated_at = NOW()
+                    FROM decision
+                    WHERE d.id = decision.id
+                      AND decision.recovery_action = 'budget_exhausted'
+                    RETURNING d.id
+                ),
+                touched AS (
+                    UPDATE bot_deployments d
+                    SET last_runner_recovery_reason = %s,
+                        last_runner_recovery_at = NOW(),
+                        runner_recovery_last_seen_at = NOW(),
+                        updated_at = NOW()
+                    FROM decision
+                    WHERE d.id = decision.id
+                      AND decision.recovery_action IN ('cooldown', 'recovery_in_flight', 'start_stop_in_flight', 'guard_blocked')
+                    RETURNING d.id
+                )
+                SELECT
+                    COALESCE(decision.recovery_action, 'deployment_not_found') AS action,
+                    decision.id AS deployment_id,
+                    decision.account_id,
+                    decision.status,
+                    decision.desired_state,
+                    decision.health_status,
+                    decision.runner_id AS existing_runner_id,
+                    decision.slot_id AS existing_slot_id,
+                    decision.latest_active_deployment_id,
+                    decision.latest_active_status,
+                    decision.runner_recovery_cooldown_until AS previous_cooldown_until,
+                    COALESCE(
+                        claimed.runner_recovery_attempt_count,
+                        decision.runner_recovery_attempt_count,
+                        0
+                    ) AS attempt_count,
+                    COALESCE(
+                        claimed.runner_recovery_cooldown_until,
+                        decision.runner_recovery_cooldown_until
+                    ) AS cooldown_until,
+                    COALESCE(
+                        claimed.runner_recovery_in_flight,
+                        decision.runner_recovery_in_flight,
+                        FALSE
+                    ) AS in_flight,
+                    COALESCE(
+                        claimed.runner_recovery_in_flight_since,
+                        decision.runner_recovery_in_flight_since
+                    ) AS in_flight_since,
+                    (SELECT COUNT(*) FROM budget_marked) AS budget_marked_count,
+                    (SELECT COUNT(*) FROM touched) AS touched_count
+                FROM decision
+                LEFT JOIN claimed ON claimed.id = decision.id
+                """,
+                (
+                    list(ACTIVE_DEPLOYMENT_STATUSES),
+                    int(deployment_id),
+                    account_id_i,
+                    account_id_i,
+                    cooldown_i,
+                    budget_window_i,
+                    budget_count_i,
+                    budget_window_i,
+                    reason_s,
+                    runner_id_s,
+                    slot_id_s,
+                    reason_s,
+                    budget_window_i,
+                    cooldown_i,
+                    reason_s,
+                    reason_s,
+                    reason_s,
+                ),
+            )
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+            return {"action": "deployment_not_found", "deployment_id": int(deployment_id)}
+
+        return self._store._with_retry_locked(_do)
+
+    def mark_backend_runner_recovery_command(
+        self,
+        *,
+        deployment_id: int,
+        command_id: str,
+    ) -> Optional[dict[str, Any]]:
+        def _do(con: Any, cur: Any) -> Optional[dict[str, Any]]:
+            cur.execute(
+                """
+                UPDATE bot_deployments
+                SET runner_recovery_last_command_id = %s,
+                    runner_recovery_last_command_at = NOW(),
+                    runner_recovery_in_flight = TRUE,
+                    runner_recovery_in_flight_since = COALESCE(runner_recovery_in_flight_since, NOW()),
+                    updated_at = NOW()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (_norm(command_id), int(deployment_id)),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+        return self._store._with_retry_locked(_do)
+
+    def mark_backend_runner_recovery_dispatch_failed(
+        self,
+        *,
+        deployment_id: int,
+        reason: str,
+    ) -> Optional[dict[str, Any]]:
+        reason_s = (_norm(reason) or "backend_runner_recovery_dispatch_failed")[:200]
+
+        def _do(con: Any, cur: Any) -> Optional[dict[str, Any]]:
+            cur.execute(
+                """
+                UPDATE bot_deployments
+                SET health_status = 'recovery_failed',
+                    last_error = %s,
+                    runner_recovery_in_flight = FALSE,
+                    runner_recovery_in_flight_since = NULL,
+                    updated_at = NOW()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (reason_s, int(deployment_id)),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+        return self._store._with_retry_locked(_do)
+
+    def clear_backend_runner_recovery(
+        self,
+        *,
+        deployment_id: int,
+        runner_id: Optional[str] = None,
+        slot_id: Optional[str] = None,
+        reason: str = "healthy",
+    ) -> Optional[dict[str, Any]]:
+        def _do(con: Any, cur: Any) -> Optional[dict[str, Any]]:
+            cur.execute(
+                """
+                UPDATE bot_deployments
+                SET status = CASE
+                        WHEN desired_state = 'running'
+                             AND status IN ('start_requested', 'starting', 'running')
+                            THEN 'running'
+                        ELSE status
+                    END,
+                    health_status = CASE
+                        WHEN desired_state = 'running'
+                             AND status IN ('start_requested', 'starting', 'running')
+                            THEN 'running'
+                        ELSE health_status
+                    END,
+                    last_error = CASE
+                        WHEN desired_state = 'running'
+                             AND status IN ('start_requested', 'starting', 'running')
+                            THEN NULL
+                        ELSE last_error
+                    END,
+                    runner_id = COALESCE(%s, runner_id),
+                    slot_id = COALESCE(%s, slot_id),
+                    runner_recovery_attempt_count = 0,
+                    runner_recovery_window_started_at = NULL,
+                    runner_recovery_cooldown_until = NULL,
+                    runner_recovery_in_flight = FALSE,
+                    runner_recovery_in_flight_since = NULL,
+                    updated_at = NOW()
+                WHERE id = %s
+                  AND (
+                    runner_recovery_in_flight = TRUE
+                    OR runner_recovery_cooldown_until IS NOT NULL
+                    OR COALESCE(health_status, '') IN ('runner_recovery_pending', 'recovering', 'recovery_failed')
+                  )
+                RETURNING *, %s::TEXT AS runner_recovery_clear_reason
+                """,
+                (
+                    _norm(runner_id) or None,
+                    _norm_slot_id(slot_id) or None,
+                    int(deployment_id),
+                    _norm(reason) or "healthy",
+                ),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+        return self._store._with_retry_locked(_do)
+
     def reconcile_deployment_runtime_slot(
         self,
         *,

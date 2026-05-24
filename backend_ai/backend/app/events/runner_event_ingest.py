@@ -13,6 +13,10 @@ from app.events.command_router import CommandRouterService
 from app.events.runner_event_idempotency import stable_runner_event_id
 from app.infra.redis_streams import RedisStreamPublisher
 from app.models.control_plane import CommandType, DeploymentStatus, EventType
+from app.orchestration.bot_runtime_contract import (
+    bot_start_runtime_disabled_reason,
+    bot_start_runtime_supported,
+)
 from app.orchestration.deployment_config import TRADING_CONFIG_SCHEMA_VERSION, normalize_deployment_config
 from app.orchestration.start_failure_policy import (
     RUNNER_THROTTLE_FAILURE_THRESHOLD,
@@ -192,6 +196,330 @@ _RECOVERY_EVENT_ALIASES = {
     "BUDGET_EXHAUSTED": EventType.MT5_RECOVERY_BUDGET_EXHAUSTED.value,
 }
 _RECOVERY_EVENT_TYPES = set(_RECOVERY_EVENT_ALIASES.values())
+_BACKEND_RECOVERY_STATUS = "mt5_recovery_deferred_to_backend"
+_BACKEND_RECOVERY_REASONS = {
+    "active_job_missing_for_target",
+    "ea_bridge_heartbeat_stale",
+    "execution_snapshot_hung",
+    "mt5_terminal_not_running",
+    "worker_process_missing",
+}
+_BACKEND_RECOVERY_HEALTH_STATUSES = {
+    "active",
+    "allocated",
+    "executor_ready",
+    "healthy",
+    "listening",
+    "ready",
+    "running",
+}
+_BACKEND_RECOVERY_BROKEN_STATUSES = {"broken", "degraded", "error", "failed", "hung", "stale"}
+_BACKEND_RECOVERY_SLOT_RUNTIME_STARTED_STATUSES = {"active", "executor_ready", "healthy", "listening", "running"}
+_BACKEND_RECOVERY_EVENT_SUPPRESS_ACTIONS = {
+    "budget_exhausted",
+    "ignored_account_guard",
+    "ignored_bot_guard",
+    "ignored_deployment_not_found_after_claim",
+    "ignored_guard_blocked",
+    "ignored_missing_identity",
+    "ignored_newer_active_deployment",
+    "ignored_not_running",
+    "ignored_not_running_after_claim",
+    "suppressed_cooldown",
+    "suppressed_in_flight",
+}
+
+
+def _payload_dict(value: Any) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _payload_falsey(value: Any) -> bool:
+    return str(value).strip().lower() in {"0", "false", "no", "off", "disabled"}
+
+
+def _payload_text(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _backend_recovery_reason(payload: dict[str, Any], report: dict[str, Any] | None = None) -> str:
+    report_map = report or {}
+    return (
+        _payload_text(
+            report_map.get("reason"),
+            payload.get("reason"),
+            payload.get("mt5_recovery_backend_required_reason"),
+            payload.get("error_code"),
+            payload.get("error"),
+            payload.get("message"),
+        ).lower()
+        or _BACKEND_RECOVERY_STATUS
+    )
+
+
+def _backend_recovery_status_text(payload: dict[str, Any], report: dict[str, Any]) -> str:
+    return _payload_text(
+        payload.get("status"),
+        payload.get("runner_event_type"),
+        payload.get("event"),
+        payload.get("event_type"),
+        report.get("status"),
+    ).lower()
+
+
+def _backend_recovery_state_text(payload: dict[str, Any], report: dict[str, Any], metadata: dict[str, Any]) -> str:
+    return _payload_text(
+        report.get("state"),
+        payload.get("state"),
+        payload.get("slot_state"),
+        payload.get("current_state"),
+        payload.get("current_runner_state"),
+        payload.get("runner_state"),
+        payload.get("control_plane_state"),
+        metadata.get("state"),
+        metadata.get("slot_state"),
+        metadata.get("current_runner_state"),
+        metadata.get("mt5_liveness_state"),
+    ).lower()
+
+
+def _backend_recovery_metadata(payload: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+    metadata = {}
+    for source in (
+        payload.get("metadata_json"),
+        payload.get("metadata"),
+        report.get("metadata_json"),
+        report.get("metadata"),
+    ):
+        if isinstance(source, dict):
+            metadata.update(source)
+    return metadata
+
+
+def _looks_backend_controlled_recovery(payload: dict[str, Any]) -> bool:
+    report = _payload_dict(payload.get("report"))
+    metadata = _backend_recovery_metadata(payload, report)
+    recycle = _payload_dict(report.get("recycle") or payload.get("recycle"))
+    status_text = _backend_recovery_status_text(payload, report)
+    state_text = _backend_recovery_state_text(payload, report, metadata)
+    reason_text = _backend_recovery_reason(payload, report)
+    recovery_status = _payload_text(
+        payload.get("mt5_recovery_status"),
+        metadata.get("mt5_recovery_status"),
+        report.get("mt5_recovery_status"),
+    ).lower()
+    last_recovery_error = _payload_text(
+        payload.get("last_mt5_recovery_error"),
+        metadata.get("last_mt5_recovery_error"),
+        report.get("last_mt5_recovery_error"),
+    ).lower()
+    backend_required = (
+        _payload_truthy(payload.get("backend_restart_required"))
+        or _payload_truthy(report.get("backend_restart_required"))
+        or _payload_truthy(recycle.get("required"))
+    )
+    auto_recovery_disabled = (
+        _payload_falsey(payload.get("auto_recovery_enabled"))
+        or _payload_falsey(report.get("auto_recovery_enabled"))
+        or last_recovery_error == "auto_recovery_disabled"
+    )
+    backend_controlled = recovery_status == "backend_controlled" or auto_recovery_disabled
+    broken = state_text in _BACKEND_RECOVERY_BROKEN_STATUSES
+    return (
+        status_text == _BACKEND_RECOVERY_STATUS
+        or (backend_required and (broken or backend_controlled))
+        or (backend_controlled and broken)
+        or (reason_text in _BACKEND_RECOVERY_REASONS and broken)
+    )
+
+
+def _backend_recovery_current_slot_broken(payload: dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    report = _payload_dict(payload.get("report"))
+    metadata = _backend_recovery_metadata(payload, report)
+    state_text = _backend_recovery_state_text(payload, report, metadata)
+    status_text = _backend_recovery_status_text(payload, report)
+    reason_text = _backend_recovery_reason(payload, report)
+    return (
+        state_text in _BACKEND_RECOVERY_BROKEN_STATUSES
+        or status_text == _BACKEND_RECOVERY_STATUS
+        or reason_text in _BACKEND_RECOVERY_REASONS
+    )
+
+
+def _command_payload(command: Any) -> dict[str, Any]:
+    if not isinstance(command, dict):
+        return {}
+    payload = command.get("payload_json")
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _is_backend_runner_recovery_command(command: Any) -> bool:
+    payload = _command_payload(command)
+    return (
+        str(payload.get("control_flow") or "").strip() == "backend_runner_recovery"
+        or _payload_truthy(payload.get("backend_runner_recovery"))
+    )
+
+
+def _backend_recovery_request_from_payload(
+    payload: dict[str, Any],
+    *,
+    runner_id: str,
+    slot_id: str | None,
+    account_id: int | None,
+    deployment_id: int | None,
+) -> dict[str, Any] | None:
+    if not isinstance(payload, dict) or not _looks_backend_controlled_recovery(payload):
+        return None
+    report = _payload_dict(payload.get("report"))
+    request_deployment_id = _payload_int(
+        report.get("deployment_id")
+        or payload.get("deployment_id")
+        or deployment_id
+    )
+    request_account_id = _payload_int(
+        report.get("account_id")
+        or payload.get("account_id")
+        or account_id
+    )
+    request_slot_id = _canonical_slot_id(
+        report.get("slot_id")
+        or report.get("storage_slot_id")
+        or payload.get("slot_id")
+        or payload.get("storage_slot_id")
+        or slot_id
+    )
+    request_runner_id = _payload_text(report.get("runner_id"), payload.get("runner_id"), runner_id)
+    return {
+        "deployment_id": request_deployment_id,
+        "account_id": request_account_id,
+        "runner_id": request_runner_id,
+        "slot_id": request_slot_id,
+        "reason": _backend_recovery_reason(payload, report),
+        "report": report,
+        "payload": payload,
+        "current_slot_broken": _backend_recovery_current_slot_broken(payload),
+    }
+
+
+def _slot_inventory_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for key in ("slot_inventory", "slots", "slot_states", "runtime_slots"):
+        raw = payload.get(key)
+        if isinstance(raw, list):
+            items.extend([dict(item) for item in raw if isinstance(item, dict)])
+        elif isinstance(raw, dict):
+            for slot_key, value in raw.items():
+                if isinstance(value, dict):
+                    item = dict(value)
+                    item.setdefault("slot_id", slot_key)
+                    items.append(item)
+    return items
+
+
+def _backend_recovery_requests_from_heartbeat(
+    payload: dict[str, Any],
+    *,
+    runner_id: str,
+    slot_id: str | None,
+    account_id: int | None,
+    deployment_id: int | None,
+) -> list[dict[str, Any]]:
+    requests: list[dict[str, Any]] = []
+    direct = _backend_recovery_request_from_payload(
+        payload,
+        runner_id=runner_id,
+        slot_id=slot_id,
+        account_id=account_id,
+        deployment_id=deployment_id,
+    )
+    if direct:
+        requests.append(direct)
+    for item in _slot_inventory_items(payload):
+        metadata = _backend_recovery_metadata(item, _payload_dict(item.get("report")))
+        merged = {**metadata, **item}
+        request = _backend_recovery_request_from_payload(
+            merged,
+            runner_id=runner_id,
+            slot_id=_canonical_slot_id(item.get("slot_id") or item.get("storage_slot_id")),
+            account_id=_payload_int(item.get("account_id") or item.get("active_account_id")),
+            deployment_id=_payload_int(item.get("deployment_id") or item.get("active_deployment_id")),
+        )
+        if request:
+            requests.append(request)
+    return requests
+
+
+def _payload_confirms_runtime_healthy(payload: dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    report = _payload_dict(payload.get("report"))
+    metadata = _backend_recovery_metadata(payload, report)
+    states = {
+        str(value or "").strip().lower()
+        for value in (
+            payload.get("status"),
+            payload.get("state"),
+            payload.get("slot_state"),
+            payload.get("current_state"),
+            payload.get("current_runner_state"),
+            payload.get("runner_state"),
+            payload.get("control_plane_state"),
+            payload.get("health_status"),
+            metadata.get("current_runner_state"),
+            metadata.get("mt5_liveness_state"),
+        )
+        if str(value or "").strip()
+    }
+    if states.intersection(_BACKEND_RECOVERY_BROKEN_STATUSES):
+        return False
+    terminal_running = payload.get("terminal_running")
+    worker_alive = payload.get("worker_alive")
+    if worker_alive is None:
+        for key in ("worker_pid", "runtime_worker_pid", "resident_worker_pid"):
+            worker_pid = _payload_int(payload.get(key) or metadata.get(key))
+            if worker_pid and worker_pid > 0:
+                worker_alive = True
+                break
+    if terminal_running is None:
+        terminal_pid = _payload_int(payload.get("terminal_pid") or metadata.get("terminal_pid"))
+        if terminal_pid and terminal_pid > 0:
+            terminal_running = True
+    if terminal_running is None or worker_alive is None:
+        return False
+    liveness_good = _payload_truthy(terminal_running) and _payload_truthy(worker_alive)
+    return liveness_good and bool(states.intersection(_BACKEND_RECOVERY_HEALTH_STATUSES))
+
+
+def _slot_state_event_confirms_runtime_started(payload: dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    report = _payload_dict(payload.get("report"))
+    metadata = _backend_recovery_metadata(payload, report)
+    states = {
+        str(value or "").strip().lower()
+        for value in (
+            payload.get("new_state"),
+            payload.get("slot_state"),
+            payload.get("to_state"),
+            payload.get("current_state"),
+            payload.get("current_runner_state"),
+            payload.get("runner_state"),
+            payload.get("status"),
+            metadata.get("current_runner_state"),
+            metadata.get("mt5_liveness_state"),
+        )
+        if str(value or "").strip()
+    }
+    if states.intersection(_BACKEND_RECOVERY_BROKEN_STATUSES):
+        return False
+    return bool(states.intersection(_BACKEND_RECOVERY_SLOT_RUNTIME_STARTED_STATUSES))
 
 
 def _normalize_recovery_event(value: Any) -> str | None:
@@ -419,11 +747,61 @@ class RunnerEventIngestService:
         self._command_router = CommandRouterService(repo)
         self._heartbeat_write_cache: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         self._heartbeat_write_lock = Lock()
+        self._backend_recovery_event_suppress_until: dict[tuple[str, str, str, str, str], float] = {}
+        self._backend_recovery_event_suppress_lock = Lock()
         self._heartbeat_write_throttle_sec = max(
             0.0,
             float(getattr(settings, "RUNNER_HEARTBEAT_WRITE_THROTTLE_SEC", 5.0) or 5.0),
         )
         self._last_publish_warning_at = 0.0
+
+    def _backend_recovery_event_suppression_ttl_sec(self) -> float:
+        return max(
+            0.0,
+            float(getattr(settings, "RUNNER_BACKEND_RECOVERY_NOOP_EVENT_TTL_SEC", 120) or 120),
+        )
+
+    def _backend_recovery_event_key(self, recovery: dict[str, Any]) -> tuple[str, str, str, str, str]:
+        return (
+            str(recovery.get("runner_id") or "").strip(),
+            str(_canonical_slot_id(recovery.get("slot_id")) or "").strip(),
+            str(recovery.get("deployment_id") or "").strip(),
+            str(recovery.get("account_id") or "").strip(),
+            str(recovery.get("reason") or "").strip().lower(),
+        )
+
+    def _backend_recovery_event_is_suppressed(self, recovery: dict[str, Any]) -> bool:
+        if self._backend_recovery_event_suppression_ttl_sec() <= 0:
+            return False
+        key = self._backend_recovery_event_key(recovery)
+        now = time.monotonic()
+        with self._backend_recovery_event_suppress_lock:
+            until = float(self._backend_recovery_event_suppress_until.get(key) or 0.0)
+            if until > now:
+                return True
+            if until:
+                self._backend_recovery_event_suppress_until.pop(key, None)
+            return False
+
+    def _suppress_backend_recovery_event_if_noop(self, recovery: dict[str, Any], action: str | None) -> None:
+        action_s = str(action or "").strip()
+        if action_s not in _BACKEND_RECOVERY_EVENT_SUPPRESS_ACTIONS:
+            return
+        ttl_sec = self._backend_recovery_event_suppression_ttl_sec()
+        if ttl_sec <= 0:
+            return
+        now = time.monotonic()
+        key = self._backend_recovery_event_key(recovery)
+        with self._backend_recovery_event_suppress_lock:
+            if len(self._backend_recovery_event_suppress_until) > 1024:
+                expired_keys = [
+                    item_key
+                    for item_key, until in self._backend_recovery_event_suppress_until.items()
+                    if until <= now
+                ]
+                for item_key in expired_keys:
+                    self._backend_recovery_event_suppress_until.pop(item_key, None)
+            self._backend_recovery_event_suppress_until[key] = now + ttl_sec
 
     async def _publish_event_best_effort(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Publish to Redis stream without failing durable event ingest.
@@ -967,6 +1345,588 @@ class RunnerEventIngestService:
             "config_update_trace_id": (stop_command.get("payload_json") or {}).get("config_update_trace_id"),
         }
 
+    def _build_backend_recovery_start_payload(
+        self,
+        *,
+        deployment: dict[str, Any],
+        bot: dict[str, Any],
+        recovery: dict[str, Any],
+        attempt_count: int,
+        recovery_key: str,
+    ) -> dict[str, Any]:
+        deployment_config = normalize_deployment_config(
+            bot=bot,
+            config=deployment.get("config_json") or {},
+        )
+        reason = str(recovery.get("reason") or _BACKEND_RECOVERY_STATUS).strip().lower()
+        return {
+            "account_id": int(deployment["account_id"]),
+            "mode": str(deployment.get("mode") or "live").strip().lower() or "live",
+            "broker": deployment.get("broker"),
+            "server": deployment.get("server"),
+            "login": deployment.get("login"),
+            "bot_code": bot.get("bot_code") or bot.get("bot_id") or deployment.get("bot_code"),
+            "bot_name": bot.get("bot_name") or deployment.get("bot_name"),
+            "bot_version": bot.get("version") or "",
+            "runtime_entry": bot.get("runtime_entry") or "",
+            "profile_class": bot.get("profile_class") or deployment.get("profile_class") or "",
+            "resource_hints": bot.get("resource_hints") or {},
+            "config_contract_version": TRADING_CONFIG_SCHEMA_VERSION,
+            "config": deployment_config,
+            "sticky_reused": True,
+            "control_flow": "backend_runner_recovery",
+            "restart_policy": "backend_controlled_same_deployment",
+            "backend_runner_recovery": True,
+            "backend_recovery_key": recovery_key,
+            "backend_recovery_reason": reason,
+            "backend_recovery_attempt": int(attempt_count or 1),
+            "backend_recovery_from_runner_id": recovery.get("runner_id"),
+            "backend_recovery_from_slot_id": recovery.get("slot_id"),
+            "backend_recovery_report": recovery.get("report") or {},
+            "intent_seq": int(deployment.get("intent_seq") or 0),
+        }
+
+    def _backend_recovery_cooldown_sec(self) -> int:
+        return max(30, int(getattr(settings, "RUNNER_BACKEND_RECOVERY_COOLDOWN_SEC", 120) or 120))
+
+    def _backend_recovery_budget_count(self) -> int:
+        return max(1, int(getattr(settings, "RUNNER_BACKEND_RECOVERY_BUDGET_COUNT", 3) or 3))
+
+    def _backend_recovery_budget_window_sec(self) -> int:
+        return max(
+            self._backend_recovery_cooldown_sec(),
+            int(getattr(settings, "RUNNER_BACKEND_RECOVERY_BUDGET_WINDOW_SEC", 900) or 900),
+        )
+
+    def _maybe_reassign_backend_recovery_slot(
+        self,
+        *,
+        deployment: dict[str, Any],
+        runner_id: str,
+        slot_id: str,
+        reason: str,
+        trace_id: str | None,
+        force_current_broken: bool = False,
+    ) -> dict[str, Any]:
+        list_slots = getattr(self._repo, "list_slots", None)
+        allocate_slot = getattr(self._repo, "allocate_slot_binding", None)
+        if not callable(list_slots) or not callable(allocate_slot):
+            return {"runner_id": runner_id, "slot_id": slot_id, "changed": False, "reason": "slot_reassign_unsupported"}
+        try:
+            slots = list_slots()
+        except Exception as exc:
+            return {
+                "runner_id": runner_id,
+                "slot_id": slot_id,
+                "changed": False,
+                "reason": f"slot_list_failed:{exc.__class__.__name__}",
+            }
+
+        runner_id_s = str(runner_id or "").strip()
+        slot_id_s = _canonical_slot_id(slot_id)
+        account_id = int(deployment.get("account_id") or 0)
+        deployment_id = int(deployment.get("id") or 0)
+        current_slot: dict[str, Any] | None = None
+        candidates: list[dict[str, Any]] = []
+        for raw in slots or []:
+            if not isinstance(raw, dict):
+                continue
+            raw_runner_id = str(raw.get("runner_id") or "").strip()
+            raw_slot_id = _canonical_slot_id(raw.get("slot_id"))
+            if raw_runner_id != runner_id_s:
+                continue
+            if raw_slot_id == slot_id_s:
+                current_slot = raw
+                continue
+            raw_status = str(raw.get("status") or "").strip().lower()
+            runner_status = str(raw.get("runner_status") or "").strip().lower()
+            current_account_id = raw.get("current_account_id")
+            active_deployment_id = raw.get("active_deployment_id")
+            current_account_matches = (
+                current_account_id in (None, "")
+                or (account_id > 0 and str(current_account_id) == str(account_id))
+            )
+            active_deployment_clear = (
+                active_deployment_id in (None, "")
+                or (deployment_id > 0 and str(active_deployment_id) == str(deployment_id))
+            )
+            if (
+                raw_status in {"ready", "allocated"}
+                and runner_status in {"", "online"}
+                and current_account_matches
+                and active_deployment_clear
+            ):
+                candidates.append(raw)
+
+        current_status = str((current_slot or {}).get("status") or "").strip().lower()
+        current_metadata = _payload_dict((current_slot or {}).get("metadata_json") or (current_slot or {}).get("metadata"))
+        current_runner_state = str(
+            current_metadata.get("current_runner_state")
+            or current_metadata.get("runner_state")
+            or ""
+        ).strip().lower()
+        current_mt5_state = str(current_metadata.get("mt5_liveness_state") or "").strip().lower()
+        current_is_broken = bool(force_current_broken) or (
+            current_status in {"broken", "degraded"}
+            or current_runner_state in {"broken", "degraded"}
+            or current_mt5_state in {"broken", "dead", "failed", "offline", "stale"}
+        )
+        if not current_is_broken or not candidates:
+            return {
+                "runner_id": runner_id_s,
+                "slot_id": slot_id_s,
+                "changed": False,
+                "reason": "current_slot_reusable" if not current_is_broken else "no_ready_slot",
+            }
+
+        if account_id <= 0 or deployment_id <= 0:
+            return {"runner_id": runner_id_s, "slot_id": slot_id_s, "changed": False, "reason": "identity_missing"}
+        last_error = "no_ready_slot"
+        for candidate in sorted(
+            candidates,
+            key=lambda item: (
+                0 if str(item.get("status") or "").strip().lower() == "ready" else 1,
+                _canonical_slot_id(item.get("slot_id")) or "",
+            ),
+        ):
+            next_slot_id = _canonical_slot_id(candidate.get("slot_id"))
+            if not next_slot_id:
+                continue
+            try:
+                binding = allocate_slot(
+                    account_id=account_id,
+                    runner_id=runner_id_s,
+                    slot_id=next_slot_id,
+                    sticky=True,
+                )
+                self._repo.update_deployment_status(
+                    deployment_id=deployment_id,
+                    status=DeploymentStatus.RUNNING.value,
+                    desired_state="running",
+                    is_active=True,
+                    health_status="runner_recovery_pending",
+                    runner_id=runner_id_s,
+                    slot_id=next_slot_id,
+                )
+                self._repo.insert_deployment_audit(
+                    deployment_id=deployment_id,
+                    action="deployment.backend_runner_recovery_slot_reassigned",
+                    payload={
+                        "deployment_id": deployment_id,
+                        "account_id": account_id,
+                        "from_runner_id": runner_id_s,
+                        "from_slot_id": slot_id_s,
+                        "to_runner_id": runner_id_s,
+                        "to_slot_id": next_slot_id,
+                        "reason": reason,
+                        "binding": binding or {},
+                    },
+                    result="slot_reassigned",
+                    trace_id=trace_id,
+                )
+                return {
+                    "runner_id": runner_id_s,
+                    "slot_id": next_slot_id,
+                    "changed": True,
+                    "reason": "current_slot_broken",
+                    "from_slot_id": slot_id_s,
+                }
+            except Exception as exc:
+                last_error = f"slot_reassign_failed:{exc.__class__.__name__}"
+                continue
+        return {
+            "runner_id": runner_id_s,
+            "slot_id": slot_id_s,
+            "changed": False,
+            "reason": last_error,
+        }
+
+    def _log_backend_recovery_decision(
+        self,
+        *,
+        recovery: dict[str, Any],
+        action: str,
+        claim: dict[str, Any] | None = None,
+        command_id: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        claim_map = claim or {}
+        action_s = str(action or "ignored").strip()
+        _log.info(
+            "runner.backend_recovery.decision deployment=%s account=%s runner=%s slot=%s reason=%s action=%s command_id=%s attempt=%s cooldown_until=%s",
+            recovery.get("deployment_id"),
+            recovery.get("account_id"),
+            recovery.get("runner_id"),
+            recovery.get("slot_id"),
+            recovery.get("reason"),
+            action_s,
+            command_id or "",
+            claim_map.get("attempt_count"),
+            claim_map.get("cooldown_until") or claim_map.get("previous_cooldown_until"),
+            extra={
+                "event": "runner.backend_recovery.decision",
+                "deployment_id": recovery.get("deployment_id"),
+                "account_id": recovery.get("account_id"),
+                "runner_id": recovery.get("runner_id"),
+                "slot_id": recovery.get("slot_id"),
+                "reason": recovery.get("reason"),
+                "action": action_s,
+                "command_id": command_id,
+                "attempt_count": claim_map.get("attempt_count"),
+                "cooldown_until": claim_map.get("cooldown_until") or claim_map.get("previous_cooldown_until"),
+                "desired_state": claim_map.get("desired_state"),
+                "deployment_status": claim_map.get("status"),
+                "runtime_status": claim_map.get("health_status"),
+                "latest_active_deployment_id": claim_map.get("latest_active_deployment_id"),
+                "detail": detail or {},
+            },
+        )
+
+    async def _handle_backend_runner_recovery_request(
+        self,
+        *,
+        recovery: dict[str, Any],
+        source: str,
+        trace_id: str | None,
+    ) -> dict[str, Any]:
+        deployment_id = recovery.get("deployment_id")
+        account_id = recovery.get("account_id")
+        runner_id = str(recovery.get("runner_id") or "").strip()
+        slot_id = _canonical_slot_id(recovery.get("slot_id"))
+        reason = str(recovery.get("reason") or _BACKEND_RECOVERY_STATUS).strip().lower()
+        recovery = {
+            **recovery,
+            "deployment_id": deployment_id,
+            "account_id": account_id,
+            "runner_id": runner_id,
+            "slot_id": slot_id,
+            "reason": reason,
+        }
+        if deployment_id is None or account_id is None or not runner_id or not slot_id:
+            self._log_backend_recovery_decision(
+                recovery=recovery,
+                action="ignored_missing_identity",
+                detail={"source": source},
+            )
+            return {"handled": False, "action": "ignored_missing_identity"}
+
+        claim_fn = getattr(self._repo, "claim_backend_runner_recovery", None)
+        if not callable(claim_fn):
+            self._log_backend_recovery_decision(
+                recovery=recovery,
+                action="ignored_repo_unsupported",
+                detail={"source": source},
+            )
+            return {"handled": False, "action": "ignored_repo_unsupported"}
+
+        claim = claim_fn(
+            deployment_id=int(deployment_id),
+            account_id=int(account_id),
+            runner_id=runner_id,
+            slot_id=slot_id,
+            reason=reason,
+            cooldown_sec=self._backend_recovery_cooldown_sec(),
+            budget_count=self._backend_recovery_budget_count(),
+            budget_window_sec=self._backend_recovery_budget_window_sec(),
+        )
+        claim_action = str((claim or {}).get("action") or "ignored").strip()
+        if claim_action == "budget_exhausted":
+            deployment = self._repo.get_deployment(deployment_id=int(deployment_id))
+            if deployment and not _deployment_wants_stopped(deployment):
+                slot_reassign = self._maybe_reassign_backend_recovery_slot(
+                    deployment=deployment,
+                    runner_id=runner_id,
+                    slot_id=slot_id,
+                    reason=reason,
+                    trace_id=trace_id,
+                    force_current_broken=True,
+                )
+                if bool(slot_reassign.get("changed")):
+                    runner_id = str(slot_reassign.get("runner_id") or runner_id).strip()
+                    slot_id = _canonical_slot_id(slot_reassign.get("slot_id") or slot_id)
+                    recovery = {
+                        **recovery,
+                        "runner_id": runner_id,
+                        "slot_id": slot_id,
+                        "slot_reassign": slot_reassign,
+                    }
+                    clear_fn = getattr(self._repo, "clear_backend_runner_recovery", None)
+                    if callable(clear_fn):
+                        clear_fn(
+                            deployment_id=int(deployment_id),
+                            runner_id=runner_id,
+                            slot_id=slot_id,
+                            reason="slot_reassigned_after_budget_exhausted",
+                        )
+                    claim = claim_fn(
+                        deployment_id=int(deployment_id),
+                        account_id=int(account_id),
+                        runner_id=runner_id,
+                        slot_id=slot_id,
+                        reason=reason,
+                        cooldown_sec=self._backend_recovery_cooldown_sec(),
+                        budget_count=self._backend_recovery_budget_count(),
+                        budget_window_sec=self._backend_recovery_budget_window_sec(),
+                    )
+                    claim_action = str((claim or {}).get("action") or "ignored").strip()
+        if claim_action != "claim":
+            log_action = {
+                "cooldown": "suppressed_cooldown",
+                "recovery_in_flight": "suppressed_in_flight",
+                "start_stop_in_flight": "suppressed_in_flight",
+                "budget_exhausted": "budget_exhausted",
+                "deployment_not_running": "ignored_not_running",
+                "newer_active_deployment": "ignored_newer_active_deployment",
+                "guard_blocked": "ignored_guard_blocked",
+            }.get(claim_action, f"ignored_{claim_action}")
+            self._log_backend_recovery_decision(
+                recovery=recovery,
+                action=log_action,
+                claim=claim,
+                detail={"source": source},
+            )
+            if claim_action == "budget_exhausted":
+                schedule_error_alert(
+                    area="Windows runner recovery",
+                    summary="Backend recovery đã hết retry budget.",
+                    severity="critical",
+                    account_id=int(account_id),
+                    deployment_id=int(deployment_id),
+                    runner_id=runner_id,
+                    slot_id=slot_id,
+                    impact="Bot vẫn được giữ desired_state=running nhưng cần operator kiểm tra runner/MT5.",
+                    action="Kiểm tra Windows slot, terminal, worker và command START_BOT gần nhất.",
+                    detail={"reason": reason, "source": source, "claim": claim},
+                    alert_key=f"backend_runner_recovery_budget:{deployment_id}:{runner_id}:{slot_id}:{reason}",
+                    cooldown_sec=300,
+                )
+            return {"handled": True, "action": log_action, "claim": claim}
+
+        deployment = self._repo.get_deployment(deployment_id=int(deployment_id))
+        if not deployment:
+            self._log_backend_recovery_decision(
+                recovery=recovery,
+                action="ignored_deployment_not_found_after_claim",
+                claim=claim,
+                detail={"source": source},
+            )
+            return {"handled": True, "action": "ignored_deployment_not_found_after_claim", "claim": claim}
+        if _deployment_wants_stopped(deployment):
+            mark_failed = getattr(self._repo, "mark_backend_runner_recovery_dispatch_failed", None)
+            if callable(mark_failed):
+                mark_failed(deployment_id=int(deployment_id), reason="deployment_stopped_after_claim")
+            self._log_backend_recovery_decision(
+                recovery=recovery,
+                action="ignored_not_running_after_claim",
+                claim=claim,
+                detail={"source": source},
+            )
+            return {"handled": True, "action": "ignored_not_running_after_claim", "claim": claim}
+
+        package_fn = getattr(self._repo, "get_runner_deployment_package", None)
+        if callable(package_fn):
+            package = package_fn(deployment_id=int(deployment_id))
+            account_status = str((package or {}).get("account_status") or "").strip().lower()
+            if account_status and account_status != "connected":
+                mark_failed = getattr(self._repo, "mark_backend_runner_recovery_dispatch_failed", None)
+                if callable(mark_failed):
+                    mark_failed(deployment_id=int(deployment_id), reason=f"account_not_ready:{account_status}")
+                self._log_backend_recovery_decision(
+                    recovery=recovery,
+                    action="ignored_account_guard",
+                    claim=claim,
+                    detail={"source": source, "account_status": account_status},
+                )
+                return {"handled": True, "action": "ignored_account_guard", "claim": claim}
+
+        bot_name = str(deployment.get("bot_code") or deployment.get("bot_name") or "").strip()
+        bot = self._repo.get_bot_by_name(bot_name=bot_name) if bot_name and hasattr(self._repo, "get_bot_by_name") else None
+        bot = bot or {
+            "bot_code": deployment.get("bot_code"),
+            "bot_name": deployment.get("bot_name"),
+            "profile_class": deployment.get("profile_class"),
+            "resource_hints": {},
+        }
+        if bot.get("enabled") is False:
+            mark_failed = getattr(self._repo, "mark_backend_runner_recovery_dispatch_failed", None)
+            if callable(mark_failed):
+                mark_failed(deployment_id=int(deployment_id), reason="bot_disabled")
+            self._log_backend_recovery_decision(
+                recovery=recovery,
+                action="ignored_bot_guard",
+                claim=claim,
+                detail={"source": source, "bot_code": bot.get("bot_code") or bot_name},
+            )
+            return {"handled": True, "action": "ignored_bot_guard", "claim": claim}
+        if not bot_start_runtime_supported(bot, settings_obj=settings):
+            disabled_reason = bot_start_runtime_disabled_reason(bot, settings_obj=settings) or "bot_runtime_not_supported"
+            mark_failed = getattr(self._repo, "mark_backend_runner_recovery_dispatch_failed", None)
+            if callable(mark_failed):
+                mark_failed(deployment_id=int(deployment_id), reason=disabled_reason)
+            self._log_backend_recovery_decision(
+                recovery=recovery,
+                action="ignored_bot_runtime_guard",
+                claim=claim,
+                detail={"source": source, "bot_code": bot.get("bot_code") or bot_name, "reason": disabled_reason},
+            )
+            return {"handled": True, "action": "ignored_bot_runtime_guard", "claim": claim}
+        slot_reassign = self._maybe_reassign_backend_recovery_slot(
+            deployment=deployment,
+            runner_id=runner_id,
+            slot_id=slot_id,
+            reason=reason,
+            trace_id=trace_id,
+            force_current_broken=bool(recovery.get("current_slot_broken")),
+        )
+        runner_id = str(slot_reassign.get("runner_id") or runner_id).strip()
+        slot_id = _canonical_slot_id(slot_reassign.get("slot_id") or slot_id)
+        recovery = {
+            **recovery,
+            "runner_id": runner_id,
+            "slot_id": slot_id,
+            "slot_reassign": slot_reassign,
+        }
+        attempt_count = int((claim or {}).get("attempt_count") or 1)
+        recovery_key = f"mt5_recovery:{deployment_id}:{runner_id}:{slot_id}:{reason}"
+        start_trace_id = f"{recovery_key}:{attempt_count}:{uuid.uuid4().hex[:8]}"
+        if trace_id:
+            start_trace_id = f"{trace_id}:{start_trace_id}"
+        payload = self._build_backend_recovery_start_payload(
+            deployment=deployment,
+            bot=bot,
+            recovery=recovery,
+            attempt_count=attempt_count,
+            recovery_key=recovery_key,
+        )
+        try:
+            command = await self._command_router.dispatch(
+                command_type=CommandType.START_BOT,
+                account_id=int(account_id),
+                deployment_id=int(deployment_id),
+                bot_id=str(bot.get("bot_code") or bot.get("bot_id") or deployment.get("bot_code") or ""),
+                runner_id=runner_id,
+                slot_id=slot_id,
+                priority=95,
+                payload=payload,
+                trace_id=start_trace_id,
+            )
+        except Exception as exc:
+            mark_failed = getattr(self._repo, "mark_backend_runner_recovery_dispatch_failed", None)
+            if callable(mark_failed):
+                mark_failed(deployment_id=int(deployment_id), reason=f"dispatch_failed:{exc.__class__.__name__}")
+            self._log_backend_recovery_decision(
+                recovery=recovery,
+                action="dispatch_failed",
+                claim=claim,
+                detail={"source": source, "error": str(exc)[:200], "slot_reassign": slot_reassign},
+            )
+            schedule_error_alert(
+                area="Windows runner recovery",
+                summary="Backend không enqueue được START_BOT để recovery.",
+                exc=exc,
+                severity="critical",
+                account_id=int(account_id),
+                deployment_id=int(deployment_id),
+                runner_id=runner_id,
+                slot_id=slot_id,
+                impact="Bot có thể đang đứng ở trạng thái recovery pending.",
+                action="Kiểm tra Redis command queue và CommandRouterService.",
+                detail={"reason": reason, "source": source},
+                alert_key=f"backend_runner_recovery_dispatch_failed:{deployment_id}:{exc.__class__.__name__}",
+                cooldown_sec=180,
+            )
+            return {"handled": True, "action": "dispatch_failed", "claim": claim}
+
+        command_id = str(command.get("command_id") or "").strip()
+        if str(command.get("delivery_status") or "").strip().lower() == "failed":
+            mark_failed = getattr(self._repo, "mark_backend_runner_recovery_dispatch_failed", None)
+            if callable(mark_failed):
+                mark_failed(
+                    deployment_id=int(deployment_id),
+                    reason=str(command.get("drop_reason") or "start_bot_dispatch_dropped")[:200],
+                )
+            self._log_backend_recovery_decision(
+                recovery=recovery,
+                action="dispatch_dropped",
+                claim=claim,
+                command_id=command_id,
+                detail={"source": source, "drop_reason": command.get("drop_reason"), "slot_reassign": slot_reassign},
+            )
+            return {"handled": True, "action": "dispatch_dropped", "claim": claim, "command": command}
+
+        mark_command = getattr(self._repo, "mark_backend_runner_recovery_command", None)
+        if callable(mark_command) and command_id:
+            mark_command(deployment_id=int(deployment_id), command_id=command_id)
+        insert_audit = getattr(self._repo, "insert_deployment_audit", None)
+        if callable(insert_audit):
+            insert_audit(
+                deployment_id=int(deployment_id),
+                action="deployment.backend_runner_recovery_requested",
+                payload={
+                    "deployment_id": int(deployment_id),
+                    "account_id": int(account_id),
+                    "runner_id": runner_id,
+                    "slot_id": slot_id,
+                    "reason": reason,
+                    "source": source,
+                    "command_id": command_id,
+                    "attempt_count": attempt_count,
+                    "recovery_key": recovery_key,
+                },
+                result="start_queued",
+                trace_id=command.get("trace_id") or start_trace_id,
+            )
+        self._log_backend_recovery_decision(
+            recovery=recovery,
+            action="queued_restart",
+            claim=claim,
+            command_id=command_id,
+            detail={"source": source, "slot_reassign": slot_reassign},
+        )
+        return {
+            "handled": True,
+            "action": "queued_restart",
+            "claim": claim,
+            "command": command,
+            "command_id": command_id,
+        }
+
+    def _clear_backend_runner_recovery_if_healthy(
+        self,
+        *,
+        deployment_id: int | None,
+        runner_id: str,
+        slot_id: str | None,
+        payload: dict[str, Any],
+        source: str,
+    ) -> None:
+        if deployment_id is None or not _payload_confirms_runtime_healthy(payload):
+            return
+        clear_fn = getattr(self._repo, "clear_backend_runner_recovery", None)
+        if not callable(clear_fn):
+            return
+        cleared = clear_fn(
+            deployment_id=int(deployment_id),
+            runner_id=runner_id,
+            slot_id=slot_id,
+            reason=f"{source}_healthy",
+        )
+        if cleared:
+            _log.info(
+                "runner.backend_recovery.cleared deployment=%s runner=%s slot=%s source=%s",
+                deployment_id,
+                runner_id,
+                slot_id or "",
+                source,
+                extra={
+                    "event": "runner.backend_recovery.cleared",
+                    "deployment_id": deployment_id,
+                    "runner_id": runner_id,
+                    "slot_id": slot_id,
+                    "source": source,
+                },
+            )
+
     async def _restart_after_config_stop(
         self,
         *,
@@ -1439,6 +2399,35 @@ class RunnerEventIngestService:
                 await login_lease.renew_for_account(account_id=int(account_id), runner_id=runner_id)
             except Exception:
                 pass
+        for recovery_request in _backend_recovery_requests_from_heartbeat(
+            payload or {},
+            runner_id=runner_id,
+            slot_id=slot_id_value,
+            account_id=account_id,
+            deployment_id=deployment_id,
+        ):
+            await self._handle_backend_runner_recovery_request(
+                recovery=recovery_request,
+                source="heartbeat",
+                trace_id=trace_id,
+            )
+        self._clear_backend_runner_recovery_if_healthy(
+            deployment_id=deployment_id,
+            runner_id=runner_id,
+            slot_id=slot_id_value,
+            payload=payload or {},
+            source="heartbeat",
+        )
+        for item in _slot_inventory_items(payload or {}):
+            metadata = _backend_recovery_metadata(item, _payload_dict(item.get("report")))
+            merged = {**metadata, **item}
+            self._clear_backend_runner_recovery_if_healthy(
+                deployment_id=_payload_int(item.get("deployment_id") or item.get("active_deployment_id")),
+                runner_id=runner_id,
+                slot_id=_canonical_slot_id(item.get("slot_id") or item.get("storage_slot_id")),
+                payload=merged,
+                source="heartbeat_slot_inventory",
+            )
         event = self._repo.insert_execution_event(
             event_id=event_model.event_id,
             event_type=event_model.event_type.value,
@@ -1494,26 +2483,6 @@ class RunnerEventIngestService:
             runner_id=runner_id,
             trace_id=trace_id,
         )
-        is_heartbeat = str(event_type or "").strip().lower() == EventType.HEARTBEAT.value.lower()
-        if not is_heartbeat:
-            severity_norm = str(severity or "info").strip().lower()
-            log_level = logging.WARNING if severity_norm in {"warning", "warn"} else (
-                logging.ERROR if severity_norm in {"error", "critical", "fatal"} else logging.INFO
-            )
-            _log.log(
-                log_level,
-                "runner_event.ingest type=%s runner=%s slot=%s deployment=%s severity=%s",
-                event_type, runner_id, slot_id_value, deployment_id, severity,
-                extra={
-                    "event_kind": "runner_event",
-                    "runner_event_id": event_id,
-                    "runner_event_type": event_type,
-                    "runner_event_severity": severity,
-                    "slot_id": slot_id_value,
-                    "command_id": command_id,
-                    "bot_id": bot_id,
-                },
-            )
         event_model = RunnerEvent.model_validate(
             {
                 "event_id": event_id or uuid.uuid4().hex,
@@ -1566,6 +2535,52 @@ class RunnerEventIngestService:
                 "skipped_db_write": True,
             }
 
+        backend_recovery_result: dict[str, Any] | None = None
+        backend_recovery_request = None
+        if event_type_value == EventType.RUNTIME_LOG.value:
+            backend_recovery_request = _backend_recovery_request_from_payload(
+                payload_map,
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+                account_id=event_model.account_id,
+                deployment_id=event_model.deployment_id,
+            )
+            if backend_recovery_request and self._backend_recovery_event_is_suppressed(backend_recovery_request):
+                return {
+                    "event_id": normalized_event_id,
+                    "event_type": event_type_value,
+                    "account_id": event_model.account_id,
+                    "deployment_id": event_model.deployment_id,
+                    "runner_id": event_model.runner_id,
+                    "slot_id": event_model.slot_id,
+                    "backend_recovery": {
+                        "handled": True,
+                        "action": "suppressed_repeated_noop_event",
+                    },
+                    "throttled": True,
+                    "skipped_db_write": True,
+                }
+
+        if event_type_value != EventType.HEARTBEAT.value:
+            severity_norm = str(severity_value or "info").strip().lower()
+            log_level = logging.WARNING if severity_norm in {"warning", "warn"} else (
+                logging.ERROR if severity_norm in {"error", "critical", "fatal"} else logging.INFO
+            )
+            _log.log(
+                log_level,
+                "runner_event.ingest type=%s runner=%s slot=%s deployment=%s severity=%s",
+                event_type_value, event_model.runner_id, event_model.slot_id, event_model.deployment_id, severity_value,
+                extra={
+                    "event_kind": "runner_event",
+                    "runner_event_id": normalized_event_id,
+                    "runner_event_type": event_type_value,
+                    "runner_event_severity": severity_value,
+                    "slot_id": event_model.slot_id,
+                    "command_id": event_command_id,
+                    "bot_id": event_model.bot_id,
+                },
+            )
+
         self._repo.touch_runner_heartbeat(runner_id=runner_id, slot_id=slot_id_value, payload=payload_map)
         if event_type_value == EventType.HEARTBEAT.value:
             self._reconcile_runtime_slot(
@@ -1588,6 +2603,35 @@ class RunnerEventIngestService:
                         event_model=event_model,
                         command_id=event_command_id,
                     )
+            for recovery_request in _backend_recovery_requests_from_heartbeat(
+                payload_map,
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+                account_id=event_model.account_id,
+                deployment_id=event_model.deployment_id,
+            ):
+                await self._handle_backend_runner_recovery_request(
+                    recovery=recovery_request,
+                    source="event_heartbeat",
+                    trace_id=event_model.trace_id,
+                )
+            self._clear_backend_runner_recovery_if_healthy(
+                deployment_id=event_model.deployment_id,
+                runner_id=event_model.runner_id,
+                slot_id=event_model.slot_id,
+                payload=payload_map,
+                source="event_heartbeat",
+            )
+            for item in _slot_inventory_items(payload_map):
+                metadata = _backend_recovery_metadata(item, _payload_dict(item.get("report")))
+                merged = {**metadata, **item}
+                self._clear_backend_runner_recovery_if_healthy(
+                    deployment_id=_payload_int(item.get("deployment_id") or item.get("active_deployment_id")),
+                    runner_id=event_model.runner_id,
+                    slot_id=_canonical_slot_id(item.get("slot_id") or item.get("storage_slot_id")),
+                    payload=merged,
+                    source="event_heartbeat_slot_inventory",
+                )
 
         event = self._repo.insert_execution_event(
             event_id=normalized_event_id,
@@ -1672,6 +2716,26 @@ class RunnerEventIngestService:
                 payload=payload_map,
             )
 
+        if event_type_value != EventType.HEARTBEAT.value:
+            if backend_recovery_request is None:
+                backend_recovery_request = _backend_recovery_request_from_payload(
+                    payload_map,
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                    account_id=event_model.account_id,
+                    deployment_id=event_model.deployment_id,
+                )
+            if backend_recovery_request:
+                backend_recovery_result = await self._handle_backend_runner_recovery_request(
+                    recovery=backend_recovery_request,
+                    source=event_type_value.lower(),
+                    trace_id=event_model.trace_id,
+                )
+                self._suppress_backend_recovery_event_if_noop(
+                    backend_recovery_request,
+                    str((backend_recovery_result or {}).get("action") or ""),
+                )
+
         if event_command_id and event_type_value in {
             EventType.BOT_STARTED.value,
             EventType.BOT_STOPPED.value,
@@ -1734,6 +2798,13 @@ class RunnerEventIngestService:
                         account_id=int(started_account_id),
                         ok=True,
                     )
+                self._clear_backend_runner_recovery_if_healthy(
+                    deployment_id=event_model.deployment_id,
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                    payload={**payload_map, "status": "running", "terminal_running": True, "worker_alive": True},
+                    source=event_type_value.lower(),
+                )
                 if event_command_id:
                     command = self._repo.get_execution_command(command_id=event_command_id)
                     command_payload = command.get("payload_json") if isinstance(command, dict) else {}
@@ -1831,27 +2902,37 @@ class RunnerEventIngestService:
                     status="broken",
                     metadata=payload_map,
                 )
-            if event_model.deployment_id is not None:
-                self._repo.update_deployment_status(
-                    deployment_id=event_model.deployment_id,
-                    status=DeploymentStatus.FAILED.value,
-                    desired_state="stopped",
-                    is_active=False,
-                    health_status="broken",
-                    last_error=str(payload_map.get("reason") or "slot_broken"),
-                    stopped=True,
-                )
+            backend_recovery_handled = bool(backend_recovery_request)
+            if event_model.deployment_id is not None and not backend_recovery_handled:
+                deployment = self._repo.get_deployment(deployment_id=event_model.deployment_id)
+                if not _deployment_wants_stopped(deployment):
+                    self._repo.update_deployment_status(
+                        deployment_id=event_model.deployment_id,
+                        status=DeploymentStatus.FAILED.value,
+                        desired_state="stopped",
+                        is_active=False,
+                        health_status="broken",
+                        last_error=str(payload_map.get("reason") or "slot_broken"),
+                        stopped=True,
+                    )
             schedule_error_alert(
                 area="Windows runner",
-                summary="Một slot MT5 bị lỗi.",
-                severity="critical",
+                summary="Một slot MT5 bị lỗi, backend đã nhận tín hiệu recovery." if backend_recovery_handled else "Một slot MT5 bị lỗi.",
+                severity="warning" if backend_recovery_handled else "critical",
                 account_id=event_model.account_id,
                 deployment_id=event_model.deployment_id,
                 runner_id=event_model.runner_id,
                 slot_id=event_model.slot_id,
-                impact="Bot trên slot này có thể đã dừng hoặc không nhận lệnh.",
-                action="Kiểm tra MT5 terminal, worker slot và log Windows.",
-                detail={"reason": _event_reason(payload_map) or "slot_broken"},
+                impact=(
+                    "Backend sẽ restart deployment nếu intent vẫn là running."
+                    if backend_recovery_handled
+                    else "Bot trên slot này có thể đã dừng hoặc không nhận lệnh."
+                ),
+                action="Theo dõi recovery decision và START_BOT command." if backend_recovery_handled else "Kiểm tra MT5 terminal, worker slot và log Windows.",
+                detail={
+                    "reason": _event_reason(payload_map) or "slot_broken",
+                    "backend_recovery": backend_recovery_result or {},
+                },
                 alert_key=f"slot_broken:{event_model.runner_id}:{event_model.slot_id}",
                 cooldown_sec=180,
             )
@@ -1879,6 +2960,20 @@ class RunnerEventIngestService:
                     slot_id=event_model.slot_id,
                     status=slot_state,
                     metadata=payload_map,
+                )
+            if event_model.deployment_id is not None and _slot_state_event_confirms_runtime_started(payload_map):
+                self._clear_backend_runner_recovery_if_healthy(
+                    deployment_id=event_model.deployment_id,
+                    runner_id=event_model.runner_id,
+                    slot_id=event_model.slot_id,
+                    payload={
+                        **payload_map,
+                        "status": payload_map.get("status") or payload_map.get("current_state") or "active",
+                        "terminal_running": payload_map.get("terminal_running")
+                        if payload_map.get("terminal_running") is not None
+                        else bool(payload_map.get("terminal_path") or payload_map.get("terminal_pid")),
+                    },
+                    source="slot_state_changed",
                 )
         elif event_type_value == EventType.COMMAND_REJECTED.value:
             command = self._repo.get_execution_command(command_id=event_command_id or "")
@@ -1959,6 +3054,52 @@ class RunnerEventIngestService:
                     )
                 if command_type == "START_BOT":
                     reason = start_failure_reason(payload_map, fallback="command_rejected")
+                    if _is_backend_runner_recovery_command(command):
+                        mark_failed = getattr(self._repo, "mark_backend_runner_recovery_dispatch_failed", None)
+                        if callable(mark_failed):
+                            mark_failed(
+                                deployment_id=event_model.deployment_id,
+                                reason=f"command_rejected:{reason}",
+                            )
+                        self._repo.update_deployment_status(
+                            deployment_id=event_model.deployment_id,
+                            status=DeploymentStatus.RUNNING.value,
+                            desired_state="running",
+                            is_active=True,
+                            health_status="runner_recovery_pending",
+                            last_error=reason,
+                            runner_id=event_model.runner_id,
+                            slot_id=event_model.slot_id,
+                        )
+                        self._repo.insert_deployment_audit(
+                            deployment_id=event_model.deployment_id,
+                            action="deployment.backend_runner_recovery_rejected",
+                            payload={
+                                "deployment_id": event_model.deployment_id,
+                                "account_id": event_model.account_id,
+                                "command_id": event_command_id,
+                                "runner_id": event_model.runner_id,
+                                "slot_id": event_model.slot_id,
+                                "reason": reason,
+                            },
+                            result="will_retry",
+                            trace_id=event_model.trace_id,
+                        )
+                        schedule_error_alert(
+                            area="Windows runner recovery",
+                            summary="Runner từ chối START_BOT recovery, backend vẫn giữ bot ở trạng thái cần phục hồi.",
+                            severity="warning",
+                            account_id=event_model.account_id,
+                            deployment_id=event_model.deployment_id,
+                            runner_id=event_model.runner_id,
+                            slot_id=event_model.slot_id,
+                            impact="Backend không tắt intent của user; recovery sẽ thử lại theo cooldown/budget.",
+                            action="Kiểm tra runner có cho phép clean restart trên slot BROKEN hay chưa.",
+                            detail={"reason": reason, "command_id": event_command_id},
+                            alert_key=f"backend_runner_recovery_rejected:{event_model.deployment_id}:{reason}",
+                            cooldown_sec=180,
+                        )
+                        return {"event": event, "backend_recovery": "command_rejected_kept_running", "reason": reason}
                     failed_account_id = event_model.account_id or command.get("account_id")
                     if failed_account_id is not None and start_failure_is_credential_failure(
                         reason=reason,

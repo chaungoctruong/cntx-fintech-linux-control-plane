@@ -5,13 +5,13 @@ SET last_heartbeat_at = NOW(),
              AND current_account_id IS NULL
              AND (
                  COALESCE(NULLIF(SUBSTRING(slot_id FROM '([0-9]+)$'), ''), '') = ''
-                 OR CAST(SUBSTRING(slot_id FROM '([0-9]+)$') AS INTEGER) <= 10
+                 OR CAST(SUBSTRING(slot_id FROM '([0-9]+)$') AS INTEGER) <= 12
              ) THEN 'ready'
         WHEN status = 'degraded'
              AND current_account_id IS NOT NULL
              AND (
                  COALESCE(NULLIF(SUBSTRING(slot_id FROM '([0-9]+)$'), ''), '') = ''
-                 OR CAST(SUBSTRING(slot_id FROM '([0-9]+)$') AS INTEGER) <= 10
+                 OR CAST(SUBSTRING(slot_id FROM '([0-9]+)$') AS INTEGER) <= 12
              ) THEN 'allocated'
         ELSE status
     END,

@@ -9,7 +9,7 @@ from typing import Any, Optional
 from app.orchestration.broker_routing import BrokerRoutePolicy, runner_slot_supports_broker_route
 from app.risk.orchestration_policy import requires_dedicated_runner
 
-RUNNER_ACTIVE_LIMIT_DEFAULT = 10
+RUNNER_ACTIVE_LIMIT_DEFAULT = 12
 RUNNER_NODE_SLOT_LIMIT_DEFAULT = RUNNER_ACTIVE_LIMIT_DEFAULT
 IPC_READY_FRESHNESS_SEC_DEFAULT = 3600
 RESIDENT_WORKER_FRESHNESS_SEC_DEFAULT = 120

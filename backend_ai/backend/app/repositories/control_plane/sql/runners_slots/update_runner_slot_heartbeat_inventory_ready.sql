@@ -14,6 +14,9 @@ SET status = 'ready',
                 - 'login_slot_account_id'
                 - 'reserved_account_id'
                 - 'sticky_account_id'
+                - 'disabled_by_node_slot_cap'
+                - 'node_slot_cap'
+                - 'disabled_reason'
                 - 'current_control_plane_state'
                 - 'previous_control_plane_state'
                 - 'current_runner_state'
@@ -34,6 +37,9 @@ SET status = 'ready',
                 - 'login_slot_account_id'
                 - 'reserved_account_id'
                 - 'sticky_account_id'
+                - 'disabled_by_node_slot_cap'
+                - 'node_slot_cap'
+                - 'disabled_reason'
         ) || jsonb_build_object(
             'control_plane_state', 'ready',
             'current_control_plane_state', 'ready'

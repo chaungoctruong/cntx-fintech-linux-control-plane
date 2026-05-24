@@ -8,6 +8,7 @@
   "version": "0.3.0",
   "version_file": "VERSION",
   "description": "Multi-tenant TradingView->MT5 bot package for the Spider AI catalog. Linux backend distributes this package to multiple Windows runners; one OS process per tenant. Cloned from gsalgo with all account/path-specific data removed and an isolated PostgreSQL database injected by the platform.",
+  "catalog_lane": "backend_webhook_signal",
   "bot_type": "backend_webhook_signal",
   "execution_owner": "linux_backend",
   "windows_role": "mt5_executor_only",
@@ -77,6 +78,7 @@
     "url_env": "DATABASE_URL"
   },
   "resource_hints": {
+    "catalog_lane": "backend_webhook_signal",
     "runtime": "windows_mt5",
     "lane": "mt5_runner",
     "bot_type": "backend_webhook_signal",

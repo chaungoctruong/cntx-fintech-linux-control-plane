@@ -115,7 +115,7 @@ released_slots AS (
       AND s.slot_id = d.slot_id
       AND (
           COALESCE(NULLIF(SUBSTRING(s.slot_id FROM '([0-9]+)$'), ''), '') = ''
-          OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= 10
+          OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= 12
       )
     RETURNING 1
 ),

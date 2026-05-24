@@ -15,7 +15,7 @@ WHERE s.runner_id = %s
       WHERE n.runner_id = s.runner_id
         AND (
             COALESCE(NULLIF(SUBSTRING(s.slot_id FROM '([0-9]+)$'), ''), '') = ''
-            OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(10, GREATEST(1, n.max_slots))
+            OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(12, GREATEST(1, n.max_slots))
         )
         AND n.status = 'online'
         AND COALESCE(LOWER(NULLIF(BTRIM(n.metadata_json->>'maintenance_mode'), '')), 'false')
@@ -63,7 +63,7 @@ WHERE s.runner_id = %s
             WHERE hs.runner_id = n.runner_id
               AND (
                   COALESCE(NULLIF(SUBSTRING(hs.slot_id FROM '([0-9]+)$'), ''), '') = ''
-                  OR CAST(SUBSTRING(hs.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(10, GREATEST(1, n.max_slots))
+                  OR CAST(SUBSTRING(hs.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(12, GREATEST(1, n.max_slots))
               )
               AND hs.status IN ('ready', 'allocated')
         )

@@ -38,10 +38,12 @@ _KNOWN_SECRET_NAMES = frozenset(
     }
 )
 _EXECUTION_CONTRACT_TEXT_KEYS = (
+    "catalog_lane",
     "bot_type",
     "execution_owner",
     "windows_role",
     "tradingview_webhook_owner",
+    "runtime_language",
 )
 _EXECUTION_CONTRACT_BOOL_KEYS = ("requires_executor_slot",)
 

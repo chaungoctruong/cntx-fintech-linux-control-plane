@@ -45,5 +45,5 @@ LEFT JOIN active_bindings b
  AND b.slot_id = s.slot_id
 WHERE (
     COALESCE(NULLIF(SUBSTRING(s.slot_id FROM '([0-9]+)$'), ''), '') = ''
-    OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(10, GREATEST(1, n.max_slots))
+    OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(12, GREATEST(1, n.max_slots))
 )

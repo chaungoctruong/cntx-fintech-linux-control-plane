@@ -41,6 +41,18 @@ from app.orchestration.deployment_config import (
     normalize_deployment_config,
 )
 from app.orchestration.deployment_manager import DeploymentManagerService, _inject_runner_queue_depths
+from app.orchestration.bot_runtime_contract import (
+    BOT_RUNTIME_LANE_BACKEND_WEBHOOK_SIGNAL,
+    bot_runtime_contract,
+    bot_matches_runtime_lane,
+    bot_runtime_lane,
+    bot_runtime_start_guard_reason,
+    bot_start_runtime_disabled_reason,
+    bot_start_runtime_supported,
+    is_template_catalog_entry,
+    is_template_catalog_identity,
+    normalize_runtime_lane,
+)
 from app.orchestration.runner_payload_identity import normalize_runner_payload_identity
 from app.orchestration.scheduler import preview_slots_for_account
 from app.repositories.control_plane_repository import ControlPlaneRepository
@@ -54,11 +66,21 @@ from app.risk.orchestration_policy import OrchestrationPolicyError, validate_run
 from app.security import CryptoBox
 from app.services.runner_gsalgo_state import GsAlgoBackendStateService
 from app.services.store_service import get_process_store
+from app.services.tradingview_signal_contracts import (
+    TradingViewSignalContract,
+    order_intent_payload,
+    resolve_signal_contract,
+    subscriber_accepts_strategy,
+)
 from app.services.tradingview_position_resolver import resolve_close_positions
 from app.services.tradingview_symbols import canonical_tradingview_symbol
 from app.settings import settings
 
 log = logging.getLogger(__name__)
+
+RUNNER_ORDER_CONTRACT_VERSION = 3
+RUNNER_SLTP_UNIT = "price_distance"
+TRADINGVIEW_PRICE_LEVEL_UNIT = "absolute_price"
 
 _SINGLE_TELEGRAM_BOT_LIMITS = {
     "free": {"max_active_deployments": 1},
@@ -88,10 +110,12 @@ def _norm_text(value: Any) -> str:
 
 
 _BOT_EXECUTION_CONTRACT_TEXT_KEYS = (
+    "catalog_lane",
     "bot_type",
     "execution_owner",
     "windows_role",
     "tradingview_webhook_owner",
+    "runtime_language",
 )
 _BOT_EXECUTION_CONTRACT_BOOL_KEYS = ("requires_executor_slot",)
 _DCA_LIMIT_CAPABILITY_KEYS = (
@@ -514,12 +538,16 @@ def _is_user_visible_catalog_bot(bot: Optional[dict[str, Any]]) -> bool:
         and not _is_backend_ctrader_reserved_bot(bot)
         and not _is_internal_canary_bot(bot)
         and not is_disabled_mt5_bot_catalog_entry(bot)
+        and not is_template_catalog_entry(bot)
+        and bot_start_runtime_supported(bot, settings_obj=settings)
     )
 
 
 def _filter_enabled_runner_bot_strings(value: Any) -> list[str]:
     out: list[str] = []
     for item in _as_string_list(value):
+        if is_template_catalog_identity(item):
+            continue
         if is_disabled_mt5_bot_catalog_entry({"bot_id": item, "bot_code": item, "bot_name": item, "display_name": item}):
             continue
         out.append(item)
@@ -535,7 +563,9 @@ def _filter_runner_bot_catalog_payload(value: Any) -> Any:
         items = [
             dict(item)
             for item in raw_items
-            if isinstance(item, dict) and not is_disabled_mt5_bot_catalog_entry(item)
+            if isinstance(item, dict)
+            and not is_template_catalog_entry(item)
+            and not is_disabled_mt5_bot_catalog_entry(item)
         ]
         catalog["bots"] = items
         catalog["count"] = len(items)
@@ -545,6 +575,83 @@ def _filter_runner_bot_catalog_payload(value: Any) -> Any:
             if str(item.get("bot_code") or item.get("bot_id") or "").strip()
         ]
     return catalog
+
+
+def _catalog_runtime_fields(bot: dict[str, Any]) -> dict[str, Any]:
+    runtime_contract = bot_runtime_contract(bot)
+    lane = bot_runtime_lane(bot)
+    start_disabled_reason = bot_start_runtime_disabled_reason(bot, settings_obj=settings)
+    return {
+        "runtime_lane": lane,
+        "catalog_lane": _norm_text(runtime_contract.get("catalog_lane")),
+        "bot_type": _norm_text(runtime_contract.get("bot_type")),
+        "execution_owner": _norm_text(runtime_contract.get("execution_owner")),
+        "windows_role": _norm_text(runtime_contract.get("windows_role")),
+        "runtime_language": _norm_text(runtime_contract.get("runtime_language") or bot.get("language") or "python"),
+        "start_enabled": not bool(start_disabled_reason),
+        "start_disabled_reason": start_disabled_reason,
+    }
+
+
+def _catalog_bot_item(bot: dict[str, Any]) -> dict[str, Any]:
+    item = dict(bot)
+    item.update(_catalog_runtime_fields(bot))
+    return item
+
+
+def _filter_bots_by_runtime_lane(bots: list[dict[str, Any]], runtime_lane: Any = None) -> list[dict[str, Any]]:
+    lane = normalize_runtime_lane(runtime_lane)
+    if lane == "all":
+        return bots
+    return [bot for bot in bots if bot_matches_runtime_lane(bot, lane)]
+
+
+def _catalog_lane_priority(bot: dict[str, Any] | None) -> int:
+    lane = bot_runtime_lane(bot)
+    if lane == BOT_RUNTIME_LANE_BACKEND_WEBHOOK_SIGNAL:
+        return 10
+    if lane == "mt5_ea_runtime":
+        return 30
+    if lane == "windows_python_mt5_runtime":
+        return 40
+    return 90
+
+
+def _catalog_identity_key(bot: dict[str, Any]) -> str:
+    return _norm_text(bot.get("bot_code") or bot.get("bot_id") or bot.get("bot_name")).lower()
+
+
+def _dedupe_catalog_definitions_by_runtime_lane(definitions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    chosen: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for definition in definitions:
+        identity = _catalog_identity_key(definition)
+        if not identity:
+            continue
+        current = chosen.get(identity)
+        if current is None:
+            chosen[identity] = definition
+            order.append(identity)
+            continue
+        current_lane = bot_runtime_lane(current)
+        incoming_lane = bot_runtime_lane(definition)
+        if current_lane == incoming_lane:
+            continue
+        current_priority = _catalog_lane_priority(current)
+        incoming_priority = _catalog_lane_priority(definition)
+        keep_incoming = incoming_priority < current_priority
+        winner = definition if keep_incoming else current
+        loser = current if keep_incoming else definition
+        chosen[identity] = winner
+        log.warning(
+            "catalog_lane_collision_suppressed bot_code=%s kept_lane=%s skipped_lane=%s kept_source=%s skipped_source=%s",
+            identity,
+            bot_runtime_lane(winner),
+            bot_runtime_lane(loser),
+            _norm_text((winner.get("metadata") or {}).get("catalog_source") if isinstance(winner.get("metadata"), dict) else ""),
+            _norm_text((loser.get("metadata") or {}).get("catalog_source") if isinstance(loser.get("metadata"), dict) else ""),
+        )
+    return [chosen[key] for key in order if key in chosen]
 
 
 def _bot_supported_broker_keys(bot: Optional[dict[str, Any]]) -> set[str]:
@@ -682,6 +789,17 @@ def _runner_bot_definition(*, runner_id: str, source: str, raw: dict[str, Any]) 
     bot_name = _norm_text(raw.get("bot_name") or raw.get("display_name") or bot_code)
     display_name = _bot_display_name(bot_code=bot_code, bot_name=bot_name, display_name=raw.get("display_name"))
     package_dir = _norm_text(raw.get("package_dir") or raw.get("package") or bot_code)
+    if is_template_catalog_entry(
+        {
+            "bot_id": raw.get("bot_id"),
+            "bot_code": bot_code,
+            "bot_name": bot_name,
+            "display_name": display_name,
+            "package_dir": package_dir,
+            "package": raw.get("package"),
+        }
+    ):
+        return None
     language = _norm_text(raw.get("runtime_language") or raw.get("language") or "python")
     raw_runtime_env = raw.get("runtime_env") if isinstance(raw.get("runtime_env"), dict) else {}
     raw_resource_hints = raw.get("resource_hints") if isinstance(raw.get("resource_hints"), dict) else {}
@@ -689,6 +807,8 @@ def _runner_bot_definition(*, runner_id: str, source: str, raw: dict[str, Any]) 
     raw_legacy_entrypoints = raw.get("legacy_entrypoints") if isinstance(raw.get("legacy_entrypoints"), dict) else {}
     raw_metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
     execution_contract = _bot_execution_contract(raw, raw_runtime_env, raw_resource_hints, raw_metadata)
+    runtime_contract = bot_runtime_contract(raw, raw_runtime_env, raw_resource_hints, raw_metadata)
+    execution_contract.update({key: value for key, value in runtime_contract.items() if key not in execution_contract})
     runtime_entry = _norm_text(
         raw.get("entrypoint")
         or raw.get("runtime_entry")
@@ -727,6 +847,8 @@ def _runner_bot_definition(*, runner_id: str, source: str, raw: dict[str, Any]) 
             runtime_env[f"{schema_key}_path"] = _norm_text(schema_payload)
     if raw.get("platform_contract") is not None:
         runtime_env["platform_contract"] = raw.get("platform_contract")
+    if isinstance(raw.get("ea"), dict):
+        runtime_env["ea"] = dict(raw.get("ea") or {})
     _merge_bot_execution_contract(runtime_env, execution_contract)
 
     resource_hints = dict(raw_resource_hints)
@@ -735,6 +857,8 @@ def _runner_bot_definition(*, runner_id: str, source: str, raw: dict[str, Any]) 
     resource_hints.setdefault("lane", "mt5_runner")
     resource_hints["runner_id"] = runner_id
     resource_hints["package_dir"] = package_dir
+    if isinstance(raw.get("ea"), dict):
+        resource_hints.setdefault("ea", dict(raw.get("ea") or {}))
     _merge_bot_execution_contract(resource_hints, execution_contract)
 
     risk_profile = dict(raw.get("risk_profile") or {})
@@ -775,6 +899,8 @@ def _runner_bot_definition(*, runner_id: str, source: str, raw: dict[str, Any]) 
         metadata["legacy_entrypoints"] = dict(raw_legacy_entrypoints)
     if execution_contract:
         metadata["execution_contract"] = dict(execution_contract)
+    if isinstance(raw.get("ea"), dict):
+        metadata["ea"] = dict(raw.get("ea") or {})
 
     definition = {
         "bot_id": bot_code,
@@ -807,6 +933,7 @@ def _mini_bot_item(bot: dict[str, Any]) -> dict[str, Any]:
     bot_name = _norm_text(bot.get("bot_name") or bot.get("display_name") or bot_code)
     display_name = _bot_display_name(bot_code=bot_code, bot_name=bot_name, display_name=bot.get("display_name"))
     profile_class = _normalize_profile_class(bot.get("profile_class"))
+    runtime_fields = _catalog_runtime_fields(bot)
     required_params = list(bot.get("required_params") or [])
     trading_keys = {"lot_size", "stop_loss", "take_profit"}
     if bot_supports_trading_config(bot) and not trading_keys.issubset({_norm_text(item).lower() for item in required_params}):
@@ -829,6 +956,7 @@ def _mini_bot_item(bot: dict[str, Any]) -> dict[str, Any]:
         "supports_live": bool(bot.get("supports_live", True)),
         "default_config_path": bot.get("default_config_path"),
         "runtime_env": dict(bot.get("runtime_env") or {}),
+        **runtime_fields,
         "checksum": _norm_text(bot.get("checksum") or ""),
         "source_path": _norm_text(bot.get("source_path") or ""),
         "label": f"{display_name} · {profile_class}",
@@ -1047,6 +1175,15 @@ class MT5ControlPlaneService:
         payload: dict[str, Any] = {
             "tradingview_contract_version": request.get("order_contract_version") or guard.get("contract_version"),
             "tradingview_alert_received_at_ms": received_at_ms,
+            "runner_order_contract": {
+                "version": RUNNER_ORDER_CONTRACT_VERSION,
+                "request_sl_tp_unit": RUNNER_SLTP_UNIT,
+                "legacy_aliases_unit": RUNNER_SLTP_UNIT,
+                "absolute_price_metadata_fields": [
+                    "tradingview_stop_loss_price",
+                    "tradingview_take_profit_price",
+                ],
+            },
             "tradingview_guard": guard or {
                 "source": "backend_tradingview_ingress",
                 "enforcement": "reject_order_only",
@@ -1069,7 +1206,47 @@ class MT5ControlPlaneService:
         for key in ("signal_role", "dca_price", "tv_symbol", "timeframe"):
             if body.get(key) not in (None, ""):
                 payload[key] = body.get(key)
+        tv_stop_loss = cls._optional_positive_body_float(body, "stop_loss", "sl")
+        tv_take_profit = cls._optional_positive_body_float(body, "take_profit", "tp")
+        if tv_stop_loss is not None:
+            payload["tradingview_stop_loss_price"] = tv_stop_loss
+        if tv_take_profit is not None:
+            payload["tradingview_take_profit_price"] = tv_take_profit
+        if tv_stop_loss is not None or tv_take_profit is not None:
+            payload["tradingview_price_level_unit"] = TRADINGVIEW_PRICE_LEVEL_UNIT
         return payload
+
+    @staticmethod
+    def _tradingview_route_metadata(
+        *,
+        contract: TradingViewSignalContract,
+        kind: str,
+        side: str = "",
+        role: str = "ENTRY",
+        entry_type: str = "market",
+        source_symbol: str = "",
+        mapped_symbol: str = "",
+        subscriber_bot_code: str = "",
+        allowed_strategy_codes: list[str] | None = None,
+    ) -> dict[str, Any]:
+        allowed = list(allowed_strategy_codes or [])
+        return {
+            "strategy_code": contract.strategy_code,
+            "tradingview_strategy_code": contract.strategy_code,
+            "tradingview_signal_contract": contract.as_payload(
+                subscriber_bot_code=subscriber_bot_code,
+                allowed_strategy_codes=allowed,
+            ),
+            "order_intent": order_intent_payload(
+                contract=contract,
+                kind=kind,
+                side=side,
+                role=role,
+                entry_type=entry_type,
+                source_symbol=source_symbol,
+                mapped_symbol=mapped_symbol,
+            ),
+        }
 
     @classmethod
     def _tradingview_dca_limit_requested(cls, body: dict[str, Any]) -> bool:
@@ -1173,6 +1350,22 @@ class MT5ControlPlaneService:
         return False
 
     @staticmethod
+    def _tradingview_subscriber_bot_contract(subscriber: dict[str, Any]) -> dict[str, Any]:
+        runtime_env = subscriber.get("bot_runtime_env")
+        resource_hints = subscriber.get("bot_resource_hints")
+        metadata_json = subscriber.get("bot_metadata_json")
+        return {
+            "bot_code": subscriber.get("bot_code"),
+            "runtime_env": dict(runtime_env) if isinstance(runtime_env, dict) else {},
+            "resource_hints": dict(resource_hints) if isinstance(resource_hints, dict) else {},
+            "metadata_json": dict(metadata_json) if isinstance(metadata_json, dict) else {},
+        }
+
+    @classmethod
+    def _tradingview_subscriber_accepts_webhook_runtime(cls, subscriber: dict[str, Any]) -> bool:
+        return bot_runtime_lane(cls._tradingview_subscriber_bot_contract(subscriber)) == BOT_RUNTIME_LANE_BACKEND_WEBHOOK_SIGNAL
+
+    @staticmethod
     def _validate_tradingview_order_levels(
         *,
         side: str,
@@ -1243,23 +1436,27 @@ class MT5ControlPlaneService:
             "side": side,
             "volume": volume,
             "order_contract_version": contract["contract_version"],
+            "runner_order_contract_version": RUNNER_ORDER_CONTRACT_VERSION,
             "source": "tradingview",
             "entry_type": entry_type_s,
             "order_type": order_type,
             "pending_order": entry_type_s == "limit",
-            # TradingView sends absolute chart price levels. Current Windows
-            # runners consume legacy sl/tp as price distances, so we bridge both
-            # contracts explicitly instead of forwarding ambiguous raw values.
-            "stop_loss": stop_loss,
-            "take_profit": take_profit,
-            "sl_price": stop_loss,
-            "tp_price": take_profit,
+            # TradingView sends absolute chart levels, but the live Windows
+            # runner treats all legacy SL/TP aliases as price distances.
+            # Absolute chart levels are kept only in payload metadata.
+            "stop_loss": sl_distance,
+            "take_profit": tp_distance,
+            "sl_price": sl_distance,
+            "tp_price": tp_distance,
             "sl": sl_distance,
             "tp": tp_distance,
             "sl_distance": sl_distance,
             "tp_distance": tp_distance,
-            "risk_unit": "absolute_price",
-            "distance_unit": "price_distance",
+            "risk_unit": RUNNER_SLTP_UNIT,
+            "distance_unit": RUNNER_SLTP_UNIT,
+            "sl_tp_unit": RUNNER_SLTP_UNIT,
+            "legacy_sltp_aliases_unit": RUNNER_SLTP_UNIT,
+            "legacy_sltp_aliases_are_distances": True,
             "magic": magic,
             "entry_price": entry_price,
             "alert_time_ms": contract.get("alert_time_ms"),
@@ -1838,18 +2035,19 @@ class MT5ControlPlaneService:
             limit=limit,
         )
 
-    def list_bots(self, *, force_sync: bool = False) -> list[dict[str, Any]]:
+    def list_bots(self, *, force_sync: bool = False, runtime_lane: Any = None) -> list[dict[str, Any]]:
         bots = self._loader.sync_catalog(force=force_sync)
-        return [bot for bot in bots if _is_user_visible_catalog_bot(bot)]
+        visible = [_catalog_bot_item(bot) for bot in bots if _is_user_visible_catalog_bot(bot)]
+        return _filter_bots_by_runtime_lane(visible, runtime_lane)
 
     def get_bot(self, *, bot_name: str, force_sync: bool = False) -> Optional[dict[str, Any]]:
         bot = self._loader.get_bot(bot_name, force_sync=force_sync)
         if not _is_user_visible_catalog_bot(bot):
             return None
-        return bot
+        return _catalog_bot_item(bot)
 
-    def list_mini_bots(self, *, force_sync: bool = False) -> list[dict[str, Any]]:
-        return [_mini_bot_item(bot) for bot in self.list_bots(force_sync=force_sync)]
+    def list_mini_bots(self, *, force_sync: bool = False, runtime_lane: Any = None) -> list[dict[str, Any]]:
+        return [_mini_bot_item(bot) for bot in self.list_bots(force_sync=force_sync, runtime_lane=runtime_lane)]
 
     def _assert_user_can_access_bot(self, *, bot_name: str) -> dict[str, Any]:
         bot = self._loader.get_bot(bot_name, force_sync=False)
@@ -1922,9 +2120,26 @@ class MT5ControlPlaneService:
             "blocked_slots": list(preview.get("blocked_slots") or []),
         }
 
-    def select_bot(self, *, telegram_id: str, username: Optional[str], account_id: int, bot_name: str, bot_config_overrides: dict[str, Any]) -> dict[str, Any]:
+    def select_bot(
+        self,
+        *,
+        telegram_id: str,
+        username: Optional[str],
+        account_id: int,
+        bot_name: str,
+        bot_config_overrides: dict[str, Any],
+        runtime_lane: Any = None,
+    ) -> dict[str, Any]:
         user = self.ensure_user(telegram_id=telegram_id, username=username)
         bot = self._assert_user_can_access_bot(bot_name=bot_name)
+        lane_guard_reason = bot_runtime_start_guard_reason(
+            bot,
+            settings_obj=settings,
+            requested_runtime_lane=runtime_lane,
+            require_explicit_lane=True,
+        )
+        if lane_guard_reason:
+            raise OrchestrationPolicyError(lane_guard_reason)
         account = self._repo.get_account(account_id=account_id, user_id=int(user["id"]))
         if not account:
             raise OrchestrationPolicyError("account_not_found")
@@ -1935,6 +2150,7 @@ class MT5ControlPlaneService:
             account_id=account_id,
             bot_name=bot_name,
             bot_config_overrides=effective_config,
+            requested_runtime_lane=runtime_lane,
         )
         self._store.add_audit(
             telegram_id=telegram_id,
@@ -1970,9 +2186,18 @@ class MT5ControlPlaneService:
         bot_name: str,
         bot_config_overrides: dict[str, Any],
         mode: str = "live",
+        runtime_lane: Any = None,
     ) -> dict[str, Any]:
         user = self.ensure_user(telegram_id=telegram_id, username=username)
         bot = self._assert_user_can_access_bot(bot_name=bot_name)
+        lane_guard_reason = bot_runtime_start_guard_reason(
+            bot,
+            settings_obj=settings,
+            requested_runtime_lane=runtime_lane,
+            require_explicit_lane=True,
+        )
+        if lane_guard_reason:
+            raise OrchestrationPolicyError(lane_guard_reason)
         effective_config = normalize_deployment_config(bot=bot, config=bot_config_overrides)
         account = self._repo.get_account(account_id=account_id, user_id=int(user["id"]))
         if not account:
@@ -2080,6 +2305,7 @@ class MT5ControlPlaneService:
                 bot_config_overrides=effective_config,
                 mode=normalized_mode,
                 start_payload_extra=start_payload_extra,
+                requested_runtime_lane=runtime_lane,
             )
         except Exception:
             if claimed_login_reservation:
@@ -2523,6 +2749,11 @@ class MT5ControlPlaneService:
         account_id_i = int(dep["account_id"])
         deployment_id_i = int(dep["id"])
         trace_id = f"tv_alert:{alert_id}:{kind.lower()}"
+        route_contract = resolve_signal_contract(
+            body=body,
+            signal_id=str(body.get("signal_id") or f"deployment:{deployment_id_i}"),
+            requested_bot_code=str(dep.get("bot_code") or bot_code),
+        )
 
         if kind == "PLACE_ORDER":
             side = str(meta.get("side") or body.get("side") or "").strip().lower()
@@ -2615,6 +2846,16 @@ class MT5ControlPlaneService:
                 payload: dict[str, Any] = {
                     "request": req,
                     **self._tradingview_payload_metadata(body, req),
+                    **self._tradingview_route_metadata(
+                        contract=route_contract,
+                        kind=kind,
+                        side=side,
+                        role="ENTRY",
+                        entry_type=str(req.get("entry_type") or "market"),
+                        source_symbol=source_symbol,
+                        mapped_symbol=symbol,
+                        subscriber_bot_code=str(dep.get("bot_code") or bot_code),
+                    ),
                 }
                 if symbol != source_symbol:
                     payload["source_symbol"] = source_symbol
@@ -2635,6 +2876,7 @@ class MT5ControlPlaneService:
                 "command_id": main_command_id,
                 "trace_id": trace_id,
                 "deployment_id": deployment_id_i,
+                "strategy_code": route_contract.strategy_code,
             }
             if dca_req is not None and dca_body is not None:
                 dca_trace_id = f"{trace_id}:dca_limit"
@@ -2651,6 +2893,16 @@ class MT5ControlPlaneService:
                     dca_payload: dict[str, Any] = {
                         "request": dca_req,
                         **self._tradingview_payload_metadata(dca_body, dca_req),
+                        **self._tradingview_route_metadata(
+                            contract=route_contract,
+                            kind=kind,
+                            side=side,
+                            role="DCA",
+                            entry_type=str(dca_req.get("entry_type") or "limit"),
+                            source_symbol=source_symbol,
+                            mapped_symbol=symbol,
+                            subscriber_bot_code=str(dep.get("bot_code") or bot_code),
+                        ),
                     }
                     if symbol != source_symbol:
                         dca_payload["source_symbol"] = source_symbol
@@ -2733,7 +2985,20 @@ class MT5ControlPlaneService:
             }
 
         validate_runtime_command_request(deployment=dep, allowed_statuses={"running"})
-        close_payload: dict[str, Any] = {"request": close_req}
+        close_kind_direct = str(meta.get("close_kind") or "CLOSE").strip().upper() or "CLOSE"
+        close_payload: dict[str, Any] = {
+            "request": close_req,
+            **self._tradingview_route_metadata(
+                contract=route_contract,
+                kind=kind,
+                side="",
+                role=close_kind_direct,
+                entry_type="market",
+                source_symbol=source_symbol_close,
+                mapped_symbol=symbol_close,
+                subscriber_bot_code=str(dep.get("bot_code") or bot_code),
+            ),
+        }
         if symbol_close and symbol_close != source_symbol_close:
             close_payload["source_symbol"] = source_symbol_close
             close_payload["mapped_symbol"] = symbol_close
@@ -2750,6 +3015,7 @@ class MT5ControlPlaneService:
             "command_id": cmd_c.get("command_id"),
             "trace_id": trace_id,
             "deployment_id": deployment_id_i,
+            "strategy_code": route_contract.strategy_code,
         }
 
     async def dispatch_tradingview_broadcast(
@@ -2805,6 +3071,11 @@ class MT5ControlPlaneService:
         if not signal_id:
             raise ValueError("tradingview_signal_id_required")
         requested_bot_code = str(body.get("bot_code") or body.get("bot_id") or "").strip()
+        route_contract = resolve_signal_contract(
+            body=body,
+            signal_id=signal_id,
+            requested_bot_code=requested_bot_code,
+        )
 
         action = body.get("action") or body.get("signal") or body.get("side")
         kind, meta = self._classify_tradingview_action(action)
@@ -2858,8 +3129,10 @@ class MT5ControlPlaneService:
                 "alert_id": alert_id,
                 "signal_id": signal_id,
                 "bot_code": requested_bot_code,
+                "strategy_code": route_contract.strategy_code,
                 "action": str(action),
                 "kind": kind,
+                "dry_run": dry_run,
                 "subscribers_total": 0,
                 "commands_total": 0,
                 "dispatched": 0,
@@ -2869,7 +3142,8 @@ class MT5ControlPlaneService:
                 "results": [],
             }
 
-        broadcast_id = f"tv:{alert_id}:{kind.lower()}"
+        strategy_trace = f":strategy:{route_contract.strategy_code}" if route_contract.has_explicit_strategy else ""
+        broadcast_id = f"tv:{alert_id}:{kind.lower()}{strategy_trace}"
 
         # Build N command items.
         items: list[dict[str, Any]] = []
@@ -2879,6 +3153,35 @@ class MT5ControlPlaneService:
             runner_id = str(sub["runner_id"])
             slot_id = str(sub["slot_id"])
             bot_code = str(sub.get("bot_code") or "")
+            if not self._tradingview_subscriber_accepts_webhook_runtime(sub):
+                runtime_lane = bot_runtime_lane(self._tradingview_subscriber_bot_contract(sub))
+                items.append({
+                    "_skip_dispatch": True,
+                    "_error": "tradingview_runtime_lane_mismatch",
+                    "account_id": account_id,
+                    "subscription_id": sub.get("subscription_id"),
+                    "_subscription_id": sub.get("subscription_id"),
+                    "_signal_role": "ROUTE",
+                    "_strategy_code": route_contract.strategy_code,
+                    "_runtime_lane": runtime_lane,
+                })
+                continue
+            strategy_ok, allowed_strategy_codes = subscriber_accepts_strategy(
+                contract=route_contract,
+                subscriber=sub,
+            )
+            if not strategy_ok:
+                items.append({
+                    "_skip_dispatch": True,
+                    "_error": "tradingview_strategy_mismatch",
+                    "account_id": account_id,
+                    "subscription_id": sub.get("subscription_id"),
+                    "_subscription_id": sub.get("subscription_id"),
+                    "_signal_role": "ROUTE",
+                    "_strategy_code": route_contract.strategy_code,
+                    "_allowed_strategy_codes": allowed_strategy_codes,
+                })
+                continue
 
             # Product rule: Mini App deployment lot is authoritative. Legacy
             # per-subscriber/default volumes are fallback only for old rows.
@@ -2895,6 +3198,8 @@ class MT5ControlPlaneService:
                     "account_id": account_id,
                     "subscription_id": sub.get("subscription_id"),
                     "_subscription_id": sub.get("subscription_id"),
+                    "_strategy_code": route_contract.strategy_code,
+                    "_allowed_strategy_codes": allowed_strategy_codes,
                 })
                 continue
 
@@ -2906,7 +3211,7 @@ class MT5ControlPlaneService:
             order_symbol = self._map_tradingview_symbol(symbol)
 
             if kind == "PLACE_ORDER":
-                trace_id = f"tv_bcast:{alert_id}:{account_id}:place_order"
+                trace_id = f"tv_bcast:{alert_id}:{account_id}{strategy_trace}:place_order"
                 dca_body: dict[str, Any] | None = None
                 dca_request: dict[str, Any] | None = None
                 dca_skip_error = ""
@@ -2943,6 +3248,8 @@ class MT5ControlPlaneService:
                         "account_id": account_id,
                         "subscription_id": sub.get("subscription_id"),
                         "_subscription_id": sub.get("subscription_id"),
+                        "_strategy_code": route_contract.strategy_code,
+                        "_allowed_strategy_codes": allowed_strategy_codes,
                     })
                     continue
                 cmd_type = CommandType.PLACE_ORDER
@@ -2961,6 +3268,9 @@ class MT5ControlPlaneService:
                         "_error": f"position_snapshot_lookup_failed:{exc.__class__.__name__}",
                         "account_id": account_id,
                         "subscription_id": sub.get("subscription_id"),
+                        "_subscription_id": sub.get("subscription_id"),
+                        "_strategy_code": route_contract.strategy_code,
+                        "_allowed_strategy_codes": allowed_strategy_codes,
                     })
                     continue
 
@@ -2978,6 +3288,9 @@ class MT5ControlPlaneService:
                         "subscription_id": sub.get("subscription_id"),
                         "close_kind": close_kind,
                         "symbol": order_symbol,
+                        "_subscription_id": sub.get("subscription_id"),
+                        "_strategy_code": route_contract.strategy_code,
+                        "_allowed_strategy_codes": allowed_strategy_codes,
                     })
                     continue
 
@@ -2995,6 +3308,7 @@ class MT5ControlPlaneService:
                         "broadcast_signal_id": signal_id,
                         "broadcast_alert_id": alert_id,
                         "broadcast_bot_code": requested_bot_code,
+                        "broadcast_strategy_code": route_contract.strategy_code,
                         "broadcast_source_symbol": symbol,
                         "broadcast_mapped_symbol": order_symbol,
                         "broadcast_position_key": position.position_key,
@@ -3002,6 +3316,17 @@ class MT5ControlPlaneService:
                         "position_snapshot_at": position.row.get("snapshot_at"),
                         "position_side": position.row.get("side"),
                         "position_volume": position.volume,
+                        **self._tradingview_route_metadata(
+                            contract=route_contract,
+                            kind=kind,
+                            side=str(position.row.get("side") or ""),
+                            role="CLOSE",
+                            entry_type="market",
+                            source_symbol=symbol,
+                            mapped_symbol=order_symbol,
+                            subscriber_bot_code=bot_code,
+                            allowed_strategy_codes=allowed_strategy_codes,
+                        ),
                     }
                     for key in ("signal_role", "dca_price", "tv_symbol", "timeframe"):
                         if body.get(key) not in (None, ""):
@@ -3015,11 +3340,13 @@ class MT5ControlPlaneService:
                         "runner_id": runner_id,
                         "slot_id": slot_id,
                         "priority": int(sub.get("subscription_priority") or 60),
-                        "trace_id": f"tv_bcast:{alert_id}:{account_id}:close_order:{position.ticket}",
+                        "trace_id": f"tv_bcast:{alert_id}:{account_id}{strategy_trace}:close_order:{position.ticket}",
                         "payload": payload,
                         "_subscription_id": sub.get("subscription_id"),
                         "_position_ticket": position.ticket,
                         "_position_key": position.position_key,
+                        "_strategy_code": route_contract.strategy_code,
+                        "_allowed_strategy_codes": allowed_strategy_codes,
                     })
                 continue
 
@@ -3028,9 +3355,21 @@ class MT5ControlPlaneService:
                 "broadcast_signal_id": signal_id,
                 "broadcast_alert_id": alert_id,
                 "broadcast_bot_code": requested_bot_code,
+                "broadcast_strategy_code": route_contract.strategy_code,
                 "broadcast_source_symbol": symbol,
                 "broadcast_mapped_symbol": order_symbol,
                 **self._tradingview_payload_metadata(body, request),
+                **self._tradingview_route_metadata(
+                    contract=route_contract,
+                    kind=kind,
+                    side=side,
+                    role="ENTRY",
+                    entry_type=str(request.get("entry_type") or "market"),
+                    source_symbol=symbol,
+                    mapped_symbol=order_symbol,
+                    subscriber_bot_code=bot_code,
+                    allowed_strategy_codes=allowed_strategy_codes,
+                ),
             }
 
             items.append({
@@ -3045,6 +3384,8 @@ class MT5ControlPlaneService:
                 "payload": payload,
                 "_subscription_id": sub.get("subscription_id"),
                 "_signal_role": "ENTRY",
+                "_strategy_code": route_contract.strategy_code,
+                "_allowed_strategy_codes": allowed_strategy_codes,
             })
 
             if kind == "PLACE_ORDER" and dca_skip_error:
@@ -3055,6 +3396,8 @@ class MT5ControlPlaneService:
                     "subscription_id": sub.get("subscription_id"),
                     "_subscription_id": sub.get("subscription_id"),
                     "_signal_role": "DCA",
+                    "_strategy_code": route_contract.strategy_code,
+                    "_allowed_strategy_codes": allowed_strategy_codes,
                 })
 
             if dca_request is not None and dca_body is not None:
@@ -3063,9 +3406,21 @@ class MT5ControlPlaneService:
                     "broadcast_signal_id": signal_id,
                     "broadcast_alert_id": alert_id,
                     "broadcast_bot_code": requested_bot_code,
+                    "broadcast_strategy_code": route_contract.strategy_code,
                     "broadcast_source_symbol": symbol,
                     "broadcast_mapped_symbol": order_symbol,
                     **self._tradingview_payload_metadata(dca_body, dca_request),
+                    **self._tradingview_route_metadata(
+                        contract=route_contract,
+                        kind=kind,
+                        side=side,
+                        role="DCA",
+                        entry_type=str(dca_request.get("entry_type") or "limit"),
+                        source_symbol=symbol,
+                        mapped_symbol=order_symbol,
+                        subscriber_bot_code=bot_code,
+                        allowed_strategy_codes=allowed_strategy_codes,
+                    ),
                 }
                 items.append({
                     "command_type": cmd_type,
@@ -3079,6 +3434,8 @@ class MT5ControlPlaneService:
                     "payload": dca_payload,
                     "_subscription_id": sub.get("subscription_id"),
                     "_signal_role": "DCA",
+                    "_strategy_code": route_contract.strategy_code,
+                    "_allowed_strategy_codes": allowed_strategy_codes,
                 })
 
         # Fan-out batch dispatch
@@ -3099,6 +3456,12 @@ class MT5ControlPlaneService:
                 }
                 if item.get("_signal_role"):
                     entry["signal_role"] = item.get("_signal_role")
+                if item.get("_strategy_code"):
+                    entry["strategy_code"] = item.get("_strategy_code")
+                if item.get("_allowed_strategy_codes"):
+                    entry["allowed_strategy_codes"] = item.get("_allowed_strategy_codes")
+                if item.get("_runtime_lane"):
+                    entry["runtime_lane"] = item.get("_runtime_lane")
                 if item.get("_invalid_volume"):
                     entry["error"] = "no_volume_resolved"
                     dry_failed += 1
@@ -3112,6 +3475,7 @@ class MT5ControlPlaneService:
                 "alert_id": alert_id,
                 "signal_id": signal_id,
                 "bot_code": requested_bot_code,
+                "strategy_code": route_contract.strategy_code,
                 "action": str(action),
                 "kind": kind,
                 "dry_run": True,
@@ -3133,7 +3497,12 @@ class MT5ControlPlaneService:
             account_id = item.get("account_id")
             sub_id = item.get("_subscription_id")
             if item.get("_invalid_volume"):
-                merged.append({"account_id": account_id, "subscription_id": sub_id, "ok": False, "error": "no_volume_resolved"})
+                entry = {"account_id": account_id, "subscription_id": sub_id, "ok": False, "error": "no_volume_resolved"}
+                if item.get("_strategy_code"):
+                    entry["strategy_code"] = item.get("_strategy_code")
+                if item.get("_allowed_strategy_codes"):
+                    entry["allowed_strategy_codes"] = item.get("_allowed_strategy_codes")
+                merged.append(entry)
                 failed += 1
                 continue
             if item.get("_skip_dispatch"):
@@ -3145,6 +3514,12 @@ class MT5ControlPlaneService:
                 }
                 if item.get("_signal_role"):
                     entry["signal_role"] = item.get("_signal_role")
+                if item.get("_strategy_code"):
+                    entry["strategy_code"] = item.get("_strategy_code")
+                if item.get("_allowed_strategy_codes"):
+                    entry["allowed_strategy_codes"] = item.get("_allowed_strategy_codes")
+                if item.get("_runtime_lane"):
+                    entry["runtime_lane"] = item.get("_runtime_lane")
                 if item.get("close_kind"):
                     entry["close_kind"] = item.get("close_kind")
                 if item.get("symbol"):
@@ -3157,6 +3532,10 @@ class MT5ControlPlaneService:
             entry = {"account_id": account_id, "subscription_id": sub_id, "ok": bool(r.get("ok"))}
             if item.get("_signal_role"):
                 entry["signal_role"] = item.get("_signal_role")
+            if item.get("_strategy_code"):
+                entry["strategy_code"] = item.get("_strategy_code")
+            if item.get("_allowed_strategy_codes"):
+                entry["allowed_strategy_codes"] = item.get("_allowed_strategy_codes")
             if item.get("_position_ticket"):
                 entry["position_ticket"] = item.get("_position_ticket")
             if item.get("_position_key"):
@@ -3178,6 +3557,7 @@ class MT5ControlPlaneService:
             "alert_id": alert_id,
             "signal_id": signal_id,
             "bot_code": requested_bot_code,
+            "strategy_code": route_contract.strategy_code,
             "action": str(action),
             "kind": kind,
             "subscribers_total": len(subscribers),
@@ -3312,6 +3692,7 @@ class MT5ControlPlaneService:
             if (definition := _runner_bot_definition(runner_id=runner_id_s, source=source, raw=item)) is not None
             and not is_disabled_mt5_bot_catalog_entry(definition)
         ]
+        definitions = _dedupe_catalog_definitions_by_runtime_lane(definitions)
         try:
             if hasattr(self._repo, "retire_bot_catalog_entries"):
                 self._repo.retire_bot_catalog_entries(bot_identities=disabled_mt5_bot_identities())
@@ -3325,7 +3706,33 @@ class MT5ControlPlaneService:
                     existing = self._repo.get_bot_by_name(
                         bot_name=str(definition.get("bot_code") or definition.get("bot_id") or definition.get("bot_name") or "")
                     )
-                    if _catalog_entry_is_linux_authoritative(existing):
+                    existing_lane = bot_runtime_lane(existing) if existing else ""
+                    incoming_lane = bot_runtime_lane(definition)
+                    if existing and existing_lane != incoming_lane:
+                        if _catalog_entry_is_linux_authoritative(existing):
+                            log.warning(
+                                "catalog_lane_collision_preserve_authoritative bot_code=%s existing_lane=%s incoming_lane=%s runner_id=%s",
+                                _catalog_identity_key(definition),
+                                existing_lane,
+                                incoming_lane,
+                                runner_id_s,
+                            )
+                            definition = _preserve_authoritative_catalog_definition(
+                                existing=existing or {},
+                                runner_definition=definition,
+                                runner_id=runner_id_s,
+                                source=source,
+                            )
+                        elif _catalog_lane_priority(existing) <= _catalog_lane_priority(definition):
+                            log.warning(
+                                "catalog_lane_collision_skip bot_code=%s existing_lane=%s incoming_lane=%s runner_id=%s",
+                                _catalog_identity_key(definition),
+                                existing_lane,
+                                incoming_lane,
+                                runner_id_s,
+                            )
+                            continue
+                    elif _catalog_entry_is_linux_authoritative(existing):
                         definition = _preserve_authoritative_catalog_definition(
                             existing=existing or {},
                             runner_definition=definition,
@@ -3412,10 +3819,12 @@ class MT5ControlPlaneService:
         error_text: Optional[str],
         payload: dict[str, Any],
     ) -> dict[str, Any]:
+        delivery_status_s = str(delivery_status or "").strip().lower()
+        error_for_status = None if delivery_status_s == "acknowledged" else error_text
         result = self._repo.update_execution_command_delivery(
             command_id=command_id,
-            status=delivery_status,
-            error_text=error_text,
+            status=delivery_status_s or delivery_status,
+            error_text=error_for_status,
             payload=payload,
         )
         if not result:

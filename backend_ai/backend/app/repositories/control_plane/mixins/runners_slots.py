@@ -51,6 +51,12 @@ _STALE_SLOT_ACCOUNT_METADATA_KEYS = (
     "sticky_account_id",
 )
 
+_STALE_SLOT_CAP_METADATA_KEYS = (
+    "disabled_by_node_slot_cap",
+    "node_slot_cap",
+    "disabled_reason",
+)
+
 
 def _drop_stale_slot_account_metadata(payload: Optional[dict[str, Any]]) -> dict[str, Any]:
     metadata = dict(payload or {})
@@ -65,13 +71,26 @@ def _drop_stale_slot_account_metadata(payload: Optional[dict[str, Any]]) -> dict
     return metadata
 
 
+def _drop_stale_slot_cap_metadata(payload: Optional[dict[str, Any]]) -> dict[str, Any]:
+    metadata = dict(payload or {})
+    for key in _STALE_SLOT_CAP_METADATA_KEYS:
+        metadata.pop(key, None)
+    inventory = metadata.get("slot_inventory_entry")
+    if isinstance(inventory, dict):
+        clean_inventory = dict(inventory)
+        for key in _STALE_SLOT_CAP_METADATA_KEYS:
+            clean_inventory.pop(key, None)
+        metadata["slot_inventory_entry"] = clean_inventory
+    return metadata
+
+
 def _slot_cap_disabled_metadata(extra: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    metadata = _drop_stale_slot_account_metadata(extra)
+    metadata = _drop_stale_slot_cap_metadata(_drop_stale_slot_account_metadata(extra))
     metadata.update(
         {
             "disabled_by_node_slot_cap": True,
             "node_slot_cap": RUNNER_NODE_SLOT_LIMIT_DEFAULT,
-            "disabled_reason": "node_slot_cap_10",
+            "disabled_reason": f"node_slot_cap_{RUNNER_NODE_SLOT_LIMIT_DEFAULT}",
             "available_for_new_account": False,
             "control_plane_state": "disabled",
             "current_control_plane_state": "disabled",
@@ -271,6 +290,8 @@ class ControlPlaneRunnersSlotsMixin:
                 if slot_over_cap:
                     slot_status = "disabled"
                     slot_metadata = _slot_cap_disabled_metadata(slot_metadata)
+                else:
+                    slot_metadata = _drop_stale_slot_cap_metadata(slot_metadata)
                 cur.execute(
                     self._SQL_SELECT_RUNNER_SLOT_METADATA_FOR_UPDATE,
                     (runner_id_s, slot_id),
@@ -340,7 +361,7 @@ class ControlPlaneRunnersSlotsMixin:
                         || jsonb_build_object(
                             'disabled_by_node_slot_cap', TRUE,
                             'node_slot_cap', %s,
-                            'disabled_reason', 'node_slot_cap_10',
+                            'disabled_reason', %s,
                             'available_for_new_account', FALSE,
                             'control_plane_state', 'disabled',
                             'current_control_plane_state', 'disabled'
@@ -351,7 +372,12 @@ class ControlPlaneRunnersSlotsMixin:
                   AND COALESCE(NULLIF(SUBSTRING(slot_id FROM '([0-9]+)$'), ''), '') <> ''
                   AND CAST(SUBSTRING(slot_id FROM '([0-9]+)$') AS INTEGER) > %s
                 """,
-                (RUNNER_NODE_SLOT_LIMIT_DEFAULT, runner_id_s, max_slots_i),
+                (
+                    RUNNER_NODE_SLOT_LIMIT_DEFAULT,
+                    f"node_slot_cap_{RUNNER_NODE_SLOT_LIMIT_DEFAULT}",
+                    runner_id_s,
+                    max_slots_i,
+                ),
             )
 
             return runner
@@ -406,6 +432,7 @@ class ControlPlaneRunnersSlotsMixin:
                     "login_slot_account_id",
                     "reserved_account_id",
                     "sticky_account_id",
+                    *_STALE_SLOT_CAP_METADATA_KEYS,
                 ):
                     incoming_metadata.pop(stale_key, None)
                 incoming_inventory_entry = dict(entry)
@@ -420,6 +447,7 @@ class ControlPlaneRunnersSlotsMixin:
                     "login_slot_account_id",
                     "reserved_account_id",
                     "sticky_account_id",
+                    *_STALE_SLOT_CAP_METADATA_KEYS,
                 ):
                     incoming_inventory_entry.pop(stale_key, None)
                 incoming_metadata["slot_inventory_entry"] = incoming_inventory_entry
@@ -828,7 +856,7 @@ class ControlPlaneRunnersSlotsMixin:
                     WHERE rs.runner_id = n.runner_id
                       AND (
                           COALESCE(NULLIF(SUBSTRING(rs.slot_id FROM '([0-9]+)$'), ''), '') = ''
-                          OR CAST(SUBSTRING(rs.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(10, GREATEST(1, n.max_slots))
+                          OR CAST(SUBSTRING(rs.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(12, GREATEST(1, n.max_slots))
                       )
                 ) slot_stats ON TRUE
                 LEFT JOIN LATERAL (
@@ -857,7 +885,7 @@ class ControlPlaneRunnersSlotsMixin:
                  AND b.binding_state = 'active'
                 WHERE (
                     COALESCE(NULLIF(SUBSTRING(s.slot_id FROM '([0-9]+)$'), ''), '') = ''
-                    OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(10, GREATEST(1, n.max_slots))
+                    OR CAST(SUBSTRING(s.slot_id FROM '([0-9]+)$') AS INTEGER) <= LEAST(12, GREATEST(1, n.max_slots))
                 )
                 ORDER BY s.runner_id ASC, s.slot_id ASC
                 """
@@ -1648,6 +1676,15 @@ class ControlPlaneRunnersSlotsMixin:
         if force_slot_cap_disabled:
             status_s = "disabled"
             metadata_payload = _slot_cap_disabled_metadata(metadata_payload)
+        else:
+            metadata_payload = _drop_stale_slot_cap_metadata(metadata_payload)
+            if status_s == "allocated":
+                metadata_payload["available_for_new_account"] = False
+                metadata_payload["control_plane_state"] = "allocated"
+                metadata_payload["current_control_plane_state"] = "allocated"
+            elif status_s == "ready":
+                metadata_payload["control_plane_state"] = "ready"
+                metadata_payload["current_control_plane_state"] = "ready"
         metadata_json = _json_payload(metadata_payload)
 
         def _do(con: Any, cur: Any) -> None:
@@ -1695,6 +1732,9 @@ class ControlPlaneRunnersSlotsMixin:
                                         - 'login_slot_account_id'
                                         - 'reserved_account_id'
                                         - 'sticky_account_id'
+                                        - 'disabled_by_node_slot_cap'
+                                        - 'node_slot_cap'
+                                        - 'disabled_reason'
                                         - 'current_control_plane_state'
                                         - 'previous_control_plane_state'
                                 ) || CASE
@@ -1711,6 +1751,9 @@ class ControlPlaneRunnersSlotsMixin:
                                                 - 'login_slot_account_id'
                                                 - 'reserved_account_id'
                                                 - 'sticky_account_id'
+                                                - 'disabled_by_node_slot_cap'
+                                                - 'node_slot_cap'
+                                                - 'disabled_reason'
                                         )
                                      END || jsonb_build_object(
                                         'control_plane_state', 'ready',

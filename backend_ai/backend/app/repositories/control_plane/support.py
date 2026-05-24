@@ -12,7 +12,7 @@ from uuid import UUID
 
 from app.models.control_plane import ACTIVE_DEPLOYMENT_STATUSES
 
-RUNNER_NODE_SLOT_LIMIT_DEFAULT = 10
+RUNNER_NODE_SLOT_LIMIT_DEFAULT = 12
 RUNNER_ACTIVE_LIMIT_DEFAULT = RUNNER_NODE_SLOT_LIMIT_DEFAULT
 RUNNER_MIN_HEALTHY_SLOTS_DEFAULT = RUNNER_NODE_SLOT_LIMIT_DEFAULT
 
@@ -853,13 +853,13 @@ def _normalize_runner_slot_projection_status(value: Any) -> str:
 def _slot_inventory_projection_status(entry: dict[str, Any]) -> str | None:
     """Normalize a runner heartbeat slot_inventory entry into DB slot status."""
     for key in (
-        "current_control_plane_state",
-        "control_plane_state",
-        "new_state",
-        "slot_state",
         "runner_state",
         "current_runner_state",
         "current_state",
+        "slot_state",
+        "new_state",
+        "current_control_plane_state",
+        "control_plane_state",
     ):
         raw = _norm(entry.get(key)).lower()
         if not raw:

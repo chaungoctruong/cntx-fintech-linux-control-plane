@@ -23,7 +23,7 @@ def _slot(*, runner_id: str, runner_status: str, broker: str) -> dict:
         "runner_status": runner_status,
         "runner_last_heartbeat_at": datetime.now(timezone.utc),
         "last_heartbeat_at": datetime.now(timezone.utc),
-        "max_slots": 10,
+        "max_slots": 12,
         "allowed_profile_classes": [],
         "supported_profiles": [],
         "capability_tags": [],

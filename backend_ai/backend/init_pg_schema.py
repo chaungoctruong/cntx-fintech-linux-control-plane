@@ -846,15 +846,15 @@ def init_postgres_schema():
             BEGIN
                 IF COALESCE(NULLIF(SUBSTRING(NEW.slot_id FROM '([0-9]+)$'), ''), '') <> '' THEN
                     slot_number := CAST(SUBSTRING(NEW.slot_id FROM '([0-9]+)$') AS INTEGER);
-                    IF slot_number > 10 THEN
+                    IF slot_number > 12 THEN
                         NEW.status := 'disabled';
                         NEW.current_account_id := NULL;
                         NEW.metadata_json := jsonb_strip_nulls(
                             COALESCE(NEW.metadata_json, '{}'::jsonb)
                             || jsonb_build_object(
                                 'disabled_by_node_slot_cap', TRUE,
-                                'node_slot_cap', 10,
-                                'disabled_reason', 'node_slot_cap_10',
+                                'node_slot_cap', 12,
+                                'disabled_reason', 'node_slot_cap_12',
                                 'available_for_new_account', FALSE,
                                 'control_plane_state', 'disabled',
                                 'current_control_plane_state', 'disabled'
@@ -957,6 +957,17 @@ def init_postgres_schema():
                 config_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                 health_status TEXT NULL,
                 last_error TEXT NULL,
+                last_runner_recovery_reason TEXT NULL,
+                last_runner_recovery_at TIMESTAMPTZ NULL,
+                runner_recovery_first_seen_at TIMESTAMPTZ NULL,
+                runner_recovery_last_seen_at TIMESTAMPTZ NULL,
+                runner_recovery_attempt_count INTEGER NOT NULL DEFAULT 0,
+                runner_recovery_window_started_at TIMESTAMPTZ NULL,
+                runner_recovery_cooldown_until TIMESTAMPTZ NULL,
+                runner_recovery_in_flight BOOLEAN NOT NULL DEFAULT FALSE,
+                runner_recovery_in_flight_since TIMESTAMPTZ NULL,
+                runner_recovery_last_command_id TEXT NULL,
+                runner_recovery_last_command_at TIMESTAMPTZ NULL,
                 trace_id TEXT NULL,
                 started_at TIMESTAMPTZ NULL,
                 stopped_at TIMESTAMPTZ NULL,
@@ -973,6 +984,20 @@ def init_postgres_schema():
         cur.execute(
             "ALTER TABLE bot_deployments ADD COLUMN IF NOT EXISTS intent_seq INTEGER NOT NULL DEFAULT 0;"
         )
+        cur.execute("""
+            ALTER TABLE bot_deployments
+                ADD COLUMN IF NOT EXISTS last_runner_recovery_reason TEXT NULL,
+                ADD COLUMN IF NOT EXISTS last_runner_recovery_at TIMESTAMPTZ NULL,
+                ADD COLUMN IF NOT EXISTS runner_recovery_first_seen_at TIMESTAMPTZ NULL,
+                ADD COLUMN IF NOT EXISTS runner_recovery_last_seen_at TIMESTAMPTZ NULL,
+                ADD COLUMN IF NOT EXISTS runner_recovery_attempt_count INTEGER NOT NULL DEFAULT 0,
+                ADD COLUMN IF NOT EXISTS runner_recovery_window_started_at TIMESTAMPTZ NULL,
+                ADD COLUMN IF NOT EXISTS runner_recovery_cooldown_until TIMESTAMPTZ NULL,
+                ADD COLUMN IF NOT EXISTS runner_recovery_in_flight BOOLEAN NOT NULL DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS runner_recovery_in_flight_since TIMESTAMPTZ NULL,
+                ADD COLUMN IF NOT EXISTS runner_recovery_last_command_id TEXT NULL,
+                ADD COLUMN IF NOT EXISTS runner_recovery_last_command_at TIMESTAMPTZ NULL;
+        """)
         cur.execute("""
             DO $$
             BEGIN

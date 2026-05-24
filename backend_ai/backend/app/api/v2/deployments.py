@@ -98,6 +98,7 @@ async def start_deployment(
             bot_name=payload.bot_name,
             bot_config_overrides=payload.merged_bot_config_overrides(),
             mode=payload.mode,
+            runtime_lane=payload.runtime_lane,
         )
     except Exception as exc:
         http_exc = translate_control_plane_error(exc)

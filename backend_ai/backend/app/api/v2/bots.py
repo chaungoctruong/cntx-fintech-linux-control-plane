@@ -12,6 +12,7 @@ router = APIRouter(prefix="/bots", tags=["mt5-bots"])
 @router.get("")
 async def list_bots(
     force_sync: bool = Query(default=False),
+    runtime_lane: str = Query(default="backend_webhook_signal"),
     service: MT5ControlPlaneService = Depends(service_dep),
 ) -> dict:
     """Tra ve catalog bot day du de FE render rich card.
@@ -27,7 +28,12 @@ async def list_bots(
       - default_config_path, runtime_entry, runtime_env (chu yeu cho debugging)
       - checksum, source_path (de hien version + signature trust)
     """
-    return {"items": service.list_bots(force_sync=force_sync)}
+    items = service.list_bots(force_sync=force_sync, runtime_lane=runtime_lane)
+    return {
+        "items": items,
+        "runtime_lane": runtime_lane,
+        "lanes": sorted({str(item.get("runtime_lane") or "unknown") for item in items}),
+    }
 
 
 @router.get("/{bot_name}")
@@ -56,6 +62,7 @@ async def select_bot(
             account_id=payload.account_id,
             bot_name=payload.bot_name,
             bot_config_overrides=payload.merged_bot_config_overrides(),
+            runtime_lane=payload.runtime_lane,
         )
     except Exception as exc:
         raise translate_control_plane_error(exc) from exc

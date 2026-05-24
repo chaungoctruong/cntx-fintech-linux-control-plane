@@ -242,11 +242,12 @@ async def miniapp_bot_token_claim(
 @mini_router.get("/bots")
 async def mini_bots(
     force_sync: bool = False,
+    runtime_lane: str = "backend_webhook_signal",
     user: dict = Depends(user_dep),
     service: MT5ControlPlaneService = Depends(service_dep),
 ) -> list[dict]:
     del user
-    return service.list_mini_bots(force_sync=force_sync)
+    return service.list_mini_bots(force_sync=force_sync, runtime_lane=runtime_lane)
 
 
 def _ctrader_tenant_user_id(user: dict) -> str:
