@@ -6,6 +6,7 @@ import html
 import json
 import logging
 import math
+import socket
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -44,6 +46,7 @@ from .token_service import TokenService
 
 
 log = logging.getLogger("token-bot.tg")
+_ORIGINAL_GETADDRINFO = socket.getaddrinfo
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -285,6 +288,22 @@ def _json_list(value) -> list:
             return []
         return parsed if isinstance(parsed, list) else []
     return []
+
+
+def _install_telegram_ipv4_preference() -> None:
+    """Prefer IPv4 for Telegram API when the host has broken IPv6 routing."""
+
+    if getattr(socket, "_cntx_telegram_ipv4_first", False):
+        return
+
+    def _getaddrinfo_ipv4_first(host, port, family=0, type=0, proto=0, flags=0):
+        infos = _ORIGINAL_GETADDRINFO(host, port, family, type, proto, flags)
+        if str(host or "").lower() == "api.telegram.org":
+            infos = sorted(infos, key=lambda item: 0 if item[0] == socket.AF_INET else 1)
+        return infos
+
+    socket.getaddrinfo = _getaddrinfo_ipv4_first
+    socket._cntx_telegram_ipv4_first = True  # type: ignore[attr-defined]
 
 
 async def _safe_edit_message_text(q, *args, **kwargs):
@@ -4285,7 +4304,32 @@ def build_application(settings: Settings) -> Application:
     else:
         log.warning("backend_client disabled — lock/revoke không tự dừng bot")
 
-    app = Application.builder().token(settings.telegram_bot_token).post_init(_post_init).build()
+    if settings.telegram_force_ipv4:
+        _install_telegram_ipv4_preference()
+        log.info("telegram_request_ipv4_preference enabled")
+
+    request = HTTPXRequest(
+        connection_pool_size=max(4, int(settings.telegram_connection_pool_size or 32)),
+        connect_timeout=float(settings.telegram_connect_timeout_sec or 15.0),
+        read_timeout=float(settings.telegram_read_timeout_sec or 25.0),
+        write_timeout=float(settings.telegram_write_timeout_sec or 25.0),
+        pool_timeout=float(settings.telegram_pool_timeout_sec or 10.0),
+    )
+    get_updates_request = HTTPXRequest(
+        connection_pool_size=4,
+        connect_timeout=float(settings.telegram_connect_timeout_sec or 15.0),
+        read_timeout=float(settings.telegram_get_updates_read_timeout_sec or 35.0),
+        write_timeout=float(settings.telegram_write_timeout_sec or 25.0),
+        pool_timeout=float(settings.telegram_pool_timeout_sec or 10.0),
+    )
+    app = (
+        Application.builder()
+        .token(settings.telegram_bot_token)
+        .request(request)
+        .get_updates_request(get_updates_request)
+        .post_init(_post_init)
+        .build()
+    )
     app.bot_data["settings"] = settings
     app.bot_data["session_factory"] = sf
     app.bot_data["registry"] = registry

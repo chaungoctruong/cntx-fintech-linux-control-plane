@@ -33,6 +33,13 @@ class Settings(BaseSettings):
 
     telegram_bot_token: Optional[str] = None
     tg_admin_user_ids: str = ""
+    telegram_force_ipv4: bool = True
+    telegram_connect_timeout_sec: float = 15.0
+    telegram_read_timeout_sec: float = 25.0
+    telegram_write_timeout_sec: float = 25.0
+    telegram_pool_timeout_sec: float = 10.0
+    telegram_get_updates_read_timeout_sec: float = 35.0
+    telegram_connection_pool_size: int = 32
 
     redis_url: Optional[str] = None
     redis_state_grace_sec: int = 7 * 86400
