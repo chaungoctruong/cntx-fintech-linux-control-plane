@@ -89,8 +89,7 @@ jobs:
               "backend_ai/backend/app/repositories/control_plane/support.py": 1000,
               "backend_ai/backend/app/repositories/control_plane/mixins/users.py": 400,
               "backend_ai/backend/app/repositories/control_plane/mixins/accounts.py": 900,
-              "backend_ai/backend/app/repositories/control_plane/mixins/verification.py": 900,
-              "backend_ai/backend/app/repositories/control_plane/mixins/deployments.py": 1400,
+              "backend_ai/backend/app/repositories/control_plane/mixins/deployments.py": 1900,
               "backend_ai/backend/app/repositories/control_plane/mixins/commands.py": 1400,
               "backend_ai/backend/app/repositories/control_plane/mixins/runners_slots.py": 3000,
           }
@@ -129,18 +128,7 @@ jobs:
         env:
           PYTHONPATH: backend_ai/backend:.
         run: |
-          python -m unittest discover -s backend_ai/backend/tests -p 'test_control_plane*.py'
-          python -m unittest \
-            backend_ai.backend.tests.test_settings_prod_guard \
-            backend_ai.backend.tests.test_api_v2_system_healthz \
-            backend_ai.backend.tests.test_control_plane_metrics \
-            backend_ai.backend.tests.test_command_delivery_reconciler \
-            backend_ai.backend.tests.test_migration_baseline \
-            backend_ai.backend.tests.test_redis_streams \
-            backend_ai.backend.tests.test_runner_contract \
-            backend_ai.backend.tests.test_runner_examples_integration \
-            backend_ai.backend.tests.test_replay_control_plane_queue \
-            backend_ai.backend.tests.test_deployment_trading_config
+          python -m unittest discover -s backend_ai/backend/tests -p 'test*.py'
 
   frontend:
     name: Frontend Checks

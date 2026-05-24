@@ -90,7 +90,7 @@ X-Backend-Api-Key: <BACKEND_API_KEY>
 
 ```powershell
 $Backend = "http://<TEST_BACKEND_HOST>:8001"
-$ApiKey = "<copy_BACKEND_API_KEY_from_backend_env>"
+$ApiKey = $env:BACKEND_API_KEY
 $Headers = @{ "X-Backend-Api-Key" = $ApiKey }
 
 curl.exe "$Backend/health"
@@ -111,7 +111,7 @@ Nếu `bootstrap` trả `401 invalid_backend_api_key`: khóa trên Windows **kh�
 
 ```powershell
 $Backend = "http://<TEST_BACKEND_HOST>:8001"
-$ApiKey = "<copy_BACKEND_API_KEY_from_backend_env>"
+$ApiKey = $env:BACKEND_API_KEY
 $Headers = @{
   "X-Backend-Api-Key" = $ApiKey
   "Content-Type" = "application/json"
