@@ -78,4 +78,3 @@ class SignalWorker:
             self.notifier.send(message)
         except Exception as exc:
             self.logger.warning("telegram_notify_failed error=%s", exc)
-

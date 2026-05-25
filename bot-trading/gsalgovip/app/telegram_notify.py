@@ -26,4 +26,3 @@ class TelegramNotifier:
         )
         with urllib.request.urlopen(req, timeout=10):
             return
-

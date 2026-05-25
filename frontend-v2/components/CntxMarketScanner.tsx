@@ -25,8 +25,8 @@ type CandlePulse = {
 };
 
 const SYMBOL_POOL = [
-  "BTC", "ETH", "XAU", "SOL", "EUR", "USD", "JPY", "GBP", "XRP", "DOGE", "PEPE", "NVDA", 
-  "TSLA", "AAPL", "NAS100", "US30", "GOLD", "OIL", "BNB", "ADA", "DOT", "LINK", "MATIC", 
+  "BTC", "ETH", "XAU", "SOL", "EUR", "USD", "JPY", "GBP", "XRP", "DOGE", "PEPE", "NVDA",
+  "TSLA", "AAPL", "NAS100", "US30", "GOLD", "OIL", "BNB", "ADA", "DOT", "LINK", "MATIC",
   "AVAX", "OP", "ARB", "LTC", "SHIB", "NEAR", "FTM"
 ];
 
@@ -86,7 +86,7 @@ export default function CntxMarketScanner() {
   return (
     <div className="sms__container dark-trading-vibe">
       <div className="sms__scanline" />
-      
+
       <div className="sms__atmosphere" aria-hidden="true">
         <div className="sms__storm-cloud sms__storm-cloud--primary" />
         <div className="sms__fog sms__fog--left" />

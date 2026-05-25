@@ -79,4 +79,3 @@ def build_router(store: StateStore, webhook_secret: str) -> APIRouter:
         return {"status": "accepted", "signal_id": signal_id}
 
     return router
-

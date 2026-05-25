@@ -328,4 +328,3 @@ Cần user duyệt từng phase. Thứ tự đề xuất:
 - [ ] P6 (subscribe endpoint generic) — sau P2 + P5
 - [ ] P8 (e2e smoke harness) — sau tất cả phía trên
 - [ ] P9 (deprecation policy generic) — sau P8 ổn định ≥1 tuần
-

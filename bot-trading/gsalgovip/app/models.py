@@ -71,4 +71,3 @@ class ExecutionResult:
     def with_created_at(self) -> "ExecutionResult":
         self.created_at = self.created_at or utc_now_iso()
         return self
-

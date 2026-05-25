@@ -153,7 +153,7 @@ def _create_control_plane_scale_indexes(cur, *, concurrently: bool = False) -> N
 def init_postgres_schema():
     tracker = _SchemaBootstrapLog()
     tracker.connection()
-    
+
     try:
         conn = psycopg2.connect(
             user=settings.POSTGRES_USER,
@@ -1274,7 +1274,7 @@ def init_postgres_schema():
         """)
 
         tracker.success()
-        
+
         cur.close()
         conn.close()
 

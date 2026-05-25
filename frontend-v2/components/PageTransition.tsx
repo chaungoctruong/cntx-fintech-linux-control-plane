@@ -19,10 +19,10 @@ export default function PageTransition({ children }: { children: React.ReactNode
 
   const prevIdx = routeIndex(prevPathRef.current);
   const currIdx = routeIndex(pathname);
-  
+
   // 1 = next, -1 = prev, 0 = same/unknown
   const direction = currIdx > prevIdx ? 1 : currIdx < prevIdx ? -1 : 0;
-  
+
   if (prevPathRef.current !== pathname) {
     prevPathRef.current = pathname;
   }

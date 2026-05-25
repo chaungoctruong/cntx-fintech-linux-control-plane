@@ -3,7 +3,7 @@
 const bool DEBUG = false
 const int maxDistanceToLastBar = 4900 // Affects Running Time
 const int atrLen = 5
-const bool maxTPLastHour = false 
+const bool maxTPLastHour = false
 
 var initRun = true
 
@@ -13,11 +13,11 @@ indicator("Gsalarm", overlay = true, max_boxes_count = 500, max_labels_count = 5
 
 mau_do = color.rgb(255, 0, 0)
 mau_do_dam = color.rgb(206, 48, 48)
-mau_xanh_la = color.rgb(0, 255, 0) 
+mau_xanh_la = color.rgb(0, 255, 0)
 mau_xanh_la_dam = color.rgb(31, 136, 34)
 mau_xanh_duong = color.rgb(65, 62, 202)
-mau_xanh_duong_nhat = color.rgb(73, 167, 255) 
-mau_vang = color.rgb(255, 205, 69) 
+mau_xanh_duong_nhat = color.rgb(73, 167, 255)
+mau_vang = color.rgb(255, 205, 69)
 mau_den = color.rgb(0, 0, 0)
 mau_cam = color.rgb(255, 166, 0)
 mau_hong = color.rgb(255, 0, 234)
@@ -29,13 +29,13 @@ mau_trong_suot = color.rgb(255, 255, 255, 100)
 mau_trang = color.white
 bi = bar_index
 ti = time
-xanh_ = close > open 
+xanh_ = close > open
 do_ = close < open
 
-h = high 
-l = low 
-o = open 
-c = close 
+h = high
+l = low
+o = open
+c = close
 
 //
 
@@ -261,7 +261,7 @@ if bar_index > last_bar_index - maxDistanceToLastBar
         if not na(lastTS)
             if na(lastTS.exitPrice)
                 createNewTS := false // Don't enter if a trade is already entered
-                
+
         if createNewTS
             newTS = TurtleSoup.new("Waiting For Liquidity Break", time)
             newTS.lastHourHigh := high12
@@ -287,7 +287,7 @@ if bar_index > last_bar_index - maxDistanceToLastBar
                             lastTS.entryType := "Short"
 
                         lastTS.state := "Waiting For Execution"
-                    
+
                     else if (breakoutMethod == "Close" ? close : high) > lastTS.lastHourHigh
                         log.info("Buyside Liq Grab")
                         if entryMethod == "Classic" or highBreaks <= lowBreaks
@@ -332,7 +332,7 @@ if bar_index > last_bar_index - maxDistanceToLastBar
                             else
                                 lastTS.slTarget := lowMSS - atr * slATRMult
                                 lastTS.tpTarget := lastTS.entryPrice + (math.abs(lastTS.entryPrice - lastTS.slTarget) * RR)
-    
+
     // Entry Taken
     if not na(lastTS)
         if lastTS.state == "Entry Taken"
@@ -355,7 +355,7 @@ if bar_index > last_bar_index - maxDistanceToLastBar
                     lastTS.exitTime := time
                     lastTS.state := "Take Profit"
                     lowBreaks += 1
-                
+
                 // Stop Loss
                 if lastTS.entryType == "Long" and lastTS.entryPrice - low >= use_SL and time > lastTS.entryTime//((low / lastTS.entryPrice) - 1) * 100 <= -slPercent
                     if not baned_long_var[1]
@@ -418,16 +418,16 @@ if barstate.islastconfirmedhistory
 //        alert("Buy Signal")
 //    if sellAlertTick and sellAlertEnabled
 //        alert("Sell Signal")
-    
+
 //    if tpAlertTick and tpAlertEnabled
 //        alert("Take-Profit Signal")
 //    if slAlertTick and slAlertEnabled
 //        alert("Stop-Loss Signal")
 
-//txt_alert_3 = 
-// nen_xanh ? "🔔 " + syminfo.tickerid + "\n" + "🟢 BUY" + "\n" + "▶️ EN: " + str.tostring(close, format.mintick) + "\n" + "❌ SL: " + str.tostring(low, format.mintick) + "\n" + "✅ TP: " + str.tostring(high, format.mintick) + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7") : 
+//txt_alert_3 =
+// nen_xanh ? "🔔 " + syminfo.tickerid + "\n" + "🟢 BUY" + "\n" + "▶️ EN: " + str.tostring(close, format.mintick) + "\n" + "❌ SL: " + str.tostring(low, format.mintick) + "\n" + "✅ TP: " + str.tostring(high, format.mintick) + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7") :
 // nen_do ? "🔔 " + syminfo.tickerid + "\n" + "🔴 SELL" + "\n" + "▶️ EN: " + str.tostring(close, format.mintick) + "\n" + "❌ SL: " + str.tostring(high, format.mintick) + "\n" + "✅ TP: " + str.tostring(low, format.mintick) + "\n" + "⏰ Time: " + str.format_time(time, "dd-MM-yyyy HH:mm", "UTC+7") : na
- 
+
 
 
 //if not initRun and buyAlertTick
@@ -452,7 +452,7 @@ if barstate.isconfirmed
     if boxX.size() > 0
         for i = 0 to boxX.size() - 1
             box.delete(boxX.get(i))
-    
+
     if labelX.size() > 0
         for i = 0 to labelX.size() - 1
             label.delete(labelX.get(i))
@@ -460,7 +460,7 @@ if barstate.isconfirmed
     if boxlineX.size() > 0
         for i = 0 to boxlineX.size() - 1
             box.delete(boxlineX.get(i))
-    
+
     if labelXXX.size() > 0
         for i = 0 to labelXXX.size() - 1
             label.delete(labelXXX.get(i))
@@ -520,7 +520,7 @@ if barstate.isconfirmed
                         endTime = nz(curTS.exitTime, time("", -15))
                         boxX.push(box.new(curTS.entryTime, curTS.tpTarget + offset, endTime, curTS.tpTarget - offset, text = "TAKE PROFIT (" + str.tostring(curTS.tpTarget, format.mintick) + ")", text_color = textColor, xloc = xloc.bar_time, border_width = 0, bgcolor = color.new(highColor, 50), text_size = size.small))
                         boxX.push(box.new(curTS.entryTime, curTS.slTarget + offset, endTime, curTS.slTarget - offset, text = "STOP LOSS (" + str.tostring(curTS.slTarget, format.mintick) + ")", text_color = textColor, xloc = xloc.bar_time, border_width = 0, bgcolor = color.new(lowColor, 50) , text_size = size.small))
-                    else if dbgTPSLVersion == "Default" 
+                    else if dbgTPSLVersion == "Default"
                         endTime = nz(curTS.exitTime, time("", -15))
                         //lineX.push(line.new(curTS.entryTime, curTS.entryPrice, curTS.entryTime, curTS.tpTarget, xloc = xloc.bar_time, color = highColor, style = line.style_dashed))
                         //lineX.push(line.new(curTS.entryTime, curTS.tpTarget, endTime, curTS.tpTarget, xloc = xloc.bar_time, color = highColor, style = line.style_solid))
@@ -530,8 +530,8 @@ if barstate.isconfirmed
                         lineX.push(line.new(curTS.entryTime, curTS.slTarget, endTime, curTS.slTarget, xloc = xloc.bar_time, color = lowColor, style = line.style_solid))
                         labelX.push(label.new(endTime, curTS.slTarget,
                          "SL - " + str.tostring(curTS.slTarget),
-                         //curTS.slTarget > curTS.tpTarget ? "\n" + "SL - " + str.tostring(curTS.slTarget) + "\n" + "EN - " + str.tostring(curTS.entryPrice) : "EN - " + str.tostring(curTS.entryPrice) + "\n" + "SL - " + str.tostring(curTS.slTarget) + "\n", 
-                         xloc = xloc.bar_time, yloc = yloc.price, textcolor = lowColor, color = color.new(lowColor, 100), 
+                         //curTS.slTarget > curTS.tpTarget ? "\n" + "SL - " + str.tostring(curTS.slTarget) + "\n" + "EN - " + str.tostring(curTS.entryPrice) : "EN - " + str.tostring(curTS.entryPrice) + "\n" + "SL - " + str.tostring(curTS.slTarget) + "\n",
+                         xloc = xloc.bar_time, yloc = yloc.price, textcolor = lowColor, color = color.new(lowColor, 100),
                          style = label.style_label_left, size = lblSize))//curTS.slTarget > curTS.tpTarget ? label.style_label_upper_left : label.style_label_lower_left
                         boxlineX.push(box.new(curTS.entryTime, curTS.tpTarget, endTime, curTS.entryPrice, text = "", text_color = na, xloc = xloc.bar_time, border_width = 0, border_color = color.new(highColor, 100), bgcolor = mau_trong_suot, text_size = size.small))
                         boxlineX.push(box.new(curTS.entryTime, curTS.entryPrice, endTime, curTS.slTarget, text = "", text_color = na, xloc = xloc.bar_time, border_width = 0, border_color = color.new(lowColor, 100), bgcolor = mau_trong_suot, text_size = size.small))
@@ -733,11 +733,11 @@ kde (array<float> arr, string kernel, float bandwidth, int steps) =>
     arrRange = arr.range()
     arrMin = arr.min() - (minPadding ? (arrRange / 2.0) : 0)
     stepCount = arrRange / steps
-    
+
     densityRange = array.new<float>(steps * 2)
     for i = 0 to (steps * 2) - 1
         densityRange.set(i, arrMin + i * stepCount)
-    
+
     xArr = array.new<float>()
     yArr = array.new<float>()
     for i = 0 to densityRange.size() - 1
@@ -747,7 +747,7 @@ kde (array<float> arr, string kernel, float bandwidth, int steps) =>
                 "Gaussian" => temp += gaussian(densityRange.get(i) - arr.get(j), 1.0 / bandwidth)
                 "Uniform" => temp += uniform(densityRange.get(i) - arr.get(j), 1.0 / bandwidth)
                 "Sigmoid" => temp += sigmoid(densityRange.get(i) - arr.get(j), 1.0 / bandwidth)
-        
+
         xArr.push(densityRange.get(i))
         yArr.push(1.0 / arrSize * temp)
     [xArr, yArr]
@@ -783,7 +783,7 @@ if not na(highPivot)
     [KDEHighX1, KDEHighY1] = kde(highPivotRSIs, KDEKernel, KDEBandwidth, KDEStep)
     KDEHighX := KDEHighX1
     KDEHighY := KDEHighY1
-    
+
     KDEHighYSum.clear()
     temp = 0.0
     for i = 0 to KDEHighY.size() - 1
@@ -829,7 +829,7 @@ if last_bar_index - maxDistanceToLastBar_2 < bar_index
             maxHighProb := array.max(KDEHighY)
         else if probMode == "Sum"
             highProb := prefixSum(KDEHighYSum, 0, nearestIndex)
-    
+
     if lowPivotRSIs.size() > 0
         lowXIndexL = array.binary_search_leftmost(KDELowX, rsi)
         lowXIndexR = math.min(array.binary_search_rightmost(KDELowX, rsi), KDELowX.size() - 1)
@@ -950,9 +950,9 @@ type TradeObj
     line lnDca
     label lbDca
     bool  active_dca
-    
-    
-    
+
+
+
 
 //==================================================
 // METHOD – INIT
@@ -1006,7 +1006,7 @@ method update(TradeObj this) =>
         label.set_x(this.lbTp, bar_index)
 
     in_f_dca_alert = false
-    float in_f_price = na    
+    float in_f_price = na
     if this.active and this.active_dca == false and this.startBar != bar_index
         if (this.isLong and low < this.dca and low > this.sl) or (not this.isLong and high > this.dca and high < this.sl)
             this.lnDca := line.new(this.startBar, this.dca, bar_index, this.dca, color = colDCA)
@@ -1023,7 +1023,7 @@ method update(TradeObj this) =>
         line.set_x2(this.lnDca, bar_index)
         label.set_x(this.lbDca, (this.startBar + bar_index) / 2)
     [in_f_dca_alert, in_f_price]
-            
+
 
 //==================================================
 // METHOD – CHECK EXIT
@@ -1035,7 +1035,7 @@ method checkExit(TradeObj this) =>
 
         if hitSL or hitTP
             this.active := false
-      
+
 
 //==================================================
 // ARRAY
@@ -1052,20 +1052,20 @@ createTrade(_isLong, _en, _sl, _tp) =>
     array.push(trades, t)
 
 f_delete_lines(ar_a) =>
-    if array.size(ar_a) > 0 
-        for i = 0 to array.size(ar_a) - 1 
+    if array.size(ar_a) > 0
+        for i = 0 to array.size(ar_a) - 1
             line.delete(array.get(ar_a, i))
         array.clear(ar_a)
 
 f_delete_labels(ar_a) =>
-    if array.size(ar_a) > 0 
-        for i = 0 to array.size(ar_a) - 1 
+    if array.size(ar_a) > 0
+        for i = 0 to array.size(ar_a) - 1
             label.delete(array.get(ar_a, i))
         array.clear(ar_a)
 
 f_delete_linefill(ar_a) =>
-    if array.size(ar_a) > 0 
-        for i = 0 to array.size(ar_a) - 1 
+    if array.size(ar_a) > 0
+        for i = 0 to array.size(ar_a) - 1
             linefill.delete(array.get(ar_a, i))
         array.clear(ar_a)
 
@@ -1112,7 +1112,7 @@ if i_an_thu_gon and array.size(trades) > 0
         label.delete(old.lbTp)
         line.delete(old.lnDca)
         label.delete(old.lbDca)
-   
+
 //==================================================
 // MAIN LOOP
 //==================================================

@@ -69,12 +69,12 @@ async def main() -> None:
         log.info("bot loaded drop_pending_updates=%s", drop_pending)
 
     ok = await _delete_webhook(
-        bot, 
-        drop_pending_updates=drop_pending, 
+        bot,
+        drop_pending_updates=drop_pending,
         retries=retries,
         timeout_sec=timeout_sec
     )
-    
+
     if ok:
         log.info("webhook deleted")
         raise SystemExit(0)

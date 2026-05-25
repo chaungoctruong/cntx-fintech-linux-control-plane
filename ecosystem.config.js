@@ -27,8 +27,8 @@ module.exports = {
       exec_mode: "fork",
       instances: 2,
       instance_var: "INSTANCE_ID",
-      env: { 
-        PYTHONPATH: ".", 
+      env: {
+        PYTHONPATH: ".",
         CNTX_ROLE: "api",
         CNTX_LOG_DIR: LOG_DIR,
         LOG_LEVEL: process.env.LOG_LEVEL || "INFO",

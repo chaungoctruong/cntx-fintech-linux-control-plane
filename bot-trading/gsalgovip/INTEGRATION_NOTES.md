@@ -169,4 +169,3 @@ trên một MT5 demo thật trước khi mở cho tenant production.
 
 Nó *chỉ* là các quyết định riêng của gsalgovip mà kỹ sư platform cần biết
 khi nối bot này vào pipe chung.
-

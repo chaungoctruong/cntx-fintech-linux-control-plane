@@ -7,7 +7,7 @@
   min-height: 200px;
   overflow: hidden;
   isolation: isolate;
-  background: 
+  background:
     radial-gradient(circle at 50% 120%, rgba(0, 255, 156, 0.12), transparent 45%),
     radial-gradient(circle at 10% 10%, rgba(255, 43, 43, 0.05), transparent 35%),
     #020408; /* Sâu hơn, mờ ám hơn */
